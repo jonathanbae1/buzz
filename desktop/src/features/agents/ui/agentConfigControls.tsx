@@ -168,7 +168,7 @@ export function AgentDropdownSelect({
   }
 
   return (
-    <Popover open={open} onOpenChange={handleOpenChange}>
+    <Popover modal={false} onOpenChange={handleOpenChange} open={open}>
       <PopoverTrigger asChild>
         <button
           aria-controls={`${id}-listbox`}
@@ -207,82 +207,95 @@ export function AgentDropdownSelect({
       </PopoverTrigger>
       <PopoverContent
         align="start"
-        className="z-[100] max-h-72 overflow-y-auto rounded-2xl border-foreground/10 bg-white p-1.5 text-foreground opacity-100 data-[state=closed]:animate-none data-[state=open]:animate-none"
+        className="z-[100] overflow-hidden rounded-2xl border-foreground/10 bg-white p-0 text-foreground opacity-100 data-[state=closed]:animate-none data-[state=open]:animate-none"
         sideOffset={8}
         style={{
           boxShadow: "0 16px 36px rgb(0 0 0 / 0.12)",
           width: "var(--radix-popover-trigger-width)",
         }}
       >
+        {/* The list is portalled to the body, so it sits outside the shard the
+            Dialog overlay's RemoveScroll leaves scrollable: without stopping
+            wheel and touch propagation here, an open list inside a dialog shows
+            a scrollbar that ignores the wheel completely. Bounding the height on
+            Radix's available-height variable rather than a fixed `max-h-72` is
+            what keeps a long list inside the viewport instead of running past
+            the dialog's bottom edge. Mirrors `PersonaModelCombobox`. */}
         <div
-          aria-labelledby={id}
-          className="space-y-1"
-          id={`${id}-listbox`}
-          role="listbox"
+          className="max-h-[min(18rem,var(--radix-popover-content-available-height))] overflow-y-auto overscroll-contain p-1.5"
+          onTouchMoveCapture={(event) => event.stopPropagation()}
+          onWheelCapture={(event) => event.stopPropagation()}
         >
-          {showSearch ? (
-            <div className="relative">
-              <Search
-                aria-hidden="true"
-                className="pointer-events-none absolute left-3 top-1/2 h-3.5 w-3.5 -translate-y-1/2 text-foreground/45"
-              />
-              <Input
-                aria-label="Search models"
-                autoFocus
-                className="h-9 rounded-xl border-foreground/10 bg-white pl-9 text-sm"
-                data-testid={testId ? `${testId}-search` : undefined}
-                onChange={(event) => setQuery(event.target.value)}
-                placeholder="Search models…"
-                value={query}
-              />
-            </div>
-          ) : null}
-          {filteredOptions.length === 0 ? (
-            <p
-              className="px-3 py-2 text-sm text-foreground/55"
-              data-testid={testId ? `${testId}-empty` : undefined}
-            >
-              {showSearch && query.trim().length > 0
-                ? "No matches"
-                : emptyOptionsLabel}
-            </p>
-          ) : null}
-          {filteredOptions.map((option) => {
-            const selected = option.value === value;
-            return (
-              <button
-                aria-disabled={option.disabled || undefined}
-                aria-selected={selected}
-                className={cn(
-                  "flex w-full items-center justify-between gap-3 rounded-xl px-3 py-2 text-left text-sm leading-5 text-black opacity-100 transition-colors hover:bg-black/5 focus-visible:outline-hidden focus-visible:ring-1 focus-visible:ring-black/30",
-                  selected && "bg-[var(--buzz-welcome-chartreuse)]/35",
-                  option.disabled && "cursor-not-allowed text-black/35",
-                )}
-                data-testid={optionTestId(testId, option.value)}
-                data-value={option.value}
-                disabled={option.disabled}
-                key={option.value}
-                onClick={() => {
-                  if (option.disabled) return;
-                  onValueChange(option.value);
-                  setOpen(false);
-                }}
-                role="option"
-                type="button"
-              >
-                <span className="min-w-0 truncate">{option.label}</span>
-                <Check
+          <div
+            aria-labelledby={id}
+            className="space-y-1"
+            id={`${id}-listbox`}
+            role="listbox"
+          >
+            {showSearch ? (
+              <div className="relative">
+                <Search
                   aria-hidden="true"
-                  className={cn(
-                    "h-4 w-4 shrink-0 text-black transition-opacity",
-                    option.disabled && "text-black/35",
-                    selected ? "opacity-100" : "opacity-0",
-                  )}
-                  strokeWidth={2.5}
+                  className="pointer-events-none absolute left-3 top-1/2 h-3.5 w-3.5 -translate-y-1/2 text-foreground/45"
                 />
-              </button>
-            );
-          })}
+                <Input
+                  aria-label="Search models"
+                  autoFocus
+                  className="h-9 rounded-xl border-foreground/10 bg-white pl-9 text-sm"
+                  data-testid={testId ? `${testId}-search` : undefined}
+                  onChange={(event) => setQuery(event.target.value)}
+                  placeholder="Search models…"
+                  value={query}
+                />
+              </div>
+            ) : null}
+            {filteredOptions.length === 0 ? (
+              <p
+                className="px-3 py-2 text-sm text-foreground/55"
+                data-testid={testId ? `${testId}-empty` : undefined}
+              >
+                {showSearch && query.trim().length > 0
+                  ? "No matches"
+                  : emptyOptionsLabel}
+              </p>
+            ) : null}
+            {filteredOptions.map((option) => {
+              const selected = option.value === value;
+              return (
+                <button
+                  aria-disabled={option.disabled || undefined}
+                  aria-selected={selected}
+                  className={cn(
+                    "flex w-full items-center justify-between gap-3 rounded-xl px-3 py-2 text-left text-sm leading-5 text-black opacity-100 transition-colors hover:bg-black/5 focus-visible:outline-hidden focus-visible:ring-1 focus-visible:ring-black/30",
+                    selected && "bg-[var(--buzz-welcome-chartreuse)]/35",
+                    option.disabled && "cursor-not-allowed text-black/35",
+                  )}
+                  data-testid={optionTestId(testId, option.value)}
+                  data-value={option.value}
+                  disabled={option.disabled}
+                  key={option.value}
+                  onClick={() => {
+                    if (option.disabled) return;
+                    onValueChange(option.value);
+                    setOpen(false);
+                  }}
+                  role="option"
+                  type="button"
+                >
+                  <span className="min-w-0 truncate">{option.label}</span>
+                  <Check
+                    aria-hidden="true"
+                    className={cn(
+                      "h-4 w-4 shrink-0 text-black transition-opacity",
+                      option.disabled && "text-black/35",
+                      selected ? "opacity-100" : "opacity-0",
+                    )}
+                    strokeWidth={2.5}
+                  />
+                </button>
+              );
+            })}
+          </div>
         </div>
       </PopoverContent>
     </Popover>
