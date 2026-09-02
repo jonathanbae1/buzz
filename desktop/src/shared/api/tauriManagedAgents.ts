@@ -78,6 +78,20 @@ export async function persistAgentEffortLevel(
   });
 }
 
+/**
+ * Persist the canonical startup session mode for a local managed agent.
+ * Applied at the next spawn; null reverts to the adapter default.
+ */
+export async function persistAgentSessionMode(
+  pubkey: string,
+  sessionMode: string | null,
+): Promise<void> {
+  return invokeTauri<void>("persist_agent_session_mode", {
+    pubkey,
+    sessionMode,
+  });
+}
+
 export async function listManagedAgentRuntimes(): Promise<
   ManagedAgentRuntimeStatus[]
 > {

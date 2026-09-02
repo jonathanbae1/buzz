@@ -155,6 +155,7 @@ impl AgentDefinition {
             definition_parallelism: self.parallelism,
             relay_mesh: None,
             effort_level: None,
+            session_mode: None,
         }
     }
 }
@@ -444,6 +445,10 @@ pub struct ManagedAgentRecord {
     /// so the harness applies it via `session/set_config_option` at session creation.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub effort_level: Option<String>,
+    /// Canonical ACP session mode. Injected as `BUZZ_ACP_SESSION_MODE` at spawn
+    /// so the harness applies it via `session/set_config_option` at session creation.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub session_mode: Option<String>,
 }
 
 #[derive(Debug)]

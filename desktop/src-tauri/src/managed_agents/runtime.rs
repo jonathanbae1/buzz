@@ -817,6 +817,11 @@ pub fn spawn_agent_child(
     // None there is no canonical value to assert, so env passthrough stands — user env
     // legitimately seeds startup effort in that case.
     apply_effort_env(&mut command, record.effort_level.as_deref());
+    if let Some(session_mode) = record.session_mode.as_deref() {
+        command.env("BUZZ_ACP_SESSION_MODE", session_mode);
+    } else {
+        command.env_remove("BUZZ_ACP_SESSION_MODE");
+    }
 
     // A1: for local claude agents, ANTHROPIC_MODEL is the single startup model authority.
     // BUZZ_ACP_MODEL is removed (live ACP switches only; two authorities in the same env

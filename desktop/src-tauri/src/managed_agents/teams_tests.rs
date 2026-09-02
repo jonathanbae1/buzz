@@ -215,6 +215,7 @@ fn managed_agent(name: &str) -> ManagedAgentRecord {
         catalog_source: None,
         relay_mesh: None,
         effort_level: None,
+        session_mode: None,
         definition_respond_to: None,
         definition_respond_to_allowlist: vec![],
         definition_parallelism: None,

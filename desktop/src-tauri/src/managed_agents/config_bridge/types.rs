@@ -207,6 +207,15 @@ pub struct RuntimeConfigSurface {
     /// are reflected correctly.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub effort_options: Vec<AcpConfigOptionValue>,
+    /// The real `configId` for the adapter's `mode` ACP config option.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub mode_config_id: Option<String>,
+    /// Adapter-advertised values for the `mode` ACP config option.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub mode_options: Vec<AcpConfigOptionValue>,
+    /// The current mode reported by the running ACP session.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub current_mode: Option<String>,
 }
 
 /// Raw config values extracted from a runtime's config file.
@@ -237,7 +246,11 @@ pub struct ExtensionEntry {
 #[serde(rename_all = "camelCase")]
 pub struct SessionConfigCache {
     pub config_options: Vec<AcpConfigOptionEntry>,
-    pub available_modes: Vec<String>,
+    pub available_modes: Vec<AcpConfigOptionValue>,
+    #[serde(default)]
+    pub current_mode: Option<String>,
+    #[serde(default)]
+    pub mode_config_id: Option<String>,
     pub available_models: Vec<AcpModelEntry>,
     pub current_model: Option<String>,
     /// Whether the harness's `desired_model` was set by a live `SwitchModel`

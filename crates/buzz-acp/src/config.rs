@@ -437,6 +437,12 @@ pub struct CliArgs {
     #[arg(long, env = "BUZZ_ACP_EFFORT_LEVEL")]
     pub effort_level: Option<String>,
 
+    /// Persisted ACP session mode to apply via `session/set_config_option` at
+    /// each session creation. The configId is resolved from the adapter's
+    /// advertised `mode` category rather than hardcoded.
+    #[arg(long, env = "BUZZ_ACP_SESSION_MODE")]
+    pub session_mode: Option<String>,
+
     /// Title for the agent's ACP sessions, passed out-of-band in `session/new`
     /// `_meta`. Adapters that recognize it name the session after this value;
     /// others ignore it. Never enters the prompt.
@@ -560,6 +566,10 @@ pub struct Config {
     /// Non-fatal when absent or when the adapter does not advertise
     /// `thought_level`.
     pub effort_level: Option<String>,
+    /// Persisted ACP session mode. Held as a per-worker spawn-scoped value and
+    /// applied at each session creation by pairing with the adapter's
+    /// advertised `mode` configId.
+    pub session_mode: Option<String>,
     /// Sanitized session title, sent as `_meta.sessionTitle` on `session/new`.
     /// `None` when unset or when the configured value sanitized to empty.
     pub session_title: Option<String>,
@@ -1126,6 +1136,12 @@ impl Config {
             memory_enabled: args.memory && !args.no_memory,
             model,
             effort_level: args.effort_level,
+            session_mode: args
+                .session_mode
+                .as_deref()
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+                .map(str::to_string),
             session_title: args
                 .session_title
                 .as_deref()
@@ -1502,6 +1518,7 @@ mod tests {
             memory_enabled: true,
             model: None,
             effort_level: None,
+            session_mode: None,
             session_title: None,
             permission_mode: PermissionMode::BypassPermissions,
             respond_to: RespondTo::Anyone,
@@ -2808,6 +2825,34 @@ channels = "ALL"
     // A minimal valid private key for test use (secp256k1 scalar = 1).
     const TEST_PRIVATE_KEY: &str =
         "0000000000000000000000000000000000000000000000000000000000000001";
+
+    #[test]
+    fn session_mode_whitespace_normalizes_to_unset() {
+        let args = CliArgs::try_parse_from([
+            "buzz-acp",
+            "--private-key",
+            TEST_PRIVATE_KEY,
+            "--session-mode",
+            " \t ",
+        ])
+        .expect("clap should parse whitespace session mode");
+        let config = Config::from_args(args).expect("whitespace mode should be valid");
+        assert_eq!(config.session_mode, None);
+    }
+
+    #[test]
+    fn session_mode_value_is_trimmed() {
+        let args = CliArgs::try_parse_from([
+            "buzz-acp",
+            "--private-key",
+            TEST_PRIVATE_KEY,
+            "--session-mode",
+            " plan ",
+        ])
+        .expect("clap should parse session mode");
+        let config = Config::from_args(args).expect("session mode should be valid");
+        assert_eq!(config.session_mode.as_deref(), Some("plan"));
+    }
 
     #[test]
     fn allowed_respond_to_full_path_rejects_disallowed_mode() {

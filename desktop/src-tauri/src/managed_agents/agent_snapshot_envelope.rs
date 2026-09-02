@@ -418,6 +418,7 @@ mod tests {
             definition_parallelism: None,
             relay_mesh: None,
             effort_level: None,
+            session_mode: None,
             agent_command_override: None,
             persona_source_version: None,
             provider: None,

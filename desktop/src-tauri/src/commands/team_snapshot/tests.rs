@@ -231,6 +231,7 @@ fn team_export_with_instance_and_memory_level_uses_supplied_entries() {
         definition_parallelism: None,
         relay_mesh: None,
         effort_level: None,
+        session_mode: None,
         runtime: None,
         name_pool: vec![],
     };

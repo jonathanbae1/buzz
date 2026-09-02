@@ -712,6 +712,7 @@ pub fn run() {
             get_baked_build_env,
             put_agent_session_config,
             persist_agent_effort_level,
+            persist_agent_session_mode,
             get_global_agent_config,
             set_global_agent_config,
             mesh_start_node,

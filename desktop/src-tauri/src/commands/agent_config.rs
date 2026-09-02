@@ -372,6 +372,11 @@ pub fn put_agent_session_config(
 
     let config_options = parse_config_options(payload.get("configOptions"));
     let available_modes = parse_modes(&config_options, payload.get("modes"));
+    let mode_option = config_options
+        .iter()
+        .find(|option| option.category.as_deref() == Some("mode"));
+    let current_mode = parse_current_mode(&config_options, payload.get("modes"));
+    let mode_config_id = mode_option.map(|option| option.config_id.clone());
     let (available_models, current_model) = parse_models(payload.get("models"));
     let model_overridden = payload
         .get("modelOverridden")
@@ -381,6 +386,8 @@ pub fn put_agent_session_config(
     let cache = SessionConfigCache {
         config_options,
         available_modes,
+        current_mode,
+        mode_config_id,
         available_models,
         current_model,
         model_overridden,
@@ -439,6 +446,7 @@ fn parse_option_values(raw: Option<&serde_json::Value>) -> Vec<AcpConfigOptionVa
                 value,
                 display_name: o
                     .get("displayName")
+                    .or_else(|| o.get("name"))
                     .and_then(|v| v.as_str())
                     .map(str::to_string),
             })
@@ -449,21 +457,58 @@ fn parse_option_values(raw: Option<&serde_json::Value>) -> Vec<AcpConfigOptionVa
 fn parse_modes(
     config_options: &[AcpConfigOptionEntry],
     raw: Option<&serde_json::Value>,
-) -> Vec<String> {
-    if let Some(arr) = raw.and_then(|v| v.as_array()) {
+) -> Vec<AcpConfigOptionValue> {
+    if let Some(arr) = raw
+        .and_then(|value| value.get("availableModes"))
+        .and_then(|value| value.as_array())
+    {
         return arr
             .iter()
-            .filter_map(|m| m.as_str().map(str::to_string))
+            .filter_map(|mode| {
+                let value = mode.get("id").and_then(|v| v.as_str())?.to_string();
+                Some(AcpConfigOptionValue {
+                    value,
+                    display_name: mode
+                        .get("name")
+                        .and_then(|v| v.as_str())
+                        .map(str::to_string),
+                })
+            })
+            .collect();
+    }
+    if let Some(arr) = raw.and_then(|value| value.as_array()) {
+        return arr
+            .iter()
+            .filter_map(|mode| {
+                mode.as_str().map(|value| AcpConfigOptionValue {
+                    value: value.to_string(),
+                    display_name: None,
+                })
+            })
             .collect();
     }
     // Fall back: extract mode options from configOptions with category "mode".
     config_options
         .iter()
         .filter(|o| o.category.as_deref() == Some("mode"))
-        .flat_map(|o| o.options.iter().map(|v| v.value.clone()))
+        .flat_map(|o| o.options.iter().cloned())
         .collect()
 }
 
+fn parse_current_mode(
+    config_options: &[AcpConfigOptionEntry],
+    raw: Option<&serde_json::Value>,
+) -> Option<String> {
+    raw.and_then(|modes| modes.get("currentModeId"))
+        .and_then(|value| value.as_str())
+        .map(str::to_string)
+        .or_else(|| {
+            config_options
+                .iter()
+                .find(|option| option.category.as_deref() == Some("mode"))
+                .and_then(|option| option.current_value.clone())
+        })
+}
 fn parse_models(raw: Option<&serde_json::Value>) -> (Vec<AcpModelEntry>, Option<String>) {
     let raw = match raw {
         Some(v) => v,
@@ -569,6 +614,37 @@ pub fn persist_agent_effort_level(
         ));
     }
     record.effort_level = effort_level;
+    record.updated_at = crate::util::now_iso();
+    save_managed_agents(&app, &records)
+}
+
+/// Persist the canonical startup session mode for a local managed agent.
+///
+/// The value is stored on the record and injected as `BUZZ_ACP_SESSION_MODE`
+/// at spawn. The harness applies it once at session creation through its
+/// advertised `mode` config option. Pass `None` to use the adapter default.
+#[tauri::command]
+pub fn persist_agent_session_mode(
+    pubkey: String,
+    session_mode: Option<String>,
+    app: AppHandle,
+    state: State<'_, AppState>,
+) -> Result<(), String> {
+    let _store_guard = state
+        .managed_agents_store_lock
+        .lock()
+        .map_err(|e| e.to_string())?;
+    let mut records = load_managed_agents(&app)?;
+    let record = records
+        .iter_mut()
+        .find(|r| r.pubkey == pubkey)
+        .ok_or_else(|| format!("agent {pubkey} not found"))?;
+    if record.backend != BackendKind::Local {
+        return Err(format!(
+            "agent {pubkey} is not a local agent; remote session mode is set at deploy time"
+        ));
+    }
+    record.session_mode = session_mode;
     record.updated_at = crate::util::now_iso();
     save_managed_agents(&app, &records)
 }

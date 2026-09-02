@@ -671,6 +671,12 @@ export type RuntimeConfigSurface = {
   effortConfigId?: string;
   /** B5/I-7: adapter-advertised option values for the `thought_level` option — the picker renders these instead of hardcoded values. */
   effortOptions?: AcpConfigOptionValue[];
+  /** ACP session-mode config id discovered from the running session. */
+  modeConfigId?: string;
+  /** Adapter-advertised options for the session-mode config option. */
+  modeOptions?: AcpConfigOptionValue[];
+  /** Currently configured startup session mode, when one is explicitly set. */
+  currentMode?: string;
 };
 
 export type UpdateManagedAgentInput = {

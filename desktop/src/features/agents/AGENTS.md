@@ -236,6 +236,12 @@ with a TypeScript lookup table or an id comparison in a component.
    mid-conversation effort control without a plan ruling. The archived live-effort
    machinery lives on `archive/claude-config-gaps-live-effort` for reference only.
 
+15. **Session mode is spawn-scoped and local-only.** The `ModePickerField`
+   reads `modeConfigId`, `modeOptions`, and `currentMode` from the config
+   surface, and each selection writes through the single
+   `persistAgentSessionMode` command for the next session start. Do not add a
+   live-switch path, control frame, or acknowledgement protocol.
+
 12. **Owner-only builds constrain managed runtimes, not relay-agent mentions.**
     The compiled owner-only capability applies when Desktop starts or deploys a
     managed agent. Independently operated relay agents with NIP-OA ownership
@@ -283,6 +289,10 @@ with a TypeScript lookup table or an id comparison in a component.
   option/preselect compute, plus `effortSelectionToPersistedValue` sentinel →
   null. This is where the v4 provider regression is pinned: the write control
   must never render for a provider backend.
+- `ui/modePicker.test.mjs` — `modePickerState` local/config-id gating,
+  adapter options/current-mode selection, and
+  `modeSelectionToPersistedValue` sentinel → null.
+
 - `desktop/tests/e2e/onboarding-agent-defaults.spec.ts` — onboarding behavior
   acceptance coverage for readiness, failure states, defaults, session-draft
   restoration, zero-write Skip, Next save failure/retry, navigation, and

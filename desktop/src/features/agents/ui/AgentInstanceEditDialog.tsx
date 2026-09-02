@@ -26,6 +26,7 @@ import { Dialog } from "@/shared/ui/dialog";
 import { Input } from "@/shared/ui/input";
 import { setManagedAgentAutoRestart } from "@/shared/api/tauriManagedAgents";
 import { EffortPickerField } from "./EffortPickerField";
+import { ModePickerField } from "./ModePickerField";
 import { EditAgentAdvancedFields } from "./EditAgentAdvancedFields";
 import {
   ADVANCED_FIELDS_MOTION_TRANSITION,
@@ -1127,6 +1128,7 @@ export function AgentInstanceEditDialog({
             </div>
 
             <EffortPickerField agent={agent} config={configSurfaceQuery.data} />
+            <ModePickerField agent={agent} config={configSurfaceQuery.data} />
 
             <AgentAiDefaultsNotice
               onEditDefaults={() => setAiDefaultsOpen(true)}

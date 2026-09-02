@@ -414,6 +414,8 @@ fn effort_option_selected_by_category_drives_all_facts() {
             ],
         }],
         available_modes: vec![],
+        current_mode: None,
+        mode_config_id: None,
         available_models: vec![],
         current_model: None,
         model_overridden: false,

@@ -53,7 +53,12 @@ pub(crate) fn read_config_surface(
             .clone()
             .or_else(|| find_config_option_value(c, "model"))
     });
-    let acp_mode = session_cache.and_then(|c| find_config_option_value(c, "mode"));
+    let mode_option = session_cache.and_then(find_mode_option);
+    let acp_mode = session_cache.and_then(|c| {
+        c.current_mode
+            .clone()
+            .or_else(|| mode_option.and_then(|o| o.current_value.clone()))
+    });
 
     // B5: the adapter-advertised effort control, selected ONCE by its category.
     // The adapter defines it as category `thought_level` with its own config id
@@ -86,7 +91,13 @@ pub(crate) fn read_config_surface(
             required_fields.contains(&"provider"),
             tiers,
         ),
-        mode: build_mode_field(&file_config.mode, &acp_mode, is_pre_spawn, session_cache),
+        mode: build_mode_field(
+            record,
+            &file_config.mode,
+            &acp_mode,
+            is_pre_spawn,
+            session_cache,
+        ),
         thinking_effort: build_thinking_field(
             record,
             &file_config.thinking_effort,
@@ -197,6 +208,20 @@ pub(crate) fn read_config_surface(
     // `effort_options` instead of hardcoded values (never hardcoded here).
     let effort_config_id = effort_option.map(|o| o.config_id.clone());
     let effort_options = effort_option.map(|o| o.options.clone()).unwrap_or_default();
+    let mode_config_id = session_cache
+        .and_then(|cache| cache.mode_config_id.clone())
+        .or_else(|| mode_option.map(|option| option.config_id.clone()));
+    let mode_options = mode_option
+        .map(|option| option.options.clone())
+        .filter(|options| !options.is_empty())
+        .or_else(|| session_cache.map(|cache| cache.available_modes.clone()))
+        .unwrap_or_default();
+    let current_mode = session_cache.and_then(|cache| {
+        cache
+            .current_mode
+            .clone()
+            .or_else(|| mode_option.and_then(|option| option.current_value.clone()))
+    });
 
     RuntimeConfigSurface {
         runtime_id: runtime_meta.map(|m| m.id.to_string()),
@@ -209,6 +234,9 @@ pub(crate) fn read_config_surface(
         claude_config_dir_custom: claude_config_dir.is_some(),
         effort_config_id,
         effort_options,
+        mode_config_id,
+        mode_options,
+        current_mode,
     }
 }
 
@@ -506,12 +534,19 @@ fn build_provider_field(
 }
 
 fn build_mode_field(
+    record: &ManagedAgentRecord,
     file_mode: &Option<String>,
     acp_mode: &Option<String>,
     is_pre_spawn: bool,
     session_cache: Option<&SessionConfigCache>,
 ) -> Option<NormalizedField> {
+    // Tier ordering mirrors `build_thinking_field`: the Buzz-persisted value
+    // sits above the live ACP reading, so the panel shows the mode the next
+    // session will start in and struck-through shows the one it is running now.
+    // `record.session_mode` is applied at session creation by the worker's
+    // `apply_startup_mode`, which is what makes it the canonical value.
     let tiers: &[(Option<&str>, ConfigOrigin)] = &[
+        (record.session_mode.as_deref(), ConfigOrigin::BuzzExplicit),
         (acp_mode.as_deref(), ConfigOrigin::AcpConfigOption),
         (file_mode.as_deref(), ConfigOrigin::ConfigFile),
     ];
@@ -728,6 +763,14 @@ fn resolve_with_override(tiers: &[(Option<&str>, ConfigOrigin)]) -> Option<Resol
     };
 
     Some((value, origin, overridden_value, overridden_origin))
+}
+/// Select the adapter-advertised mode control from the session cache by
+/// category, rather than assuming the config id is literally `"mode"`.
+fn find_mode_option(cache: &SessionConfigCache) -> Option<&AcpConfigOptionEntry> {
+    cache
+        .config_options
+        .iter()
+        .find(|o| o.category.as_deref() == Some("mode"))
 }
 
 // ── ACP cache helpers ────────────────────────────────────────────────────────

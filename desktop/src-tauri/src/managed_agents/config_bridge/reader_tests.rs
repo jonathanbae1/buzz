@@ -117,6 +117,7 @@ fn test_record() -> ManagedAgentRecord {
         definition_parallelism: None,
         relay_mesh: None,
         effort_level: None,
+        session_mode: None,
         agent_command_override: None,
         persona_source_version: None,
         provider: None,
@@ -280,6 +281,8 @@ fn post_spawn_with_model_config_option_uses_acp() {
             options: vec![],
         }],
         available_modes: vec![],
+        current_mode: None,
+        mode_config_id: None,
         available_models: vec![],
         current_model: Some("claude-opus-4".to_string()),
         model_overridden: false,
@@ -304,6 +307,8 @@ fn acp_model_overrides_file_model_with_override_tracking() {
     let cache = SessionConfigCache {
         config_options: vec![],
         available_modes: vec![],
+        current_mode: None,
+        mode_config_id: None,
         available_models: vec![],
         current_model: Some("acp-model".to_string()),
         model_overridden: false,
@@ -315,6 +320,61 @@ fn acp_model_overrides_file_model_with_override_tracking() {
     let model = surface.normalized.model.unwrap();
     assert_eq!(model.value.as_deref(), Some("acp-model"));
     assert_eq!(model.origin, ConfigOrigin::AcpConfigOption);
+}
+
+// A persisted session mode is the mode the NEXT session starts in, so it must
+// win the displayed value while the live reading becomes the struck-through
+// secondary — the same two facts `build_thinking_field` produces for effort.
+// Without this the panel and the picker would both echo the running session
+// and a fresh selection would look like it never took.
+#[test]
+fn persisted_session_mode_outranks_the_live_mode_reading() {
+    let mut record = test_record();
+    record.session_mode = Some("plan".to_string());
+    let runtime = test_runtime();
+    let cache = SessionConfigCache {
+        config_options: vec![],
+        available_modes: vec![],
+        current_mode: Some("default".to_string()),
+        mode_config_id: Some("mode".to_string()),
+        available_models: vec![],
+        current_model: None,
+        model_overridden: false,
+        goose_native_config: None,
+        captured_at: "".to_string(),
+    };
+
+    let surface = read_config_surface(&record, Some(runtime), Some(&cache), &no_tiers(), None);
+    let mode = surface.normalized.mode.unwrap();
+    assert_eq!(mode.value.as_deref(), Some("plan"));
+    assert_eq!(mode.origin, ConfigOrigin::BuzzExplicit);
+    assert_eq!(mode.overridden_value.as_deref(), Some("default"));
+    assert_eq!(mode.overridden_origin, Some(ConfigOrigin::AcpConfigOption));
+}
+
+// With nothing persisted the live reading is the only fact there is, and the
+// pre-existing behaviour must not change for agents that never set a mode.
+#[test]
+fn live_mode_reading_stands_alone_without_a_persisted_mode() {
+    let record = test_record();
+    let runtime = test_runtime();
+    let cache = SessionConfigCache {
+        config_options: vec![],
+        available_modes: vec![],
+        current_mode: Some("default".to_string()),
+        mode_config_id: Some("mode".to_string()),
+        available_models: vec![],
+        current_model: None,
+        model_overridden: false,
+        goose_native_config: None,
+        captured_at: "".to_string(),
+    };
+
+    let surface = read_config_surface(&record, Some(runtime), Some(&cache), &no_tiers(), None);
+    let mode = surface.normalized.mode.unwrap();
+    assert_eq!(mode.value.as_deref(), Some("default"));
+    assert_eq!(mode.origin, ConfigOrigin::AcpConfigOption);
+    assert_eq!(mode.overridden_value, None);
 }
 
 // ── Persona / global tier integration tests ──────────────────────────────────
@@ -406,6 +466,8 @@ fn runtime_override_wins_display_when_model_overridden_is_true() {
     let cache = SessionConfigCache {
         config_options: vec![],
         available_modes: vec![],
+        current_mode: None,
+        mode_config_id: None,
         available_models: vec![],
         current_model: Some("live-model".to_string()),
         model_overridden: true,
@@ -438,6 +500,8 @@ fn no_runtime_override_when_model_overridden_is_false() {
     let cache = SessionConfigCache {
         config_options: vec![],
         available_modes: vec![],
+        current_mode: None,
+        mode_config_id: None,
         available_models: vec![],
         current_model: Some("persona-model".to_string()),
         model_overridden: false,
@@ -470,6 +534,8 @@ fn no_false_positive_override_when_persona_edited_mid_life() {
     let cache = SessionConfigCache {
         config_options: vec![],
         available_modes: vec![],
+        current_mode: None,
+        mode_config_id: None,
         available_models: vec![],
         current_model: Some("old-persona-model".to_string()),
         model_overridden: false,
@@ -914,6 +980,8 @@ fn acp_effort_wins_over_inherited_global_effort_as_secondary() {
             options: vec![],
         }],
         available_modes: vec![],
+        current_mode: None,
+        mode_config_id: None,
         available_models: vec![],
         current_model: None,
         model_overridden: false,

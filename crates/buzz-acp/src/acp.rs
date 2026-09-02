@@ -2204,6 +2204,26 @@ pub fn extract_thought_level_config_id(result: &serde_json::Value) -> Option<Str
     None
 }
 
+/// Extract the adapter-defined `configId` for a config option category.
+///
+/// ACP adapters disagree on the identifier key (`configId` in the protocol
+/// specification, `id` in claude-agent-acp), so callers must resolve it from
+/// the advertised `category` rather than hardcoding an identifier.
+pub fn extract_config_option_id_by_category(
+    result: &serde_json::Value,
+    category: &str,
+) -> Option<String> {
+    result["configOptions"].as_array()?.iter().find_map(|opt| {
+        if opt.get("category").and_then(|value| value.as_str()) != Some(category) {
+            return None;
+        }
+        opt.get("configId")
+            .or_else(|| opt.get("id"))
+            .and_then(|value| value.as_str())
+            .map(str::to_string)
+    })
+}
+
 /// Match a desired model ID against a fresh `session/new` response.
 ///
 /// Returns the correct ACP method to call, or `None` if no match.

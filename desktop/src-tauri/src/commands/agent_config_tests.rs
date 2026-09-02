@@ -118,6 +118,7 @@ fn agent_record() -> ManagedAgentRecord {
         definition_parallelism: None,
         relay_mesh: None,
         effort_level: None,
+        session_mode: None,
         agent_command_override: None,
         persona_source_version: None,
         provider: None,
@@ -156,6 +157,8 @@ fn session_cache(current_model: &str, model_overridden: bool) -> SessionConfigCa
     SessionConfigCache {
         config_options: vec![],
         available_modes: vec![],
+        current_mode: None,
+        mode_config_id: None,
         available_models: vec![],
         current_model: Some(current_model.to_string()),
         model_overridden,
@@ -709,4 +712,147 @@ fn live_switch_null_models_parses_to_no_current_model() {
         "Null models must not surface any current model"
     );
     assert!(available.is_empty());
+}
+
+#[test]
+fn parse_modes_accepts_advertised_object_with_names() {
+    let raw = serde_json::json!({
+        "availableModes": [
+            {"id": "default", "name": "Default", "description": "Standard mode"},
+            {"id": "plan", "name": "Plan", "description": "Read-only mode"}
+        ],
+        "currentModeId": "default"
+    });
+
+    let modes = parse_modes(&[], Some(&raw));
+    assert_eq!(modes.len(), 2);
+    assert_eq!(modes[0].value, "default");
+    assert_eq!(modes[0].display_name.as_deref(), Some("Default"));
+    assert_eq!(modes[1].value, "plan");
+    assert_eq!(modes[1].display_name.as_deref(), Some("Plan"));
+}
+
+#[test]
+fn parse_modes_keeps_legacy_string_array() {
+    let raw = serde_json::json!(["default", "plan"]);
+    let modes = parse_modes(&[], Some(&raw));
+
+    assert_eq!(
+        modes
+            .iter()
+            .map(|mode| mode.value.as_str())
+            .collect::<Vec<_>>(),
+        vec!["default", "plan"]
+    );
+    assert!(modes.iter().all(|mode| mode.display_name.is_none()));
+}
+
+#[test]
+fn parse_modes_falls_back_to_mode_config_option() {
+    let config_options = vec![AcpConfigOptionEntry {
+        config_id: "session-mode".to_string(),
+        category: Some("mode".to_string()),
+        display_name: Some("Mode".to_string()),
+        current_value: Some("default".to_string()),
+        options: vec![
+            AcpConfigOptionValue {
+                value: "default".to_string(),
+                display_name: Some("Default".to_string()),
+            },
+            AcpConfigOptionValue {
+                value: "plan".to_string(),
+                display_name: Some("Plan".to_string()),
+            },
+        ],
+    }];
+
+    let modes = parse_modes(&config_options, None);
+    assert_eq!(modes[1].value, "plan");
+    assert_eq!(modes[1].display_name.as_deref(), Some("Plan"));
+}
+
+#[test]
+fn mode_metadata_prefers_current_mode_id_and_resolves_config_id_by_category() {
+    let config_options = vec![AcpConfigOptionEntry {
+        config_id: "session-mode".to_string(),
+        category: Some("mode".to_string()),
+        display_name: Some("Mode".to_string()),
+        current_value: Some("default".to_string()),
+        options: vec![],
+    }];
+    let raw = serde_json::json!({
+        "availableModes": [{"id": "default", "name": "Default"}],
+        "currentModeId": "plan"
+    });
+
+    assert_eq!(
+        parse_current_mode(&config_options, Some(&raw)).as_deref(),
+        Some("plan")
+    );
+    assert_eq!(
+        config_options
+            .iter()
+            .find(|option| option.category.as_deref() == Some("mode"))
+            .map(|option| option.config_id.as_str()),
+        Some("session-mode")
+    );
+}
+
+#[test]
+fn mode_metadata_falls_back_to_config_option_current_value() {
+    let config_options = vec![AcpConfigOptionEntry {
+        config_id: "session-mode".to_string(),
+        category: Some("mode".to_string()),
+        display_name: Some("Mode".to_string()),
+        current_value: Some("plan".to_string()),
+        options: vec![],
+    }];
+    let raw = serde_json::json!({
+        "availableModes": [{"id": "default", "name": "Default"}]
+    });
+
+    assert_eq!(
+        parse_current_mode(&config_options, Some(&raw)).as_deref(),
+        Some("plan")
+    );
+}
+
+#[test]
+fn runtime_surface_exposes_mode_fields_with_frontend_names() {
+    let mut record = agent_record();
+    record.persona_id = None;
+    let cache = SessionConfigCache {
+        config_options: vec![AcpConfigOptionEntry {
+            config_id: "session-mode".to_string(),
+            category: Some("mode".to_string()),
+            display_name: Some("Mode".to_string()),
+            current_value: Some("plan".to_string()),
+            options: vec![AcpConfigOptionValue {
+                value: "plan".to_string(),
+                display_name: Some("Plan".to_string()),
+            }],
+        }],
+        available_modes: vec![],
+        current_mode: Some("plan".to_string()),
+        mode_config_id: Some("session-mode".to_string()),
+        available_models: vec![],
+        current_model: None,
+        model_overridden: false,
+        goose_native_config: None,
+        captured_at: "".to_string(),
+    };
+
+    let surface = resolve_config_surface(
+        record,
+        &[],
+        Some(goose_runtime()),
+        Some(&cache),
+        &Default::default(),
+        None,
+    );
+    let wire = serde_json::to_value(surface).expect("surface serializes");
+    assert_eq!(wire["modeConfigId"], "session-mode");
+    assert_eq!(wire["modeOptions"][0]["value"], "plan");
+    assert_eq!(wire["modeOptions"][0]["displayName"], "Plan");
+    assert_eq!(wire["currentMode"], "plan");
 }
