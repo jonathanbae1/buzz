@@ -361,16 +361,28 @@ fn profile_target_dirs(root: &Path) -> [PathBuf; 2] {
 }
 
 fn command_search_dirs() -> Vec<PathBuf> {
-    let mut dirs = profile_target_dirs(&workspace_root_dir()).to_vec();
+    let mut dirs = Vec::new();
+    // Release bundles must resolve their adjacent sidecars before compile-time
+    // workspace artifacts. Development builds retain workspace-first lookup so
+    // `just dev` continues to use the freshly built target binaries.
+    if !cfg!(debug_assertions) {
+        dirs.extend(
+            std::env::current_exe()
+                .ok()
+                .and_then(|path| path.parent().map(Path::to_path_buf)),
+        );
+    }
+    dirs.extend(profile_target_dirs(&workspace_root_dir()));
     if let Ok(current_dir) = std::env::current_dir() {
         dirs.extend(profile_target_dirs(&current_dir));
     }
-
-    dirs.extend(
-        std::env::current_exe()
-            .ok()
-            .and_then(|path| path.parent().map(Path::to_path_buf)),
-    );
+    if cfg!(debug_assertions) {
+        dirs.extend(
+            std::env::current_exe()
+                .ok()
+                .and_then(|path| path.parent().map(Path::to_path_buf)),
+        );
+    }
     dirs.into_iter().fold(Vec::new(), |mut unique, dir| {
         if !unique.contains(&dir) {
             unique.push(dir);
