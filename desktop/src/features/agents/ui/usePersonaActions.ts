@@ -9,6 +9,7 @@ import {
   useCreatePersonaMutation,
   useDeletePersonaMutation,
   useExportAgentSnapshotMutation,
+  useOmpProfileCatalogQuery,
   usePersonasQuery,
   usePreviewAgentSnapshotImportMutation,
   useConfirmAgentSnapshotImportMutation,
@@ -71,6 +72,7 @@ export function usePersonaActions() {
   const { activeCommunity } = useCommunities();
   const identityQuery = useIdentityQuery();
   const communityId = activeCommunity?.id ?? null;
+  const ompProfileCatalogQuery = useOmpProfileCatalogQuery();
   const personasQuery = usePersonasQuery();
   const catalogQuery = usePersonaCatalogQuery(communityId);
   usePersonaCatalogLiveUpdates(communityId);
@@ -125,6 +127,8 @@ export function usePersonaActions() {
     React.useState<PersonaFeedbackSurface>("library");
   const createdAgentAttachment = useCreatedAgentChannelAttachment();
   const [isPersonaSubmitPending, setIsPersonaSubmitPending] =
+    React.useState(false);
+  const [isOmpProfileAddPending, setIsOmpProfileAddPending] =
     React.useState(false);
 
   const personas = personasQuery.data ?? [];
@@ -422,6 +426,73 @@ export function usePersonaActions() {
     setSnapshotImportConfirmError(null);
   }
 
+
+  async function addMissingOmpProfiles() {
+    if (isOmpProfileAddPending) return;
+
+    clearFeedback("library");
+    setIsOmpProfileAddPending(true);
+    try {
+      const catalogResult = await ompProfileCatalogQuery.refetch();
+      const catalog = catalogResult.data;
+      if (!catalog) {
+        throw new Error("The omp profile catalogue is unavailable.");
+      }
+      if (catalog.state !== "configured") {
+        setPersonaErrorMessage(
+          "The omp profile catalogue is unavailable; no personas were added.",
+        );
+        return;
+      }
+
+      const personaResult = await personasQuery.refetch();
+      if (!personaResult.data) {
+        throw new Error("Could not refresh the existing persona roster.");
+      }
+      const existingProfiles = new Set(
+        personaResult.data
+          .filter(
+            (persona) =>
+              persona.runtime === "omp" &&
+              typeof persona.envVars.OMP_PROFILE === "string",
+          )
+          .map((persona) => persona.envVars.OMP_PROFILE),
+      );
+      const existingDisplayNames = new Set(
+        personaResult.data.map((persona) => persona.displayName),
+      );
+      const missingProfiles = catalog.entries.filter(
+        (profile) =>
+          profile.name !== "default" &&
+          profile.name !== "designer" &&
+          !existingProfiles.has(profile.name) &&
+          !existingDisplayNames.has(profile.name),
+      );
+
+      for (const profile of missingProfiles) {
+        await createPersonaMutation.mutateAsync({
+          displayName: profile.name,
+          systemPrompt: "",
+          runtime: "omp",
+          envVars: { OMP_PROFILE: profile.name },
+        });
+      }
+      await personasQuery.refetch();
+      setPersonaNoticeMessage(
+        missingProfiles.length > 0
+          ? `Added ${missingProfiles.length} omp profile ${missingProfiles.length === 1 ? "persona" : "personas"}.`
+          : "All addable omp profile personas are already present.",
+      );
+    } catch (error) {
+      setPersonaErrorMessage(
+        error instanceof Error
+          ? error.message
+          : "Failed to add omp profile personas.",
+      );
+    } finally {
+      setIsOmpProfileAddPending(false);
+    }
+  }
   function prepareCreate() {
     clearFeedback("library");
     setShouldLoadAcpRuntimes(true);
@@ -550,6 +621,7 @@ export function usePersonaActions() {
 
   const isPending =
     isPersonaSubmitPending ||
+    isOmpProfileAddPending ||
     createPersonaMutation.isPending ||
     createAgentMutation.isPending ||
     updatePersonaMutation.isPending ||
@@ -560,9 +632,9 @@ export function usePersonaActions() {
     previewSnapshotImportMutation.isPending ||
     confirmSnapshotImportMutation.isPending ||
     setCatalogSharedMutation.isPending;
-
   return {
     personasQuery,
+    ompProfileCatalogQuery,
     catalogQuery,
     acpRuntimesQuery,
     createPersonaMutation,
@@ -586,6 +658,7 @@ export function usePersonaActions() {
     handleSubmit,
     handleDelete,
     handleSetActive,
+    addMissingOmpProfiles,
     prepareCreate,
     openEdit,
     openDuplicate,

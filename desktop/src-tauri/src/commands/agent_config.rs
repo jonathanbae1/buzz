@@ -6,10 +6,10 @@ use crate::{
     managed_agents::{
         config_bridge::{
             read_goose_file_config,
-            reader::{read_config_surface, read_omp_profile_surface},
+            reader::{read_config_surface, read_omp_profile_catalog, read_omp_profile_surface},
             types::{
                 AcpConfigOptionEntry, AcpConfigOptionValue, AcpModelEntry, InheritedConfigTiers,
-                RuntimeConfigSurface, SessionConfigCache,
+                OmpProfileCatalog, RuntimeConfigSurface, SessionConfigCache,
             },
         },
         current_instance_id, is_reserved_env_key, is_safe_to_reveal, is_well_formed_env_key,
@@ -246,6 +246,16 @@ pub fn get_baked_build_env() -> Vec<BakedEnvEntry> {
             }
         })
         .collect()
+}
+
+/// Return the safe installer-owned omp profile catalogue for this machine.
+///
+/// The response contains only catalogue state and profile declarations. It
+/// does not expose the manifest path, environment values, credentials, or
+/// process state.
+#[tauri::command]
+pub fn get_omp_profile_catalog() -> OmpProfileCatalog {
+    read_omp_profile_catalog()
 }
 
 /// Get the full config surface for a managed agent.

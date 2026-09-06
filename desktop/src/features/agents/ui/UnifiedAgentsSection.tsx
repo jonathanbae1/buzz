@@ -1,5 +1,5 @@
 import * as React from "react";
-import { AlertTriangle, ChevronDown, ChevronRight } from "lucide-react";
+import { AlertTriangle, ChevronDown, ChevronRight, Plus } from "lucide-react";
 
 import {
   isAgentCardAvatarLoading,
@@ -13,10 +13,15 @@ import { isManagedAgentActive } from "@/features/agents/lib/managedAgentControlA
 import { pickProfileAgent } from "@/features/agents/lib/pickProfileAgent";
 import { useIsArchivedPredicate } from "@/features/identity-archive/hooks";
 import { useUserProfileQuery } from "@/features/profile/hooks";
-import type { AgentPersona, ManagedAgent } from "@/shared/api/types";
+import type {
+  AgentPersona,
+  ManagedAgent,
+  OmpProfileCatalog,
+} from "@/shared/api/types";
 import type { ProfilePanelOpenOptions } from "@/shared/context/ProfilePanelContext";
 import { useFeedbackToasts } from "@/shared/hooks/useToastEffect";
 import { Badge } from "@/shared/ui/badge";
+import { Button } from "@/shared/ui/button";
 import {
   ProtectedBestieCardBadge,
   useProtectedBestiePubkey,
@@ -49,6 +54,11 @@ type UnifiedAgentsSectionProps = {
   onStartAgent: (pubkey: string) => void;
   onStartPersona: (persona: AgentPersona) => void;
   personas: AgentPersona[];
+  allPersonas: AgentPersona[];
+  ompProfileCatalog?: OmpProfileCatalog;
+  ompProfileCatalogError: Error | null;
+  isOmpProfileCatalogLoading: boolean;
+  onAddMissingOmpProfiles: () => void;
   personasError: Error | null;
   personaFeedbackErrorMessage: string | null;
   personaFeedbackNoticeMessage: string | null;
@@ -74,6 +84,7 @@ export const IDENTITY_CARD_GRID_CLASS = `${AGENT_CARD_COLUMN_CLASS} ${AGENT_CARD
 export function UnifiedAgentsSection(props: UnifiedAgentsSectionProps) {
   const {
     actionErrorMessage,
+    allPersonas = [],
     actionNoticeMessage,
     defaultModel,
     getAvailability,
@@ -89,9 +100,13 @@ export function UnifiedAgentsSection(props: UnifiedAgentsSectionProps) {
     onRestartAgent,
     onStartAgent,
     onStartPersona,
+    ompProfileCatalog,
+    ompProfileCatalogError = null,
     personas,
     personasError,
     personaFeedbackErrorMessage,
+    isOmpProfileCatalogLoading = false,
+    onAddMissingOmpProfiles = () => {},
     personaFeedbackNoticeMessage,
     isPersonasLoading,
     isPersonasPending,
@@ -216,6 +231,14 @@ export function UnifiedAgentsSection(props: UnifiedAgentsSectionProps) {
         </div>
       ) : null}
 
+      <OmpProfileRoster
+        allPersonas={allPersonas}
+        catalog={ompProfileCatalog}
+        catalogError={ompProfileCatalogError}
+        isCatalogLoading={isOmpProfileCatalogLoading}
+        isPending={isPersonasPending}
+        onAddMissing={onAddMissingOmpProfiles}
+      />
       {agentsError ? (
         <p
           className={`${AGENT_CARD_COLUMN_CLASS} rounded-2xl border border-destructive/30 bg-destructive/10 px-4 py-3 text-sm text-destructive`}
@@ -229,6 +252,163 @@ export function UnifiedAgentsSection(props: UnifiedAgentsSectionProps) {
         >
           {personasError.message}
         </p>
+      ) : null}
+    </section>
+  );
+}
+
+function OmpProfileRoster({
+  allPersonas,
+  catalog,
+  catalogError,
+  isCatalogLoading,
+  isPending,
+  onAddMissing,
+}: {
+  allPersonas: AgentPersona[];
+  catalog?: OmpProfileCatalog;
+  catalogError: Error | null;
+  isCatalogLoading: boolean;
+  isPending: boolean;
+  onAddMissing: () => void;
+}) {
+  const configuredEntries =
+    catalog?.state === "configured" ? catalog.entries : [];
+  const defaultEntry = configuredEntries.find(
+    (entry) => entry.name === "default",
+  );
+  const specialistEntries = configuredEntries.filter(
+    (entry) => entry.name !== "default",
+  );
+  const missingAddableCount = specialistEntries.filter(
+    (entry) =>
+      entry.name !== "designer" &&
+      !allPersonas.some(
+        (persona) =>
+          persona.runtime === "omp" &&
+          persona.envVars.OMP_PROFILE === entry.name,
+      ) &&
+      !allPersonas.some((persona) => persona.displayName === entry.name),
+  ).length;
+
+  return (
+    <section
+      className="space-y-3 rounded-2xl border border-border/70 bg-card/50 p-4"
+      data-testid="omp-profile-roster"
+    >
+      <div className="flex flex-wrap items-start justify-between gap-3">
+        <div className="min-w-0">
+          <h2 className="text-sm font-semibold text-foreground">omp profiles</h2>
+          <p className="text-xs text-muted-foreground">
+            Installed profiles are separate from personas and running instances.
+          </p>
+        </div>
+        {catalog?.state === "configured" ? (
+          <Button
+            disabled={isPending || missingAddableCount === 0}
+            onClick={onAddMissing}
+            size="sm"
+            type="button"
+            variant="outline"
+          >
+            <Plus />
+            Add missing profiles
+          </Button>
+        ) : null}
+      </div>
+
+      {isCatalogLoading ? (
+        <p className="text-sm text-muted-foreground">Reading installed profiles…</p>
+      ) : null}
+      {catalogError ? (
+        <p className="text-sm text-destructive">
+          The installed omp profile catalogue could not be read.
+        </p>
+      ) : null}
+      {!isCatalogLoading && !catalogError && catalog?.state !== "configured" ? (
+        <p className="text-sm text-warning">
+          {catalog?.state === "invalid"
+            ? "The installed omp profile catalogue is invalid. Repair it before adding profile personas."
+            : "The installed omp profile catalogue is unavailable. No profile personas were added."}
+        </p>
+      ) : null}
+
+      {catalog?.state === "configured" ? (
+        <div className="space-y-2">
+          {defaultEntry ? (
+            <div
+              className="flex flex-wrap items-baseline justify-between gap-x-3 gap-y-1 rounded-lg border border-border/60 bg-muted/20 px-3 py-2"
+              data-testid="omp-profile-row-default"
+            >
+              <div className="min-w-0">
+                <div className="flex items-center gap-2">
+                  <span className="font-medium text-foreground">default</span>
+                  <Badge variant="secondary">Fallback</Badge>
+                </div>
+                <p className="truncate text-xs text-muted-foreground">
+                  {defaultEntry.modelLane}
+                </p>
+              </div>
+              <span className="text-xs text-muted-foreground">
+                Used when no profile is selected
+              </span>
+            </div>
+          ) : null}
+
+          <div className="divide-y divide-border/50 rounded-lg border border-border/60">
+            {specialistEntries.map((entry) => {
+              const matchingPersona = allPersonas.find(
+                (persona) =>
+                  persona.runtime === "omp" &&
+                  persona.envVars.OMP_PROFILE === entry.name,
+              );
+              const nameConflict =
+                matchingPersona === undefined &&
+                allPersonas.some(
+                  (persona) => persona.displayName === entry.name,
+                );
+              const isDesigner = entry.name === "designer";
+              return (
+                <div
+                  className="flex flex-wrap items-center justify-between gap-3 px-3 py-2.5"
+                  data-testid={`omp-profile-row-${entry.name}`}
+                  key={entry.name}
+                >
+                  <div className="min-w-0">
+                    <div className="flex flex-wrap items-center gap-2">
+                      <span className="font-medium text-foreground">
+                        {entry.name}
+                      </span>
+                      {matchingPersona ? (
+                        <Badge variant="secondary">Persona present</Badge>
+                      ) : nameConflict ? (
+                        <Badge variant="warning">Name conflict</Badge>
+                      ) : isDesigner ? (
+                        <Badge variant="warning">Catalogue only</Badge>
+                      ) : (
+                        <Badge variant="outline">Not added</Badge>
+                      )}
+                    </div>
+                    <p className="truncate text-xs text-muted-foreground">
+                      {entry.modelLane}
+                    </p>
+                  </div>
+                  <span className="max-w-full text-right text-xs text-muted-foreground">
+                    {matchingPersona
+                      ? isDesigner
+                        ? `${matchingPersona.displayName} · existing assignment; new designer personas are gated`
+                        : matchingPersona.displayName
+                      : nameConflict
+                        ? "Existing persona is unchanged"
+                        : isDesigner
+                          ? "Pending activation gate; add is disabled"
+                          : "Available to add"}
+                  </span>
+                </div>
+              );
+            })}
+          </div>
+        </div>
       ) : null}
     </section>
   );

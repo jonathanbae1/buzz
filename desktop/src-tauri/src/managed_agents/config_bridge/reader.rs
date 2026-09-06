@@ -126,6 +126,49 @@ fn read_profile_manifest(path: &Path) -> Result<OmpProfileManifest, OmpProfileUn
     }
 }
 
+/// Read the installer-owned catalogue from this machine's default omp config
+/// root. Persona-specific `PI_CONFIG_DIR` values are intentionally not
+/// consulted here; those remain explicit per-persona configuration.
+pub(crate) fn read_omp_profile_catalog() -> OmpProfileCatalog {
+    let empty_env = BTreeMap::new();
+    let ambient_env = std::env::var("PI_CONFIG_DIR")
+        .map(|value| BTreeMap::from([("PI_CONFIG_DIR".to_string(), value)]))
+        .unwrap_or_default();
+    let Some(path) = safe_profile_config_dir(&empty_env, &ambient_env) else {
+        return OmpProfileCatalog {
+            state: OmpProfileState::Unavailable,
+            entries: Vec::new(),
+            unavailable_reason: Some(OmpProfileUnavailableReason::ManifestMissing),
+        };
+    };
+
+    match read_profile_manifest(&path) {
+        Ok(manifest) => OmpProfileCatalog {
+            state: OmpProfileState::Configured,
+            entries: manifest
+                .profiles
+                .into_iter()
+                .map(|profile| OmpProfileCatalogEntry {
+                    name: profile.name,
+                    model_lane: profile.model_lane,
+                    rule_paths: profile.rule_paths,
+                    plugin_names: profile.plugin_names,
+                })
+                .collect(),
+            unavailable_reason: None,
+        },
+        Err(reason) => OmpProfileCatalog {
+            state: if reason == OmpProfileUnavailableReason::ManifestInvalid {
+                OmpProfileState::Invalid
+            } else {
+                OmpProfileState::Unavailable
+            },
+            entries: Vec::new(),
+            unavailable_reason: Some(reason),
+        },
+    }
+}
+
 fn safe_profile_config_dir(
     effective_env: &BTreeMap<String, String>,
     ambient_env: &BTreeMap<String, String>,

@@ -38,6 +38,7 @@ import type {
   CommandAvailability,
   InstallRuntimeResult,
   GitBashPrerequisite,
+  OmpProfileCatalog,
   RuntimeConfigSurface,
 } from "@/shared/api/types";
 
@@ -940,6 +941,10 @@ export async function getAgentConfigSurface(
   return invokeTauri<RuntimeConfigSurface>("get_agent_config_surface", {
     pubkey,
   });
+}
+
+export async function getOmpProfileCatalog(): Promise<OmpProfileCatalog> {
+  return invokeTauri<OmpProfileCatalog>("get_omp_profile_catalog");
 }
 
 export async function putAgentSessionConfig(

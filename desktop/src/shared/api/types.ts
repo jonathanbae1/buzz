@@ -695,6 +695,19 @@ export type OmpProfileSurface = {
   unavailableReason: OmpProfileUnavailableReason | null;
 };
 
+export type OmpProfileCatalogEntry = {
+  name: string;
+  modelLane: string;
+  rulePaths: string[];
+  pluginNames: string[];
+};
+
+export type OmpProfileCatalog = {
+  state: OmpProfileState;
+  entries: OmpProfileCatalogEntry[];
+  unavailableReason: OmpProfileUnavailableReason | null;
+};
+
 export type RuntimeConfigSurface = {
   runtimeId: string | null;
   runtimeLabel: string | null;

@@ -67,7 +67,11 @@ import {
   MODEL_DISCOVERY_LOADING_VALUE,
   usePersonaModelDiscovery,
 } from "./usePersonaModelDiscovery";
-import { useBakedBuildEnvKeysQuery, useRuntimeFileConfigQuery } from "../hooks";
+import {
+  useBakedBuildEnvKeysQuery,
+  useOmpProfileCatalogQuery,
+  useRuntimeFileConfigQuery,
+} from "../hooks";
 import { useAgentDialogDefaults } from "./useAgentDialogDefaults";
 import { AgentDefaultsDialog } from "./AgentDefaultsDialog";
 import { AgentHarnessField } from "./AgentHarnessField";
@@ -172,6 +176,11 @@ export function AgentDefinitionDialog({
   // snap the dropdown back to the default — an edit-mode regression.
   const hasSeededForOpenRef = React.useRef(false);
   const [showAdvancedFields, setShowAdvancedFields] = React.useState(false);
+  const ompProfileCatalogQuery = useOmpProfileCatalogQuery({
+    enabled:
+      open &&
+      (runtime.trim() === "omp" || initialValues?.runtime?.trim() === "omp"),
+  });
   const [isAvatarUploadPending, setIsAvatarUploadPending] =
     React.useState(false);
   const [hasUserChanges, setHasUserChanges] = React.useState(false);
@@ -499,6 +508,60 @@ export function AgentDefinitionDialog({
     selectedRuntime?.availability === "available";
   // Gate model/provider validity through missingNormalizedFields — single
   // source of truth with the readiness gate so display and Save can't drift.
+  const ompProfileRawValue =
+    runtime.trim() === "omp" ? (envVars.OMP_PROFILE ?? "") : "";
+  const ompProfileSelection = ompProfileRawValue.trim();
+  const ompProfileEntries =
+    ompProfileCatalogQuery.data?.state === "configured"
+      ? ompProfileCatalogQuery.data.entries
+      : [];
+  const ompProfileNames = new Set(
+    ompProfileEntries.map((entry) => entry.name),
+  );
+  const ompProfileHasInvalidSelection =
+    runtime.trim() === "omp" &&
+    ompProfileSelection.length > 0 &&
+    ompProfileCatalogQuery.data?.state === "configured" &&
+    !ompProfileNames.has(ompProfileSelection);
+  const ompProfileOptions = React.useMemo(() => {
+    const options: PersonaDropdownOption[] = [
+      { label: "Default (inherit)", value: "" },
+    ];
+    if (ompProfileCatalogQuery.data?.state === "configured") {
+      options.push(
+        ...ompProfileCatalogQuery.data.entries.map((entry) => ({
+          label:
+            entry.name === "default"
+              ? "default (machine fallback)"
+              : entry.name,
+          value: entry.name,
+          disabled: entry.name === "designer",
+        })),
+      );
+    } else if (ompProfileSelection.length > 0) {
+      options.push({
+        label: `${ompProfileSelection} (current; catalogue unavailable)`,
+        value: ompProfileSelection,
+        disabled: true,
+      });
+    }
+    if (
+      ompProfileSelection.length > 0 &&
+      !ompProfileNames.has(ompProfileSelection) &&
+      ompProfileCatalogQuery.data?.state === "configured"
+    ) {
+      options.push({
+        label: `${ompProfileSelection} (not installed)`,
+        value: ompProfileSelection,
+        disabled: true,
+      });
+    }
+    return options;
+  }, [
+    ompProfileCatalogQuery.data,
+    ompProfileNames,
+    ompProfileSelection,
+  ]);
   const canSubmit =
     canSubmitPersonaDialog({ displayName, isPending }) &&
     (!isCreateMode || runtime.trim().length > 0) &&
@@ -511,6 +574,7 @@ export function AgentDefinitionDialog({
     // missingEnvKeys — credential env keys now block submit, not just display.
     localModeSatisfied &&
     customAiPairSatisfied &&
+    !ompProfileHasInvalidSelection &&
     !isAvatarUploadPending;
 
   // Merge global env as the base layer so credential keys satisfied via global
@@ -693,6 +757,17 @@ export function AgentDefinitionDialog({
     );
   }
 
+  function handleOmpProfileChange(nextValue: string) {
+    setHasUserChanges(true);
+    setEnvVars((current) => {
+      if (nextValue.trim().length === 0) {
+        const { OMP_PROFILE: _ompProfile, ...rest } = current;
+        return rest;
+      }
+      return { ...current, OMP_PROFILE: nextValue };
+    });
+  }
+
   // Routed through the normal change handler so a harness registered inline
   // resets model/provider exactly as a hand-picked one would. Scoped to `open`
   // so a pending id can't outlive the dialog that started the registration.
@@ -816,6 +891,40 @@ export function AgentDefinitionDialog({
               value={runtimeDropdownValue}
               warning={runtimeWarning}
             />
+          ) : null}
+          {runtime.trim() === "omp" ? (
+            <div className="space-y-1.5">
+              <RequiredFieldLabel htmlFor="persona-omp-profile" isRequired={false}>
+                omp profile
+                <span className={PERSONA_LABEL_OPTIONAL_CLASS}>Optional</span>
+              </RequiredFieldLabel>
+              <PersonaDropdownField
+                disabled={isPending}
+                id="persona-omp-profile"
+                onValueChange={handleOmpProfileChange}
+                options={ompProfileOptions}
+                placeholder="Choose an omp profile"
+                value={ompProfileSelection}
+              />
+              {ompProfileHasInvalidSelection ? (
+                <p className="text-xs text-destructive">
+                  “{ompProfileSelection}” is not installed. Choose an installed
+                  profile or Default (inherit) before saving.
+                </p>
+              ) : null}
+              {ompProfileCatalogQuery.error ? (
+                <p className="text-xs text-warning">
+                  The omp profile catalogue is unavailable. The current value is
+                  preserved.
+                </p>
+              ) : null}
+              {ompProfileCatalogQuery.data?.state === "invalid" ? (
+                <p className="text-xs text-warning">
+                  The omp profile catalogue is invalid. Repair it before choosing
+                  a different profile.
+                </p>
+              ) : null}
+            </div>
           ) : null}
           {llmProviderFieldVisible && aiConfigurationMode === "custom" ? (
             <div className="space-y-1.5">
@@ -970,9 +1079,10 @@ export function AgentDefinitionDialog({
                   disabled={isPending}
                   envVars={envVars}
                   fileSatisfiedEnvKeys={localModeGate.fileSatisfiedEnvKeys}
-                  hiddenEnvKeys={
-                    topLevelSecretEnvVar ? [topLevelSecretEnvVar] : []
-                  }
+                  hiddenEnvKeys={[
+                    ...(topLevelSecretEnvVar ? [topLevelSecretEnvVar] : []),
+                    ...(runtime.trim() === "omp" ? ["OMP_PROFILE"] : []),
+                  ]}
                   inheritedEnvVars={inheritedEnvVarsForAdvanced}
                   model={model}
                   modelTuningRuntimeId={runtime}

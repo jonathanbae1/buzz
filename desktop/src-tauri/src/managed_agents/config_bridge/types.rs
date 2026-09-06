@@ -225,6 +225,27 @@ pub struct OmpProfileSurface {
     pub unavailable_reason: Option<OmpProfileUnavailableReason>,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct OmpProfileCatalogEntry {
+    pub name: String,
+    pub model_lane: String,
+    pub rule_paths: Vec<String>,
+    pub plugin_names: Vec<String>,
+}
+
+/// Read-only catalogue of the installer-owned omp profile manifest.
+///
+/// This projection contains only safe profile declarations. It never includes
+/// the manifest path, environment values, credentials, or process state.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct OmpProfileCatalog {
+    pub state: OmpProfileState,
+    pub entries: Vec<OmpProfileCatalogEntry>,
+    pub unavailable_reason: Option<OmpProfileUnavailableReason>,
+}
+
 #[derive(Debug, Clone, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub(crate) struct OmpProfileManifest {
