@@ -26,6 +26,7 @@ import type {
   ConfigOrigin,
   NormalizedConfig,
   NormalizedField,
+  OmpProfileSurface,
   RuntimeConfigSurface,
 } from "@/shared/api/types";
 import { providerDisplayLabel } from "./agentConfigOptions";
@@ -289,12 +290,130 @@ function ProfileConfigSection({
   );
 }
 
+function profileReasonLabel(profile: OmpProfileSurface): string {
+  if (profile.state === "configured") {
+    return "Configured";
+  }
+  if (profile.state === "invalid") {
+    return "Invalid declaration";
+  }
+  switch (profile.unavailableReason) {
+    case "manifestMissing":
+      return "Manifest unavailable";
+    case "manifestUnreadable":
+      return "Manifest unreadable";
+    case "manifestInvalid":
+      return "Manifest invalid";
+    case "selectorConflict":
+      return "Conflicting --profile argument";
+    case "selectorInvalid":
+      return "Invalid selector";
+    case "undeclared":
+      return "Selected profile is undeclared";
+    default:
+      return "Unavailable";
+  }
+}
+function profileOriginLabel(
+  origin: OmpProfileSurface["selectionOrigin"],
+): string {
+  switch (origin) {
+    case "recordEnv":
+      return "Agent environment";
+    case "personaEnv":
+      return "Persona environment";
+    case "globalEnv":
+      return "Global environment";
+    case "harnessEnv":
+      return "Harness environment";
+    case "processEnv":
+      return "Ambient process environment";
+    case "piProfile":
+      return "PI_PROFILE";
+    case "default":
+      return "Default";
+    default:
+      return "Unknown";
+  }
+}
+
+function OmpProfileDisclosure({
+  profile,
+  variant,
+}: {
+  profile: OmpProfileSurface;
+  variant: RowVariant;
+}) {
+  const details = (
+    <div className="space-y-1 px-4 py-3 text-xs">
+      <div className="flex items-center justify-between gap-3">
+        <span className="font-medium text-foreground">Selected profile</span>
+        <span className="truncate text-muted-foreground">
+          {profile.selectedName ?? "—"}
+        </span>
+      </div>
+      <div className="flex items-center justify-between gap-3">
+        <span className="font-medium text-foreground">Selection source</span>
+        <span className="text-muted-foreground">
+          {profileOriginLabel(profile.selectionOrigin)}
+        </span>
+      </div>
+      <div className="flex items-center justify-between gap-3">
+        <span className="font-medium text-foreground">State</span>
+        <span className="text-muted-foreground">{profileReasonLabel(profile)}</span>
+      </div>
+      {profile.modelLane ? (
+        <div className="flex items-center justify-between gap-3">
+          <span className="font-medium text-foreground">Model lane</span>
+          <span className="truncate font-mono text-muted-foreground">
+            {profile.modelLane}
+          </span>
+        </div>
+      ) : null}
+      {profile.rulePaths.length > 0 ? (
+        <div className="flex items-start justify-between gap-3">
+          <span className="font-medium text-foreground">Rules</span>
+          <span className="text-right text-muted-foreground">
+            {profile.rulePaths.join(", ")}
+          </span>
+        </div>
+      ) : null}
+      {profile.pluginNames.length > 0 ? (
+        <div className="flex items-center justify-between gap-3">
+          <span className="font-medium text-foreground">Plugins</span>
+          <span
+            className="text-muted-foreground"
+            title={profile.pluginNames.join(", ")}
+          >
+            {profile.pluginNames.length} declared
+          </span>
+        </div>
+      ) : null}
+    </div>
+  );
+
+  if (variant === "profile") {
+    return (
+      <ProfileConfigSection testId="user-profile-omp-profile-section" title="omp profile">
+        {details}
+      </ProfileConfigSection>
+    );
+  }
+  return (
+    <div
+      className="border-b border-border/50"
+      data-testid="agent-config-omp-profile-section"
+    >
+      {details}
+    </div>
+  );
+}
+
 /**
  * #3493: caveat shown when the surface was read from a user-set
  * `CLAUDE_CONFIG_DIR`. Claude Code keys its stored login to the config-dir
  * path, so a custom dir maps to a fresh Keychain namespace — the agent starts
- * logged out unless `CLAUDE_SECURESTORAGE_CONFIG_DIR` is set to match the
- * default login.
+ * logged out unless `CLAUDE_SECURESTORAGE_CONFIG_DIR` is set to match the default login.
  */
 function ClaudeConfigDirNotice() {
   return (
@@ -379,7 +498,8 @@ export function AgentConfigSurfaceRows({
 }: AgentConfigSurfaceRowsProps) {
   const [advancedOpen, setAdvancedOpen] = React.useState(false);
 
-  const { normalized, advanced, extensions, runtimeId, sources } = data;
+  const { normalized, advanced, extensions, runtimeId, sources, ompProfile } =
+    data;
   const mcpConfigFilePath = sources.mcpConfigFilePath;
   const claudeConfigDirCustom = data.claudeConfigDirCustom ?? false;
 
@@ -413,6 +533,9 @@ export function AgentConfigSurfaceRows({
   if (advancedMode === "flat") {
     return (
       <div className="space-y-4">
+        {ompProfile ? (
+          <OmpProfileDisclosure profile={ompProfile} variant="profile" />
+        ) : null}
         {showModelSection && normalizedEntries.length > 0 ? (
           <ProfileConfigSection
             testId="user-profile-model-settings-section"
@@ -465,6 +588,9 @@ export function AgentConfigSurfaceRows({
 
   return (
     <div className="space-y-0.5">
+      {ompProfile ? (
+        <OmpProfileDisclosure profile={ompProfile} variant="compact" />
+      ) : null}
       {/* Normalized section */}
       <div className="divide-y divide-border/50">
         {normalizedEntries.length === 0 ? (

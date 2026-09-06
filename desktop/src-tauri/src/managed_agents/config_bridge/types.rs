@@ -177,6 +177,70 @@ pub struct ConfigSourceReport {
     pub mcp_config_file_path: Option<String>,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub enum OmpProfileState {
+    Configured,
+    Unavailable,
+    Invalid,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub enum OmpProfileSelectionOrigin {
+    RecordEnv,
+    PersonaEnv,
+    GlobalEnv,
+    HarnessEnv,
+    ProcessEnv,
+    PiProfile,
+    Default,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub enum OmpProfileUnavailableReason {
+    ManifestMissing,
+    ManifestUnreadable,
+    ManifestInvalid,
+    SelectorConflict,
+    SelectorInvalid,
+    Undeclared,
+}
+
+/// Read-only projection of the installer-owned omp profile manifest.
+///
+/// This never contains environment values, command paths, or a manifest path.
+/// The selected profile's declaration is kept separate from `normalized.model`,
+/// which remains Buzz's own model override.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct OmpProfileSurface {
+    pub state: OmpProfileState,
+    pub selected_name: Option<String>,
+    pub selection_origin: Option<OmpProfileSelectionOrigin>,
+    pub model_lane: Option<String>,
+    pub rule_paths: Vec<String>,
+    pub plugin_names: Vec<String>,
+    pub unavailable_reason: Option<OmpProfileUnavailableReason>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub(crate) struct OmpProfileManifest {
+    pub schema_version: u8,
+    pub profiles: Vec<OmpProfileDeclaration>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub(crate) struct OmpProfileDeclaration {
+    pub name: String,
+    pub model_lane: String,
+    pub rule_paths: Vec<String>,
+    pub plugin_names: Vec<String>,
+}
+
 /// Full config surface returned to the frontend.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -216,6 +280,10 @@ pub struct RuntimeConfigSurface {
     /// The current mode reported by the running ACP session.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub current_mode: Option<String>,
+    /// Installer-owned omp profile metadata. This is read-only and absent when
+    /// the manifest cannot be resolved.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub omp_profile: Option<OmpProfileSurface>,
 }
 
 /// Raw config values extracted from a runtime's config file.

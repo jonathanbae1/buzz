@@ -6,7 +6,7 @@ use crate::{
     managed_agents::{
         config_bridge::{
             read_goose_file_config,
-            reader::read_config_surface,
+            reader::{read_config_surface, read_omp_profile_surface},
             types::{
                 AcpConfigOptionEntry, AcpConfigOptionValue, AcpModelEntry, InheritedConfigTiers,
                 RuntimeConfigSurface, SessionConfigCache,
@@ -14,9 +14,9 @@ use crate::{
         },
         current_instance_id, is_reserved_env_key, is_safe_to_reveal, is_well_formed_env_key,
         known_acp_runtime, load_managed_agents, load_personas, resolve_effective_agent_env,
-        save_managed_agents, sync_managed_agent_processes, AgentDefinition, BackendKind,
-        GlobalAgentConfig, KnownAcpRuntime, ManagedAgentRecord, ManagedAgentRuntimeKey,
-        MAX_ENV_VALUE_BYTES,
+        save_managed_agents, sync_managed_agent_processes, AgentDefinition, GlobalAgentConfig,
+        KnownAcpRuntime, ManagedAgentRecord, ManagedAgentRuntimeKey, MAX_ENV_VALUE_BYTES,
+        BackendKind,
     },
 };
 
@@ -319,14 +319,32 @@ pub async fn get_agent_config_surface(
         None
     };
 
-    Ok(resolve_config_surface(
-        record,
+    let profile_tiers = build_inherited_tiers(
+        record.persona_id.as_deref(),
+        record.runtime.as_deref(),
+        &personas,
+        &global,
+    );
+    let profile_env = resolve_effective_agent_env(&record, &personas, runtime_meta, &global);
+    let ambient_profile_env = ["OMP_PROFILE", "PI_PROFILE", "PI_CONFIG_DIR"]
+        .into_iter()
+        .filter_map(|key| std::env::var(key).ok().map(|value| (key.to_string(), value)))
+        .collect();
+    let mut surface = resolve_config_surface(
+        record.clone(),
         &personas,
         runtime_meta,
         session_cache.as_ref(),
         &global,
         claude_config_dir.as_deref(),
-    ))
+    );
+    surface.omp_profile = Some(read_omp_profile_surface(
+        &record,
+        &profile_tiers,
+        &profile_env.env,
+        &ambient_profile_env,
+    ));
+    Ok(surface)
 }
 
 /// Store a `session_config_captured` observer event payload into the session cache.
@@ -580,42 +598,15 @@ fn parse_models(raw: Option<&serde_json::Value>) -> (Vec<AcpModelEntry>, Option<
     (models, current_model)
 }
 
-/// Persist the canonical startup effort level for a local managed agent.
-///
-/// B5 (v4 direct-write): the panel's EffortPicker calls this directly to set the
-/// effort a spawn will apply at next session start. The value is stored on the
-/// record; at spawn `runtime.rs` injects it as `BUZZ_ACP_EFFORT_LEVEL` and the
-/// harness applies it via `session/set_config_option` against the adapter's
-/// advertised `thought_level` configId. Pass `None` to clear (adapter default).
-///
-/// Rejects non-local backends: remote agents receive effort through `policy_env`
-/// at deploy time (see `agents_deploy.rs`), never this local persistence path —
-/// so an effort edit against a deployed agent is a caller error, not a silent
-/// no-op that leaves the panel and the running agent disagreeing.
-#[tauri::command]
-pub fn persist_agent_effort_level(
-    pubkey: String,
+/// Atomically set the record's canonical effort column and strip every stale
+/// record-scope effort env alias. Split from the Tauri command so the invariant
+/// — no leftover alias can outrank the just-set column — is directly testable.
+pub(crate) fn apply_picker_effort_level(
+    record: &mut ManagedAgentRecord,
     effort_level: Option<String>,
-    app: AppHandle,
-    state: State<'_, AppState>,
-) -> Result<(), String> {
-    let _store_guard = state
-        .managed_agents_store_lock
-        .lock()
-        .map_err(|e| e.to_string())?;
-    let mut records = load_managed_agents(&app)?;
-    let record = records
-        .iter_mut()
-        .find(|r| r.pubkey == pubkey)
-        .ok_or_else(|| format!("agent {pubkey} not found"))?;
-    if record.backend != BackendKind::Local {
-        return Err(format!(
-            "agent {pubkey} is not a local agent; remote effort is set at deploy time"
-        ));
-    }
+) {
     record.effort_level = effort_level;
-    record.updated_at = crate::util::now_iso();
-    save_managed_agents(&app, &records)
+    crate::managed_agents::remove_record_effort_aliases(&mut record.env_vars);
 }
 
 /// Persist the canonical startup session mode for a local managed agent.

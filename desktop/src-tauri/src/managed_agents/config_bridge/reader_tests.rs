@@ -1,5 +1,5 @@
 //! Unit tests for `config_bridge/reader.rs` (kept in a sibling file so
-//! `reader.rs` stays under the 1000-line budget; `#[path]`-included from
+//! `reader.rs` stays under the 1500-line budget; `#[path]`-included from
 //! there).
 
 use std::{collections::BTreeMap, path::Path, sync::Mutex};
@@ -28,7 +28,7 @@ fn with_goose_path_root<T>(value: Option<&str>, body: impl FnOnce() -> T) -> T {
 }
 
 fn test_runtime() -> &'static KnownAcpRuntime {
-    &KnownAcpRuntime {
+    static RUNTIME: KnownAcpRuntime = KnownAcpRuntime {
         id: "goose",
         label: "Goose",
         commands: &["goose"],
@@ -54,17 +54,21 @@ fn test_runtime() -> &'static KnownAcpRuntime {
         config_file_format: Some("yaml"),
         supports_acp_native_config: true,
         thinking_env_var: Some("GOOSE_THINKING_EFFORT"),
+        effort_normalization: Some(&crate::managed_agents::discovery::GOOSE_EFFORT_NORMALIZATION),
+        effort_accepted_values: None,
         max_tokens_env_var: Some("GOOSE_MAX_TOKENS"),
         context_limit_env_var: Some("GOOSE_CONTEXT_LIMIT"),
         max_rounds_env_var: None,
         required_normalized_fields: &["model", "provider"],
         login_hint: None,
         auth_probe_args: None,
-    }
+    };
+    &RUNTIME
 }
 
 fn test_record() -> ManagedAgentRecord {
     ManagedAgentRecord {
+        description: None,
         pubkey: "test".to_string(),
         name: "Test Agent".to_string(),
         persona_id: None,
@@ -112,6 +116,7 @@ fn test_record() -> ManagedAgentRecord {
         source_team: None,
         source_team_persona_slug: None,
         catalog_source: None,
+        team_catalog_source: None,
         definition_respond_to: None,
         definition_respond_to_allowlist: Vec::new(),
         definition_parallelism: None,
@@ -711,6 +716,8 @@ fn buzz_agent_runtime() -> &'static KnownAcpRuntime {
         config_file_format: None,
         supports_acp_native_config: false,
         thinking_env_var: Some("BUZZ_AGENT_THINKING_EFFORT"),
+        effort_normalization: None,
+        effort_accepted_values: None,
         max_tokens_env_var: Some("BUZZ_AGENT_MAX_OUTPUT_TOKENS"),
         context_limit_env_var: Some("BUZZ_AGENT_MAX_CONTEXT_TOKENS"),
         max_rounds_env_var: Some("BUZZ_AGENT_MAX_ROUNDS"),
@@ -1021,6 +1028,77 @@ fn numeric_max_tokens_inherits_from_global_env() {
     assert_eq!(field.origin, ConfigOrigin::GlobalDefault);
 }
 
+#[test]
+fn omp_manifest_validation_rejects_unknown_fields_and_path_bearing_values() {
+    let valid: OmpProfileManifest = serde_json::from_value(serde_json::json!({
+        "schemaVersion": 1,
+        "profiles": [{
+            "name": "coder",
+            "modelLane": "openai-codex/gpt-5.6-luna",
+            "rulePaths": ["profiles/rules/global.md"],
+            "pluginNames": ["agentmemory@agentmemory"]
+        }, {
+            "name": "default",
+            "modelLane": "anthropic/claude-opus-5:max",
+            "rulePaths": ["profiles/rules/global.md"],
+            "pluginNames": []
+        }]
+    }))
+    .unwrap();
+    assert!(valid_manifest(&valid));
+
+    let path_bearing = OmpProfileManifest {
+        profiles: vec![OmpProfileDeclaration {
+            name: "coder".to_string(),
+            model_lane: "openai-codex/gpt-5.6-luna".to_string(),
+            rule_paths: vec!["../../private".to_string()],
+            plugin_names: vec!["agentmemory@agentmemory".to_string()],
+        }],
+        schema_version: 1,
+    };
+    assert!(!valid_manifest(&path_bearing));
+
+    let unknown = serde_json::from_value::<OmpProfileManifest>(serde_json::json!({
+        "schemaVersion": 1,
+        "profiles": [],
+        "secret": "/tmp/private"
+    }));
+    assert!(unknown.is_err());
+}
+
+#[test]
+fn omp_profile_selector_uses_defined_empty_and_pi_profile_only_as_fallback() {
+    let mut record = test_record();
+    record.env_vars.insert("OMP_PROFILE".into(), " ".into());
+    let mut tiers = InheritedConfigTiers::default();
+    tiers.global_env.insert("PI_PROFILE".into(), "coder".into());
+    let mut ambient = BTreeMap::new();
+    ambient.insert("OMP_PROFILE".into(), "process".into());
+    let (selector, origin) = profile_selector(&record, &tiers, &ambient);
+    assert_eq!(selector, " ");
+    assert_eq!(origin, OmpProfileSelectionOrigin::RecordEnv);
+
+    record.env_vars.remove("OMP_PROFILE");
+    let (selector, origin) = profile_selector(&record, &tiers, &ambient);
+    assert_eq!(selector, "process");
+    assert_eq!(origin, OmpProfileSelectionOrigin::ProcessEnv);
+
+    ambient.remove("OMP_PROFILE");
+    let (selector, origin) = profile_selector(&record, &tiers, &ambient);
+    assert_eq!(selector, "coder");
+    assert_eq!(origin, OmpProfileSelectionOrigin::PiProfile);
+}
+
+#[test]
+fn omp_profile_argv_conflict_is_not_guessed() {
+    assert!(has_profile_arg(&["--profile".into(), "coder".into()]));
+    assert!(has_profile_arg(&["--profile=coder".into()]));
+    assert!(!has_profile_arg(&["acp".into()]));
+}
+
 // ── Extended tests (split file to respect line-count ratchet) ────────────────
 #[path = "reader_tests_ext.rs"]
 mod ext;
+
+#[path = "reader_tests_ext2.rs"]
+mod ext2;
