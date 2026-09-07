@@ -1,5 +1,9 @@
 import { setKeepMentionedAgentsPinned } from "@/features/messages/lib/autoPinMentionedAgentsPreference";
 import type {
+  AgentSessionCommand,
+  AgentSessionCommandSubcommand,
+} from "@/shared/api/types";
+import type {
   ChannelSuggestion,
   UseChannelLinksResult,
 } from "@/features/messages/lib/useChannelLinks";
@@ -9,6 +13,7 @@ import type {
 } from "@/features/messages/lib/useEmojiAutocomplete";
 import type { UseMentionsResult } from "@/features/messages/lib/useMentions";
 import { ChannelAutocomplete } from "./ChannelAutocomplete";
+import { CommandAutocomplete } from "./CommandAutocomplete";
 import { EmojiAutocomplete } from "./EmojiAutocomplete";
 import {
   MentionAutocomplete,
@@ -22,6 +27,24 @@ type MessageComposerAutocompletesProps = {
    */
   audienceControlsEnabled: boolean;
   channelLinks: UseChannelLinksResult;
+  commandPicker: {
+    activeCommand: AgentSessionCommand | null;
+    composerOwnsFocus: boolean;
+    isCommandRecognized: boolean;
+    isCommandOpen: boolean;
+    isDispatching: boolean;
+    query: string;
+    selectedIndex: number;
+    stateStatus: string | null;
+    suggestions: readonly AgentSessionCommand[];
+    targetSummary: string | null;
+    onDismiss: () => void;
+    onRun: () => void;
+    onSelect: (command: AgentSessionCommand) => void;
+    onSelectSubcommand: (
+      subcommand: AgentSessionCommandSubcommand,
+    ) => void;
+  };
   composerOwnsFocus: boolean;
   emojiAutocomplete: UseEmojiAutocompleteResult;
   keepMentionedAgentsPinned: boolean;
@@ -49,6 +72,7 @@ type MessageComposerAutocompletesProps = {
 export function MessageComposerAutocompletes({
   audienceControlsEnabled,
   channelLinks,
+  commandPicker,
   composerOwnsFocus,
   emojiAutocomplete,
   keepMentionedAgentsPinned,
@@ -63,6 +87,22 @@ export function MessageComposerAutocompletes({
 }: MessageComposerAutocompletesProps) {
   return (
     <>
+      <CommandAutocomplete
+        activeCommand={commandPicker.activeCommand}
+        composerOwnsFocus={
+          composerOwnsFocus && commandPicker.isCommandOpen
+        }
+        isDispatching={commandPicker.isDispatching}
+        onDismiss={commandPicker.onDismiss}
+        onRun={commandPicker.onRun}
+        onSelect={commandPicker.onSelect}
+        onSelectSubcommand={commandPicker.onSelectSubcommand}
+        query={commandPicker.query}
+        selectedIndex={commandPicker.selectedIndex}
+        stateStatus={commandPicker.stateStatus}
+        suggestions={commandPicker.suggestions}
+        targetSummary={commandPicker.targetSummary}
+      />
       <EmojiAutocomplete
         composerOwnsFocus={composerOwnsFocus}
         onSelect={onEmojiSelect}

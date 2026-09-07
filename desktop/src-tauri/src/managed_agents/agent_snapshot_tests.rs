@@ -34,6 +34,9 @@ fn minimal_record() -> ManagedAgentRecord {
         model: Some("claude-opus-4".to_string()),
         provider: Some("anthropic".to_string()),
         persona_source_version: Some("v1.0".to_string()), // MUST NOT appear
+        workspace_path: Some(std::path::PathBuf::from(
+            "/Users/example/SENTINEL_WORKSPACE",
+        )), // MUST NOT appear
         env_vars: {
             let mut m = BTreeMap::new();
             m.insert("API_KEY".to_string(), "secret123".to_string()); // MUST NOT appear
@@ -458,6 +461,12 @@ fn secret_exclusion_machine_commands_absent() {
     assert!(
         !json.contains("mcpCommand") && !json.contains("mcp_command"),
         "mcpCommand field must not appear"
+    );
+    assert!(
+        !json.contains("SENTINEL_WORKSPACE")
+            && !json.contains("workspacePath")
+            && !json.contains("workspace_path"),
+        "workspace binding must not appear in snapshots"
     );
 }
 

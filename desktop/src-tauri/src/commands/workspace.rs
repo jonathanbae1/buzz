@@ -5,8 +5,10 @@ use tauri::{AppHandle, Emitter, Manager, State};
 
 use crate::app_state::AppState;
 use crate::managed_agents::{
-    effective_repos_dir, ensure_repos_symlink, nest_dir, restore_managed_agents_on_launch,
-    try_regenerate_nest, write_persisted_repos_dir,
+    build_managed_agent_summary, canonicalize_workspace_path, effective_repos_dir,
+    ensure_repos_symlink, find_managed_agent_mut, load_global_agent_config, load_managed_agents,
+    load_personas, load_teams, nest_dir, restore_managed_agents_on_launch, save_managed_agents,
+    try_regenerate_nest, write_persisted_repos_dir, ManagedAgentSummary,
 };
 use crate::relay;
 
@@ -134,6 +136,62 @@ pub async fn validate_repos_dir(dir: String) -> Result<(), String> {
     })
     .await
     .map_err(|e| format!("spawn_blocking failed: {e}"))?
+}
+/// Set or clear the explicit local workspace for one managed-agent instance.
+///
+/// The path is canonicalized through symlink targets and validated as a real
+/// accessible directory before the record is mutated. `None` restores the
+/// legacy unbound `~/.buzz` fallback. This command never restarts a running
+/// process: a changed desired path is reported as pending until the caller
+/// explicitly performs a safe relaunch.
+#[tauri::command]
+pub fn set_managed_agent_workspace(
+    pubkey: String,
+    workspace_path: Option<String>,
+    app: AppHandle,
+) -> Result<ManagedAgentSummary, String> {
+    let state = app.state::<AppState>();
+    let _transition = state
+        .managed_agent_runtime_transition
+        .lock()
+        .map_err(|error| error.to_string())?;
+    let _store_guard = state
+        .managed_agents_store_lock
+        .lock()
+        .map_err(|error| error.to_string())?;
+
+    let mut records = load_managed_agents(&app)?;
+    let record = find_managed_agent_mut(&mut records, &pubkey)?;
+    if record.backend != crate::managed_agents::BackendKind::Local {
+        return Err("workspace bindings require a local managed agent".to_string());
+    }
+
+    let canonical_workspace = match workspace_path {
+        None => None,
+        Some(raw) => {
+            let trimmed = raw.trim();
+            if trimmed.is_empty() {
+                return Err("workspace path must be a non-empty directory".to_string());
+            }
+            Some(canonicalize_workspace_path(std::path::Path::new(trimmed))?)
+        }
+    };
+    record.workspace_path = canonical_workspace;
+    record.updated_at = crate::util::now_iso();
+    save_managed_agents(&app, &records)?;
+
+    let runtimes = state
+        .managed_agent_processes
+        .lock()
+        .map_err(|error| error.to_string())?;
+    let personas = load_personas(&app).unwrap_or_default();
+    let teams = load_teams(&app).unwrap_or_default();
+    let global = load_global_agent_config(&app).unwrap_or_default();
+    let record = records
+        .iter()
+        .find(|record| record.pubkey == pubkey)
+        .ok_or_else(|| format!("agent {pubkey} not found"))?;
+    build_managed_agent_summary(&app, record, &runtimes, &personas, &teams, &global)
 }
 
 /// Apply a workspace's configuration to the backend session.

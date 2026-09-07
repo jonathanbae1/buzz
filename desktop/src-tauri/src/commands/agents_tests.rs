@@ -30,6 +30,7 @@ fn bare_agent_record(
         model: model.map(str::to_string),
         provider: provider.map(str::to_string),
         persona_source_version: None,
+        workspace_path: None,
         env_vars: BTreeMap::new(),
         start_on_app_launch: false,
         runtime_pid: None,

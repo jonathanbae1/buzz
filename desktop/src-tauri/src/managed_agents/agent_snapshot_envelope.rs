@@ -422,6 +422,7 @@ mod tests {
             session_mode: None,
             agent_command_override: None,
             persona_source_version: None,
+            workspace_path: None,
             provider: None,
             team_catalog_source: None,
         }

@@ -276,6 +276,7 @@ mod tests {
             model: Some("claude-opus-4".to_string()),
             provider: Some("anthropic".to_string()),
             persona_source_version: None,
+            workspace_path: None,
             env_vars: {
                 let mut m = BTreeMap::new();
                 m.insert("API_KEY".to_string(), "secret123".to_string()); // MUST NOT appear

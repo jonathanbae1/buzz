@@ -70,6 +70,20 @@ export async function setManagedAgentAutoRestart(
   return fromRawManagedAgent(response);
 }
 
+/** Persist a canonical local workspace without restarting a running agent. */
+export async function setManagedAgentWorkspace(
+  pubkey: string,
+  workspacePath: string | null,
+): Promise<ManagedAgent> {
+  const response = await invokeTauri<RawManagedAgent>(
+    "set_managed_agent_workspace",
+    {
+      pubkey,
+      workspacePath,
+    },
+  );
+  return fromRawManagedAgent(response);
+}
 
 /**
  * Persist the canonical startup session mode for a local managed agent.

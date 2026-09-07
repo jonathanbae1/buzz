@@ -40,6 +40,7 @@
 
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
+use std::path::{Path, PathBuf};
 
 use crate::managed_agents::{
     agent_env::baked_build_env,
@@ -50,6 +51,54 @@ use crate::managed_agents::{
     normalize_agent_args,
     types::{AcpAvailabilityStatus, AgentDefinition, ManagedAgentRecord},
 };
+
+/// Canonicalize and validate an explicit managed-agent workspace.
+///
+/// The binding is deliberately resolved at the local command/spawn boundary:
+/// symlinks are followed, the result must be a real accessible directory, and
+/// failures are returned to the caller instead of falling back to `~/.buzz`.
+pub(crate) fn canonicalize_workspace_path(path: &Path) -> Result<PathBuf, String> {
+    let canonical = path.canonicalize().map_err(|error| {
+        format!(
+            "managed-agent workspace is unavailable ({}): {error}",
+            path.display()
+        )
+    })?;
+    let metadata = std::fs::metadata(&canonical).map_err(|error| {
+        format!(
+            "managed-agent workspace cannot be inspected ({}): {error}",
+            canonical.display()
+        )
+    })?;
+    if !metadata.is_dir() {
+        return Err(format!(
+            "managed-agent workspace is not a directory: {}",
+            canonical.display()
+        ));
+    }
+    std::fs::read_dir(&canonical).map_err(|error| {
+        format!(
+            "managed-agent workspace is inaccessible ({}): {error}",
+            canonical.display()
+        )
+    })?;
+    Ok(canonical)
+}
+
+/// Resolve the process working directory for a managed agent.
+///
+/// An explicit binding is strict: a missing or inaccessible path is a hard
+/// launch error and never enters setup-listener mode. Legacy records with no
+/// binding retain the existing `~/.buzz` fallback (or inherited cwd when that
+/// fallback is unavailable).
+pub(crate) fn resolve_managed_agent_workspace(
+    record: &ManagedAgentRecord,
+) -> Result<Option<PathBuf>, String> {
+    match record.workspace_path.as_deref() {
+        Some(path) => canonicalize_workspace_path(path).map(Some),
+        None => Ok(crate::managed_agents::default_agent_workdir()),
+    }
+}
 
 mod cli_login;
 pub(crate) mod cli_probe;
@@ -1514,6 +1563,7 @@ mod tests {
             model: None,
             provider: None,
             persona_source_version: None,
+            workspace_path: None,
             env_vars,
             start_on_app_launch: false,
             auto_restart_on_config_change: true,
@@ -1698,6 +1748,33 @@ mod tests {
             .contains(&Requirement::NormalizedField {
                 field: "model".to_string()
             }));
+    }
+
+    #[test]
+    fn explicit_workspace_must_be_an_accessible_directory() {
+        let temp = tempfile::tempdir().expect("temp workspace");
+        let canonical = canonicalize_workspace_path(temp.path()).expect("directory is valid");
+        assert_eq!(
+            canonical,
+            temp.path().canonicalize().expect("canonical temp path")
+        );
+
+        #[cfg(unix)]
+        {
+            let link = temp.path().join("workspace-link");
+            std::os::unix::fs::symlink(temp.path(), &link).expect("workspace symlink");
+            assert_eq!(
+                canonicalize_workspace_path(&link).expect("symlink target is valid"),
+                canonical
+            );
+        }
+
+        let missing = temp.path().join("deleted-workspace");
+        let error = canonicalize_workspace_path(&missing).expect_err("missing path must fail");
+        assert!(
+            error.contains("workspace is unavailable"),
+            "unexpected workspace error: {error}"
+        );
     }
 
     // buzz-agent OpenRouter readiness tests live in a sibling file so this

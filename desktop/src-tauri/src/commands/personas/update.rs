@@ -14,7 +14,10 @@ use crate::{
     util::now_iso,
 };
 
-use super::{normalize_description, pending, retain_persona_pending, trim_optional, trim_required};
+use super::{
+    normalize_description, retain_persona_pending, trim_optional, trim_required,
+    validate_persona_env_assignments,
+};
 
 #[cfg(test)]
 mod name_propagation_tests;
@@ -171,7 +174,20 @@ pub(super) async fn update_persona_with<R: Send + 'static>(
                 .lock()
                 .map_err(|error| error.to_string())?;
             let mut personas = load_personas(&app)?;
-            pending::project_active_persona_sharing(&app, &state, &mut personas);
+            let effective_env_vars = input.env_vars.clone().or_else(|| {
+                personas
+                    .iter()
+                    .find(|record| record.id == input.id)
+                    .map(|record| record.env_vars.clone())
+            });
+            if let Some(env_vars) = effective_env_vars.as_ref() {
+                validate_persona_env_assignments(
+                    env_vars,
+                    runtime.as_deref(),
+                    &personas,
+                    Some(&input.id),
+                )?;
+            }
             let persona = personas
                 .iter_mut()
                 .find(|record| record.id == input.id)
@@ -203,7 +219,6 @@ pub(super) async fn update_persona_with<R: Send + 'static>(
                 .filter(|s| !s.is_empty())
                 .collect();
             if let Some(env_vars) = input.env_vars {
-                crate::managed_agents::validate_user_env_keys(&env_vars)?;
                 persona.env_vars = env_vars;
             }
             apply_persona_behavior(persona, input.behavior)?;

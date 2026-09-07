@@ -1237,6 +1237,7 @@ fn make_pair_runtime_placeholder() -> crate::managed_agents::ManagedAgentPairRun
             crate::managed_agents::AcpSessionPolicy::Channel,
         ),
         setup_mode: false,
+        spawned_with_workspace_path: None,
         adapter_availability: None,
         start_nonce: "test-nonce".to_string(),
         #[cfg(windows)]

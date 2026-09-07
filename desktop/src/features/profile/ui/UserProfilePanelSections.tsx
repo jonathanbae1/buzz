@@ -548,6 +548,7 @@ export function ProfileSummaryView({
                     isOwner === true && managedAgent !== undefined ? (
                       <AgentConfigPanel
                         advancedMode="flat"
+                        agent={managedAgent}
                         onEdit={canEditAgent ? handleEditAgent : undefined}
                         pubkey={managedAgent.pubkey}
                         sections={["model"]}
@@ -570,6 +571,7 @@ export function ProfileSummaryView({
                 {isOwner === true && managedAgent !== undefined ? (
                   <AgentConfigPanel
                     advancedMode="flat"
+                    agent={managedAgent}
                     pubkey={managedAgent.pubkey}
                     sections={["mcp", "advanced"]}
                   />

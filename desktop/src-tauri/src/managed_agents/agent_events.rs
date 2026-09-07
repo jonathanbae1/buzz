@@ -19,9 +19,10 @@
 //! - `auth_tag` — the NIP-OA owner attestation.
 //! - `env_vars` — may hold API keys / credentials.
 //! - `backend` — `Provider { config }` is an opaque blob that may hold secrets.
-//! - any runtime field (`runtime_pid`, `last_*`, `backend_agent_id`, …) — these
+//! - any runtime field (`runtime_pid`, `last_*`, `backend_agent_id`, …) — they
 //!   mutate on every start/stop and describe transient process state.
-
+//! - `workspace_path` — an absolute local process binding that must never leave
+//!   the device or be accepted from a remote message.
 use buzz_core_pkg::kind::KIND_MANAGED_AGENT;
 use nostr::{EventBuilder, Kind, Tag};
 use serde::{Deserialize, Serialize};
@@ -160,8 +161,8 @@ pub fn build_agent_delete(d_tag: &str, owner_pubkey_hex: &str) -> Result<EventBu
 #[cfg(test)]
 mod tests {
     use super::*;
+    use nostr::{JsonUtil, Keys};
     use std::collections::BTreeMap;
-
     fn sample_agent() -> ManagedAgentRecord {
         ManagedAgentRecord {
             description: None,
@@ -185,8 +186,11 @@ mod tests {
             model: Some("claude-opus-4".to_string()),
             provider: Some("anthropic".to_string()),
             persona_source_version: Some("abc123".to_string()),
+            workspace_path: Some(std::path::PathBuf::from(
+                "/Users/example/SENTINEL_WORKSPACE",
+            )),
             env_vars: BTreeMap::from([("OPENAI_API_KEY".to_string(), "sk-secret".to_string())]),
-            start_on_app_launch: true,
+            start_on_app_launch: false,
             auto_restart_on_config_change: true,
             runtime_pid: Some(4242),
             backend: super::super::BackendKind::Provider {
@@ -426,7 +430,6 @@ mod tests {
     /// `content_excludes_secrets_and_runtime_fields`.
     #[test]
     fn from_event_drops_injected_secret_and_harness_keys() {
-        use nostr::{EventBuilder, JsonUtil, Keys, Kind, Tag};
         let content = serde_json::json!({
             "name": "Agent",
             "parallelism": 1,
@@ -437,6 +440,7 @@ mod tests {
             "env_vars": { "K": "leak" },
             "agent_command": "leak",
             "agent_command_override": "leak",
+            "workspace_path": "/Users/example/SENTINEL_WORKSPACE",
             "backend": { "type": "local" },
         });
         let keys = Keys::generate();
@@ -458,6 +462,9 @@ mod tests {
         assert!(!json.contains("auth_tag"));
         assert!(!json.contains("env_vars"));
         assert!(!json.contains("agent_command"));
+        assert!(!json.contains("workspace_path"));
+        assert!(!json.contains("workspacePath"));
+        assert!(!json.contains("SENTINEL_WORKSPACE"));
         assert!(!json.contains("backend"));
     }
 

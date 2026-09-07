@@ -358,6 +358,7 @@ pub async fn create_managed_agent(
         }
     }
     crate::managed_agents::validate_user_env_keys(&input.env_vars)?;
+    crate::managed_agents::validate_activation_widening_env(&input.env_vars)?;
 
     // Validate & normalize the respond-to allowlist BEFORE any side effects.
     // The harness has its own validator (buzz-acp/src/config.rs) but we want
@@ -639,6 +640,7 @@ pub async fn create_managed_agent(
             model: effective_model.clone(),
             provider: effective_provider.clone(),
             persona_source_version: snapshot_source_version,
+            workspace_path: None,
             // Provider agents are managed externally — force false.
             start_on_app_launch: if input.backend != BackendKind::Local {
                 false

@@ -130,6 +130,7 @@ impl AgentDefinition {
             model: self.model,
             provider: self.provider,
             persona_source_version: None,
+            workspace_path: None,
             env_vars: self.env_vars,
             start_on_app_launch: false,
             auto_restart_on_config_change: true,
@@ -317,6 +318,11 @@ pub struct ManagedAgentRecord {
     /// for non-persona agents and for pre-existing records pending backfill.
     #[serde(default)]
     pub persona_source_version: Option<String>,
+    /// Optional explicit local execution workspace for this managed-agent
+    /// process. The command boundary stores a canonical absolute directory;
+    /// `None` preserves the legacy `~/.buzz` fallback.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub workspace_path: Option<PathBuf>,
     /// Environment variables injected at spawn time. Layered as: desktop
     /// parent env < persona `env_vars` < this agent's `env_vars` (last wins).
     ///
@@ -499,11 +505,14 @@ pub struct ManagedAgentProcess {
     /// `install_acp_runtime` to target only stuck agents for auto-restart,
     /// excluding healthy in-pool agents.
     pub setup_mode: bool,
+    /// Canonical workspace path supplied to `Command::current_dir` for this
+    /// exact harness generation. This is the spawned-with fact; it is never
+    /// inferred from a live process cwd.
+    pub spawned_with_workspace_path: Option<PathBuf>,
     /// Adapter availability status stamped at spawn time for runtimes with a
     /// version gate (currently codex only; `None` for all others). Runtime-only
-    /// — never persisted. The summary builder compares this against the current
-    /// cached availability and sets `needs_restart` on drift, catching out-of-
-    /// band adapter changes that Phase-1 auto-restart doesn't cover.
+    /// — the summary builder compares this against the current cached
+    /// availability and sets `needs_restart` on drift.
     pub adapter_availability: Option<AcpAvailabilityStatus>,
     /// Unpredictable identity shared only with this harness generation.
     pub start_nonce: String,
@@ -533,6 +542,17 @@ pub struct ManagedAgentSummary {
     /// from the persona. Lets the Edit dialog seed "Inherit from persona" vs a
     /// concrete pin (`agent_command` above is the resolved/effective command).
     pub agent_command_override: Option<String>,
+    /// Canonical explicit local workspace selected for this instance. `None`
+    /// means the legacy `~/.buzz` fallback remains in effect.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub workspace_path: Option<String>,
+    /// Workspace supplied to the most recent tracked process spawn. This is
+    /// runtime evidence, not a claim about the child's live cwd.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub spawned_with_workspace_path: Option<String>,
+    /// A selected workspace differs from the path used by the tracked process
+    /// (or has not yet been spawned). Setting a path never restarts mid-turn.
+    pub workspace_change_pending: bool,
     pub agent_args: Vec<String>,
     /// Catalog-derived from the effective harness (not the record's stored
     /// field), so the UI always shows what a spawn would actually use.

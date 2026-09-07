@@ -14,9 +14,9 @@ use crate::{
         },
         current_instance_id, is_reserved_env_key, is_safe_to_reveal, is_well_formed_env_key,
         known_acp_runtime, load_managed_agents, load_personas, resolve_effective_agent_env,
-        save_managed_agents, sync_managed_agent_processes, AgentDefinition, GlobalAgentConfig,
-        KnownAcpRuntime, ManagedAgentRecord, ManagedAgentRuntimeKey, MAX_ENV_VALUE_BYTES,
-        BackendKind,
+        save_managed_agents, sync_managed_agent_processes, AgentDefinition, BackendKind,
+        GlobalAgentConfig, KnownAcpRuntime, ManagedAgentRecord, ManagedAgentRuntimeKey,
+        MAX_ENV_VALUE_BYTES,
     },
 };
 
@@ -338,7 +338,11 @@ pub async fn get_agent_config_surface(
     let profile_env = resolve_effective_agent_env(&record, &personas, runtime_meta, &global);
     let ambient_profile_env = ["OMP_PROFILE", "PI_PROFILE", "PI_CONFIG_DIR"]
         .into_iter()
-        .filter_map(|key| std::env::var(key).ok().map(|value| (key.to_string(), value)))
+        .filter_map(|key| {
+            std::env::var(key)
+                .ok()
+                .map(|value| (key.to_string(), value))
+        })
         .collect();
     let mut surface = resolve_config_surface(
         record.clone(),

@@ -465,6 +465,7 @@ fn no_sentinel_reaches_the_owning_process_debug_output() {
         log_path: std::path::PathBuf::new(),
         spawn_config: seeded_with_sentinels(),
         setup_mode: false,
+        spawned_with_workspace_path: None,
         adapter_availability: None,
         start_nonce: "test-nonce".to_string(),
         #[cfg(windows)]

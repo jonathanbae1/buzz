@@ -26,6 +26,7 @@ fn agent(persona_id: &str, name: &str, display_name: Option<&str>) -> ManagedAge
         model: None,
         provider: None,
         persona_source_version: None,
+        workspace_path: None,
         env_vars: std::collections::BTreeMap::new(),
         start_on_app_launch: false,
         auto_restart_on_config_change: true,

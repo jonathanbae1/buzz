@@ -21,6 +21,40 @@ use crate::usage::{
 /// Maximum allowed size of a single NDJSON line from the agent's stdout.
 /// Lines exceeding this limit are rejected to prevent OOM from rogue agents.
 const MAX_LINE_SIZE: usize = 10_000_000; // 10 MB
+/// Maximum output retained for one command turn.
+///
+/// `buzz_sdk::build_message` accepts at most 64 KiB, so retaining more would
+/// only create an unpublishable result and an unbounded capture buffer.
+const COMMAND_OUTPUT_MAX_BYTES: usize = 64 * 1024;
+
+/// Text and tool activity observed during one command-only prompt.
+#[derive(Debug, Default)]
+pub(crate) struct CommandOutput {
+    pub text: String,
+    pub tool_call_seen: bool,
+    pub truncated: bool,
+}
+
+impl CommandOutput {
+    fn append_text(&mut self, text: &str) {
+        if self.truncated {
+            return;
+        }
+        let start_len = self.text.len();
+        for ch in text.chars() {
+            if self.text.len() + ch.len_utf8() > COMMAND_OUTPUT_MAX_BYTES {
+                self.truncated = true;
+                break;
+            }
+            self.text.push(ch);
+        }
+        if self.text.len() - start_len < text.len() {
+            self.truncated = true;
+        }
+    }
+}
+
+
 
 /// An MCP server configuration passed to `session/new`.
 ///
@@ -174,6 +208,8 @@ pub struct AcpClient {
     observer_agent_index: Option<usize>,
     /// Best-effort context attached to raw ACP wire events.
     observer_context: ObserverContext,
+    /// Capture enabled only around a command-dispatch prompt.
+    command_output: Option<CommandOutput>,
     /// Most recently observed `_meta.goose.activeRunId` from a
     /// `session/update` notification of kind `session_info_update`.
     ///
@@ -557,6 +593,7 @@ impl AcpClient {
             observer: None,
             observer_agent_index: None,
             observer_context: ObserverContext::default(),
+            command_output: None,
             active_run_id: None,
             steering_supported: false,
             steer_rx: None,
@@ -576,6 +613,17 @@ impl AcpClient {
     pub fn set_observer_context(&mut self, context: ObserverContext) {
         self.observer_context = context;
     }
+    /// Start capturing agent text and tool activity for one command prompt.
+    pub(crate) fn begin_command_output_capture(&mut self) {
+        self.command_output = Some(CommandOutput::default());
+    }
+
+    /// Finish the current command capture, returning an empty result when
+    /// called outside a command prompt.
+    pub(crate) fn take_command_output_capture(&mut self) -> CommandOutput {
+        self.command_output.take().unwrap_or_default()
+    }
+
 
     /// Return a clone of the observer handle, if attached.
     pub(crate) fn observer_handle(&self) -> Option<ObserverHandle> {
@@ -1756,6 +1804,9 @@ impl AcpClient {
             "agent_message_chunk" => {
                 if let Some(text) = update["content"]["text"].as_str() {
                     tracing::info!(target: "acp::stream", "{text}");
+                    if let Some(capture) = self.command_output.as_mut() {
+                        capture.append_text(text);
+                    }
                 }
                 false
             }
@@ -1769,6 +1820,9 @@ impl AcpClient {
                     .and_then(|v| v.as_str())
                     .unwrap_or("unknown");
                 tracing::info!(target: "acp::tool", "tool_call: {title} ({kind})");
+                if let Some(capture) = self.command_output.as_mut() {
+                    capture.tool_call_seen = true;
+                }
                 true
             }
             "tool_call_update" => {
@@ -1778,6 +1832,9 @@ impl AcpClient {
                     .unwrap_or("?");
                 let status = update.get("status").and_then(|v| v.as_str()).unwrap_or("?");
                 tracing::info!(target: "acp::tool", "tool_call_update: {tool_id} → {status}");
+                if let Some(capture) = self.command_output.as_mut() {
+                    capture.tool_call_seen = true;
+                }
                 false
             }
             "plan" => {
@@ -3741,6 +3798,45 @@ mod tests {
             .await
             .expect("spawn cat as inert client")
     }
+    #[tokio::test]
+    async fn command_capture_collects_only_command_text_and_tool_activity() {
+        let mut client = spawn_inert_client().await;
+        client.begin_command_output_capture();
+
+        let chunk = |text: &str| {
+            serde_json::json!({
+                "params": {
+                    "update": {
+                        "sessionUpdate": "agent_message_chunk",
+                        "content": {"text": text},
+                    },
+                },
+            })
+        };
+        let tool = serde_json::json!({
+            "params": {
+                "update": {
+                    "sessionUpdate": "tool_call",
+                    "title": "shell",
+                    "kind": "execute",
+                },
+            },
+        });
+
+        assert!(!client.handle_session_update(&chunk("first ")));
+        assert!(!client.handle_session_update(&chunk("answer")));
+        assert!(client.handle_session_update(&tool));
+        let capture = client.take_command_output_capture();
+        assert_eq!(capture.text, "first answer");
+        assert!(capture.tool_call_seen);
+
+        // A normal prompt does not inherit command capture state.
+        client.handle_session_update(&chunk("ordinary"));
+        let ordinary = client.take_command_output_capture();
+        assert!(ordinary.text.is_empty());
+        assert!(!ordinary.tool_call_seen);
+    }
+
 
     /// Build a `session/update` JSON-RPC notification carrying a
     /// `session_info_update` with the given `_meta.goose.activeRunId` value.

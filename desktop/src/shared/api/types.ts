@@ -353,6 +353,12 @@ export type ManagedAgent = {
   restartDiff: RestartDiffEntry[];
   /** Per-agent env vars. Layered on top of persona envVars. */
   envVars: Record<string, string>;
+  /** Canonical desired local workspace; null keeps the legacy fallback. */
+  workspacePath: string | null;
+  /** Workspace used by the most recent tracked process spawn. */
+  spawnedWithWorkspacePath: string | null;
+  /** True until a safe relaunch applies a changed desired workspace. */
+  workspaceChangePending: boolean;
   status: "running" | "stopped" | "deployed" | "not_deployed";
   pid: number | null;
   createdAt: string;
@@ -370,8 +376,8 @@ export type ManagedAgent = {
   /** Who the agent should respond to. Maps to `buzz-acp --respond-to`. */
   respondTo: RespondToMode;
   /**
-   * Normalized 64-char lowercase hex pubkeys. Used only when `respondTo` is
-   * `"allowlist"`. Preserved across mode toggles.
+   * Normalized 64-char lowercase hex pubkeys. Used only when `respondTo`
+   * is `"allowlist"`. Preserved across mode toggles.
    */
   respondToAllowlist: string[];
 };
@@ -457,15 +463,65 @@ export type SwitchManagedAgentModelStatus =
   | "no_active_turn"
   | "failure";
 
+export type AgentSessionCommandOutputDisposition =
+  | "published"
+  | "empty"
+  | "tool_handled";
+
 export type ControlResultFrame = {
-  type: "cancel_turn" | "switch_model";
+  type: "cancel_turn" | "switch_model" | "dispatch_command";
   status: string;
   modelId?: string;
+  commandName?: string;
+  sessionId?: string;
   /** Opaque per-pick id echoed from the request; correlates late frames. */
   requestId?: string;
   /** Buzz channel UUID from the observer envelope; disambiguates channels. */
   channelId?: string | null;
+  /** Terminal command delivery disposition; actual published text is a kind9 event. */
+  outputDisposition?: AgentSessionCommandOutputDisposition;
+  /** Runtime refusal detail, when the harness has one. */
+  error?: string;
 };
+
+export type AgentSessionCommandSubcommand = {
+  name: string;
+  description?: string;
+  usage?: string;
+};
+
+export type AgentSessionCommand = {
+  name: string;
+  description?: string;
+  usage?: string;
+  inputSchema?: unknown;
+  subcommands?: AgentSessionCommandSubcommand[];
+};
+
+export type AgentSessionCommandCatalog = {
+  agentPubkey: string;
+  sessionId: string;
+  commands: AgentSessionCommand[];
+  receivedAt: number;
+  source: "live" | "archive" | "stale";
+};
+
+export type AgentSessionCommandCatalogStatus =
+  | "fresh"
+  | "stale"
+  | "unsupported"
+  | "error";
+
+export type AgentSessionCommandDispatchStatus =
+  | "sent"
+  | "disabled"
+  | "no_agent"
+  | "ambiguous_target"
+  | "active_turn"
+  | "stale_session"
+  | "stale_cache"
+  | "unsupported_command"
+  | "runtime_error";
 
 export type GitBashPrerequisite = {
   available: boolean;
@@ -473,6 +529,7 @@ export type GitBashPrerequisite = {
   installInstructionsUrl: string;
   installHint: string;
 };
+
 
 export type AcpAvailabilityStatus =
   | "available"

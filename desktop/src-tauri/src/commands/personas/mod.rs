@@ -1,3 +1,60 @@
+use std::collections::BTreeMap;
+
+use crate::managed_agents::config_bridge::{
+    reader::read_omp_profile_catalog, types::OmpProfileState,
+};
+
+use crate::managed_agents::validate_activation_widening_env;
+
+fn validate_persona_env_assignments(
+    env_vars: &BTreeMap<String, String>,
+    runtime: Option<&str>,
+    existing: &[AgentDefinition],
+    current_id: Option<&str>,
+) -> Result<(), String> {
+    crate::managed_agents::validate_user_env_keys(env_vars)?;
+    validate_activation_widening_env(env_vars)?;
+
+    let Some(raw_profile) = env_vars.get("OMP_PROFILE") else {
+        return Ok(());
+    };
+    if raw_profile.is_empty() {
+        return Ok(());
+    }
+    if runtime != Some("omp") {
+        return Err("OMP_PROFILE requires the omp runtime".to_string());
+    }
+
+    let catalog = read_omp_profile_catalog();
+    if catalog.state != OmpProfileState::Configured {
+        return Err("the installed omp profile catalogue is unavailable".to_string());
+    }
+    if !catalog
+        .entries
+        .iter()
+        .any(|entry| entry.name == *raw_profile)
+    {
+        return Err(format!(
+            "OMP_PROFILE `{raw_profile}` is not an installed profile"
+        ));
+    }
+    if raw_profile == "designer" {
+        return Err(
+            "the designer profile remains catalogue-only until activation is proven".to_string(),
+        );
+    }
+
+    if existing.iter().any(|persona| {
+        Some(persona.id.as_str()) != current_id
+            && persona.env_vars.get("OMP_PROFILE") == Some(raw_profile)
+    }) {
+        return Err(format!(
+            "OMP_PROFILE `{raw_profile}` is already assigned to another persona"
+        ));
+    }
+    Ok(())
+}
+
 use tauri::AppHandle;
 
 use crate::{

@@ -21,7 +21,7 @@ require_literal 'select-qualified-ci-run.jq'
 require_literal "needs: [build, qualify]"
 require_literal "https://buzz.block.xyz/attestations/deployment-eligibility/v1"
 require_literal "actions/attest@1e69f48acb82d1966a394da916b4c1698aa569d6"
-require_literal "if: matrix.variant == 'release'"
+require_literal "if: matrix.variant == 'release' && github.repository == 'block/buzz'"
 require_literal "BUZZ_SOURCE_SHA"
 require_literal "BUZZ_BUILD_ID"
 require_literal "BUZZ_BUILD_URL"

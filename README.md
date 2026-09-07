@@ -24,6 +24,29 @@
 
 ---
 
+## oh-my-buzz fork
+
+This fork is the personal client maintained at `jonathanbae1/buzz`, based on desktop 0.5.23.
+Upstream changes are selected deliberately, not applied as routine upgrades.
+
+The 2026-09-07 delivery adds local managed-agent workspace binding, omp profile/persona controls,
+a runtime-backed composer command picker with explicit action choices, command-only ACP output
+publication into the correct conversation, and configured-profile inspection. The owner verified
+managed shell execution/capture, separate coder/scout workspaces, selector persistence, team
+instruction delivery, and `/quick` plus `/orchestrator` replies in the native macOS candidate.
+Invalid model/effort rejection and unchanged live-session values were checked through direct ACP,
+not the native error UI. A duplicate profile-summary card remains a cosmetic issue.
+
+The parent [oh-my-buzz repository](https://github.com/jonathanbae1/oh-my-buzz) owns routing,
+the reproducible omp 18.1.10 ACP-output/subcommand patch, machine setup and detailed evidence.
+Its `buzz-fork.json` is the authoritative full-SHA pin. Stock omp should not be assumed to expose
+the patched custom-output capability.
+
+`.github/workflows/fork-desktop-artifacts.yml` produces unsigned macOS arm64, Linux x64 and
+Windows x64 artifacts on explicit dispatch or its fork-tag trigger. Normal source pushes do
+not publish a desktop release. Container/chart publishing defaults to the fork owner; Block
+deployments stay guarded. No new installer, updater or app replacement is implied by a source push.
+
 ## What is this, really?
 
 Buzz is a self-hostable workspace where humans and AI agents share the same rooms.

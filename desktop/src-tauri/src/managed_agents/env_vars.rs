@@ -169,6 +169,32 @@ pub fn validate_user_env_keys(env_vars: &BTreeMap<String, String>) -> Result<(),
     }
     Ok(())
 }
+/// Reject user env overrides that widen channel activation.
+///
+/// These two harness flags are intentionally not reserved globally: legacy
+/// records and runtime-specific callers may still carry a false value. Persona
+/// save/deploy paths call this narrower validator so a preset cannot enable
+/// subscription delivery or disable mention filtering.
+pub fn validate_activation_widening_env(env_vars: &BTreeMap<String, String>) -> Result<(), String> {
+    const ACTIVATION_KEYS: [&str; 2] = ["BUZZ_ACP_SUBSCRIBE", "BUZZ_ACP_NO_MENTION_FILTER"];
+
+    for key in ACTIVATION_KEYS {
+        let Some(value) = env_vars
+            .iter()
+            .find(|(candidate, _)| candidate.eq_ignore_ascii_case(key))
+            .map(|(_, value)| value)
+        else {
+            continue;
+        };
+        let normalized = value.trim().to_ascii_lowercase();
+        if !matches!(normalized.as_str(), "" | "0" | "false" | "no" | "off") {
+            return Err(format!(
+                "env var `{key}` cannot widen managed-agent activation"
+            ));
+        }
+    }
+    Ok(())
+}
 
 /// Returns `true` when `key` is safe to show verbatim — not a credential.
 ///

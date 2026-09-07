@@ -426,7 +426,6 @@ export function usePersonaActions() {
     setSnapshotImportConfirmError(null);
   }
 
-
   async function addMissingOmpProfiles() {
     if (isOmpProfileAddPending) return;
 

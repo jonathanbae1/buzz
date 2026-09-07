@@ -334,21 +334,37 @@ pub struct AgentPool {
     agents: Vec<Option<OwnedAgent>>,
     result_tx: mpsc::UnboundedSender<PromptResult>,
     result_rx: mpsc::UnboundedReceiver<PromptResult>,
+    command_result_tx: mpsc::UnboundedSender<AgentCommandResult>,
+    command_result_rx: mpsc::UnboundedReceiver<AgentCommandResult>,
     pub join_set: JoinSet<()>,
     task_map: HashMap<tokio::task::Id, TaskMeta>,
     /// Authoritative directory of which worker most recently owned each session
-    /// scope's provider session. Survives while a worker is checked out (its
-    /// `SessionState` is invisible to the pool then), so a busy owner does not
-    /// cause another worker to open a duplicate session for the same thread.
-    /// Best-effort: stale entries (rotation, crash/respawn) self-heal on the
-    /// next dispatch and are pruned on channel-wide session invalidation.
+    /// scope's provider session.
     session_owners: HashMap<SessionScope, usize>,
-    /// First time each scope was held for a busy owner, so the bounded hold can
-    /// expire and fork rather than starve behind an unbounded turn. Derived
-    /// state: cleared on every dispatch/invalidation path, and only ever holds
-    /// `Thread` scopes (the sole variant [`hold_decision`](Self::hold_decision)
-    /// stamps).
+    /// Provider session ids are retained independently of worker ownership so
+    /// observer commands can target an exact idle or busy session.
+    session_scopes: HashMap<String, SessionScope>,
     held_since: HashMap<SessionScope, std::time::Instant>,
+}
+
+pub enum AgentCommandTarget {
+    ActiveTurn,
+    StaleSession,
+    Ambiguous,
+}
+pub struct AgentCommandResult {
+    pub agent: OwnedAgent,
+    pub request_id: String,
+    pub session_id: String,
+    /// Authoritative scope resolved from the checked-out agent's session map.
+    pub scope: SessionScope,
+    /// Concatenated `agent_message_chunk` text observed during the command turn.
+    pub output: String,
+    /// Whether any ACP tool call activity occurred during the command turn.
+    pub tool_call_seen: bool,
+    /// Whether output exceeded the bounded capture buffer.
+    pub output_truncated: bool,
+    pub outcome: Result<StopReason, AcpError>,
 }
 
 /// Result returned by a completed prompt task.
@@ -829,13 +845,23 @@ impl AgentPool {
     /// the index invariant.
     pub fn from_slots(slots: Vec<Option<OwnedAgent>>) -> Self {
         let (result_tx, result_rx) = mpsc::unbounded_channel();
+        let (command_result_tx, command_result_rx) = mpsc::unbounded_channel();
+        let mut session_scopes = HashMap::new();
+        for agent in slots.iter().flatten() {
+            for (scope, session_id) in &agent.state.sessions {
+                session_scopes.insert(session_id.clone(), scope.clone());
+            }
+        }
         Self {
             agents: slots,
             result_tx,
             result_rx,
+            command_result_tx,
+            command_result_rx,
             join_set: JoinSet::new(),
             task_map: HashMap::new(),
             session_owners: HashMap::new(),
+            session_scopes,
             held_since: HashMap::new(),
         }
     }
@@ -933,32 +959,70 @@ impl AgentPool {
     /// Return an agent to its slot after a task completes.
     pub fn return_agent(&mut self, agent: OwnedAgent) {
         let idx = agent.index;
+        for (scope, session_id) in &agent.state.sessions {
+            self.session_scopes
+                .insert(session_id.clone(), scope.clone());
+        }
         if self.agents[idx].is_some() {
-            // This is a bug: two tasks returned the same agent index. Log it
-            // loudly so it shows up in production logs, then overwrite — the
-            // alternative (dropping the incoming agent) would permanently leak
-            // the slot.
             tracing::error!(
                 idx,
-                "BUG: return_agent called for slot {idx} which is already occupied — overwriting"
+                "BUG: return_agent called for occupied slot — overwriting"
             );
         }
         self.agents[idx] = Some(agent);
     }
 
-    /// Whether any agent is currently idle (sitting in its slot).
     pub fn any_idle(&self) -> bool {
         self.agents.iter().any(|slot| slot.is_some())
     }
 
-    /// Whether any idle agent already has a session for `scope`.
-    /// Used to compute `affinity_hit` before calling `try_claim`.
     pub fn has_session_for(&self, scope: &SessionScope) -> bool {
         self.agents.iter().any(|slot| {
             slot.as_ref()
-                .map(|a| a.state.sessions.contains_key(scope))
+                .map(|agent| agent.state.sessions.contains_key(scope))
                 .unwrap_or(false)
         })
+    }
+    /// Take the unique idle worker that owns an exact ACP session id.
+    pub fn take_command_agent(
+        &mut self,
+        session_id: &str,
+    ) -> Result<OwnedAgent, AgentCommandTarget> {
+        let matches: Vec<usize> = self
+            .agents
+            .iter()
+            .enumerate()
+            .filter_map(|(index, slot)| {
+                slot.as_ref().and_then(|agent| {
+                    agent
+                        .state
+                        .sessions
+                        .values()
+                        .any(|id| id == session_id)
+                        .then_some(index)
+                })
+            })
+            .collect();
+        if matches.len() > 1 {
+            return Err(AgentCommandTarget::Ambiguous);
+        }
+        if let Some(index) = matches.first().copied() {
+            return Ok(self.agents[index].take().expect("agent slot present"));
+        }
+        if let Some(scope) = self.session_scopes.get(session_id) {
+            if self
+                .task_map
+                .values()
+                .any(|meta| meta.scope.as_ref() == Some(scope))
+            {
+                return Err(AgentCommandTarget::ActiveTurn);
+            }
+        }
+        Err(AgentCommandTarget::StaleSession)
+    }
+
+    pub fn command_result_tx(&self) -> mpsc::UnboundedSender<AgentCommandResult> {
+        self.command_result_tx.clone()
     }
 
     /// Count of agents that are alive: idle OR checked out (have a task_map entry).
@@ -1070,6 +1134,20 @@ impl AgentPool {
         &mut self,
     ) -> (&mut mpsc::UnboundedReceiver<PromptResult>, &mut JoinSet<()>) {
         (&mut self.result_rx, &mut self.join_set)
+    }
+
+    pub fn rx_command_and_join_set(
+        &mut self,
+    ) -> (
+        &mut mpsc::UnboundedReceiver<PromptResult>,
+        &mut mpsc::UnboundedReceiver<AgentCommandResult>,
+        &mut JoinSet<()>,
+    ) {
+        (
+            &mut self.result_rx,
+            &mut self.command_result_rx,
+            &mut self.join_set,
+        )
     }
 
     /// Non-blocking drain of the result channel. Used during shutdown to
@@ -7767,8 +7845,9 @@ printf '%s\n' '{{"jsonrpc":"2.0","id":0,"result":{{"stopReason":"end_turn"}}}}'"
             desired_model_request_id: None,
             desired_model_pending_ack: false,
             startup_effort: None,
-            agent_name: "test".into(),
+            startup_mode: None,
             goose_system_prompt_supported: None,
+            agent_name: "unknown".into(),
             protocol_version: 2,
         };
         agent.state.sessions.insert(ta.clone(), "sess-a".into());
@@ -7842,8 +7921,9 @@ printf '%s\n' '{{"jsonrpc":"2.0","id":0,"result":{{"stopReason":"end_turn"}}}}'"
             desired_model_request_id: None,
             desired_model_pending_ack: false,
             startup_effort: None,
-            agent_name: "test".into(),
+            startup_mode: None,
             goose_system_prompt_supported: None,
+            agent_name: "unknown".into(),
             protocol_version: 2,
         };
         agent.state.sessions.insert(scope, "sess".into());
@@ -9912,8 +9992,9 @@ done"#
             desired_model_request_id: None,
             desired_model_pending_ack: false,
             startup_effort: None,
-            agent_name: "boundary-test-agent".into(),
+            startup_mode: None,
             goose_system_prompt_supported: None,
+            agent_name: "unknown".into(),
             protocol_version: 1,
         };
 

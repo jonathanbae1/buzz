@@ -93,8 +93,9 @@ pub use personas::*;
 #[cfg(windows)]
 pub use process_lifecycle::*;
 pub(crate) use readiness::{
-    agent_readiness, resolve_effective_agent_env, resolve_effective_harness_descriptor,
-    AgentReadiness, Requirement,
+    agent_readiness, canonicalize_workspace_path, resolve_effective_agent_env,
+    resolve_effective_harness_descriptor, resolve_managed_agent_workspace, AgentReadiness,
+    Requirement,
 };
 pub use relay_mesh::*;
 pub use repos::{

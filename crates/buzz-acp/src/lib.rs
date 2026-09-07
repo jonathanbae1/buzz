@@ -41,8 +41,8 @@ use filter::SubscriptionRule;
 use futures_util::FutureExt;
 use nostr::{PublicKey, ToBech32};
 use pool::{
-    AgentPool, ControlSignal, IdleSwitchResult, OwnedAgent, PromptContext, PromptOutcome,
-    PromptResult, PromptSource, SessionState, TimeoutKind,
+    AgentCommandResult, AgentCommandTarget, AgentPool, ControlSignal, IdleSwitchResult, OwnedAgent,
+    PromptContext, PromptOutcome, PromptResult, PromptSource, SessionState, TimeoutKind,
 };
 use pool_lifecycle::PoolLifecycle;
 use queue::{CancelReason, EventQueue, FlushBatch, QueuedEvent, ThreadTags};
@@ -1570,6 +1570,7 @@ fn handle_relay_observer_control_event(
     observer: Option<&observer::ObserverHandle>,
     owner_pubkey_hex: &str,
     event_publisher: RelayEventPublisher,
+    config: &Config,
 ) {
     // Defense-in-depth: verify signature even though the relay already checked.
     if let Err(e) = buzz_core::verify_event(&event) {
@@ -1615,6 +1616,9 @@ fn handle_relay_observer_control_event(
         Some("switch_model") => {
             handle_switch_model_control(&payload, pool, observer);
         }
+        Some("dispatch_command") => {
+            handle_dispatch_command_control(&payload, pool, observer, &config);
+        }
         Some("publish_project_owner_announcements") => {
             handle_publish_project_owner_announcements_control(
                 &payload,
@@ -1628,6 +1632,261 @@ fn handle_relay_observer_control_event(
         }
     }
 }
+
+fn handle_dispatch_command_control(
+    payload: &serde_json::Value,
+    pool: &mut AgentPool,
+    observer: Option<&observer::ObserverHandle>,
+    config: &Config,
+) {
+    let request_id = payload
+        .get("requestId")
+        .and_then(|value| value.as_str())
+        .filter(|value| !value.trim().is_empty())
+        .unwrap_or_default()
+        .to_string();
+    let session_id = payload
+        .get("sessionId")
+        .and_then(|value| value.as_str())
+        .filter(|value| !value.trim().is_empty())
+        .map(str::to_string);
+    let command_name = payload
+        .get("commandName")
+        .and_then(|value| value.as_str())
+        .map(|value| value.trim().trim_start_matches('/').to_string());
+    let Some(session_id) = session_id else {
+        emit_dispatch_command_result(observer, &request_id, None, "error");
+        return;
+    };
+    let Some(command_name) = command_name.filter(|value| !value.is_empty()) else {
+        emit_dispatch_command_result(observer, &request_id, Some(&session_id), "error");
+        return;
+    };
+    let arguments = payload.get("arguments").and_then(|value| {
+        if value.is_null() {
+            None
+        } else if let Some(text) = value.as_str() {
+            Some(text.to_string())
+        } else {
+            Some(value.to_string())
+        }
+    });
+    let prompt = match arguments {
+        Some(args) if !args.trim().is_empty() => format!("/{command_name} {args}"),
+        _ => format!("/{command_name}"),
+    };
+    let mut agent = match pool.take_command_agent(&session_id) {
+        Ok(agent) => agent,
+        Err(AgentCommandTarget::ActiveTurn) => {
+            emit_dispatch_command_result(observer, &request_id, Some(&session_id), "active_turn");
+            return;
+        }
+        Err(AgentCommandTarget::Ambiguous) => {
+            emit_dispatch_command_result(
+                observer,
+                &request_id,
+                Some(&session_id),
+                "ambiguous_target",
+            );
+            return;
+        }
+        Err(AgentCommandTarget::StaleSession) => {
+            emit_dispatch_command_result(observer, &request_id, Some(&session_id), "stale_session");
+            return;
+        }
+    };
+    // Resolve the scope from the checked-out worker before returning it to the
+    // pool. The client-provided session ID is only a lookup key; it never
+    // authorizes a channel or thread destination.
+    let Some(scope) = agent
+        .state
+        .sessions
+        .iter()
+        .find_map(|(scope, id)| (id == &session_id).then(|| scope.clone()))
+    else {
+        pool.return_agent(agent);
+        emit_dispatch_command_result(observer, &request_id, Some(&session_id), "stale_session");
+        return;
+    };
+    let result_tx = pool.command_result_tx();
+    let request_id_for_task = request_id.clone();
+    let session_id_for_task = session_id.clone();
+    let scope_for_task = scope.clone();
+    let idle_timeout = std::time::Duration::from_secs(config.idle_timeout_secs);
+    let max_duration = std::time::Duration::from_secs(config.max_turn_duration_secs);
+    tokio::spawn(async move {
+        agent.acp.set_observer_context(observer::ObserverContext {
+            channel_id: Some(scope_for_task.channel_id().to_string()),
+            session_id: Some(session_id_for_task.clone()),
+            turn_id: None,
+            started_at: Some(chrono::Utc::now().to_rfc3339()),
+        });
+        agent.acp.begin_command_output_capture();
+        let outcome = agent
+            .acp
+            .session_prompt_blocks_with_idle_timeout(
+                &session_id_for_task,
+                &[prompt.as_str()],
+                idle_timeout,
+                max_duration,
+            )
+            .await;
+        let capture = agent.acp.take_command_output_capture();
+        let _ = result_tx.send(AgentCommandResult {
+            agent,
+            request_id: request_id_for_task,
+            session_id: session_id_for_task,
+            scope: scope_for_task,
+            output: capture.text,
+            tool_call_seen: capture.tool_call_seen,
+            output_truncated: capture.truncated,
+            outcome,
+        });
+    });
+    emit_dispatch_command_result_with_details(
+        observer,
+        &request_id,
+        Some(&session_id),
+        "sent",
+        Some(scope.channel_id()),
+        None,
+        None,
+    );
+}
+
+fn emit_dispatch_command_result(
+    observer: Option<&observer::ObserverHandle>,
+    request_id: &str,
+    session_id: Option<&str>,
+    status: &str,
+) {
+    emit_dispatch_command_result_with_details(
+        observer,
+        request_id,
+        session_id,
+        status,
+        None,
+        None,
+        None,
+    );
+}
+
+fn emit_dispatch_command_result_with_details(
+    observer: Option<&observer::ObserverHandle>,
+    request_id: &str,
+    session_id: Option<&str>,
+    status: &str,
+    channel_id: Option<Uuid>,
+    output_disposition: Option<&str>,
+    error: Option<&str>,
+) {
+    let Some(observer) = observer else {
+        return;
+    };
+    let mut payload = serde_json::json!({
+        "type": "dispatch_command",
+        "requestId": request_id,
+        "sessionId": session_id,
+        "status": status,
+    });
+    if let Some(disposition) = output_disposition {
+        payload["outputDisposition"] = serde_json::Value::String(disposition.to_string());
+    }
+    if let Some(error) = error {
+        payload["error"] = serde_json::Value::String(error.to_string());
+    }
+    observer.emit(
+        "control_result",
+        None,
+        &observer::ObserverContext {
+            channel_id: channel_id.map(|id| id.to_string()),
+            session_id: session_id.map(str::to_string),
+            turn_id: None,
+            started_at: None,
+        },
+        payload,
+    );
+}
+
+/// Publish one command-only answer as an agent-authored kind:9 message.
+///
+/// The destination comes solely from the server-owned [`SessionScope`]. The
+/// validated control sender is the only explicit recipient, so the reply also
+/// carries the ordinary `p` notification tag without accepting a client
+/// channel or thread destination.
+async fn publish_command_output(
+    publisher: &RelayEventPublisher,
+    keys: &nostr::Keys,
+    session_scope: &scope::SessionScope,
+    recipient_pubkey: &str,
+    output: &str,
+) -> Result<(), String> {
+    let thread_ref = match session_scope.root_event_id() {
+        Some(root) => {
+            let root_event_id = nostr::EventId::from_hex(root)
+                .map_err(|error| format!("invalid session thread root {root:?}: {error}"))?;
+            Some(buzz_sdk::ThreadRef {
+                root_event_id,
+                parent_event_id: root_event_id,
+            })
+        }
+        None => None,
+    };
+    let mentions = [recipient_pubkey];
+    let builder = buzz_sdk::build_message(
+        session_scope.channel_id(),
+        output,
+        thread_ref.as_ref(),
+        &mentions,
+        false,
+        &[],
+        &[],
+    )
+    .map_err(|error| format!("command output build failed: {error}"))?;
+    let event = builder
+        .sign_with_keys(keys)
+        .map_err(|error| format!("command output sign failed: {error}"))?;
+    publisher
+        .publish_event(event)
+        .await
+        .map_err(|error| format!("command output publish failed: {error}"))
+}
+
+/// Remember a command request ID, returning `false` for a duplicate terminal
+/// result. The bounded generations match membership replay deduplication.
+fn remember_command_result(
+    request_id: &str,
+    current: &mut HashSet<String>,
+    previous: &mut HashSet<String>,
+) -> bool {
+    if current.contains(request_id) || previous.contains(request_id) {
+        return false;
+    }
+    if current.len() >= 1_000 {
+        std::mem::swap(current, previous);
+        current.clear();
+    }
+    current.insert(request_id.to_string())
+}
+
+
+fn command_output_disposition(
+    output: &str,
+    tool_call_seen: bool,
+    output_truncated: bool,
+) -> Result<Option<&'static str>, &'static str> {
+    if output_truncated {
+        return Err("command output exceeded the 64 KiB publish limit");
+    }
+    if tool_call_seen {
+        return Ok(Some("tool_handled"));
+    }
+    if output.trim().is_empty() {
+        return Ok(Some("empty"));
+    }
+    Ok(None)
+}
+
 
 #[derive(serde::Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -2965,6 +3224,12 @@ async fn tokio_main() -> Result<()> {
     let mut seen_membership_current: HashSet<String> = HashSet::new();
     let mut seen_membership_previous: HashSet<String> = HashSet::new();
 
+    // Command terminal results are delivered through an unbounded channel. Keep
+    // the same two-generation bounded dedup convention as membership replay so
+    // a duplicate result can never publish a second kind:9 answer.
+    let mut seen_command_requests_current: HashSet<String> = HashSet::new();
+    let mut seen_command_requests_previous: HashSet<String> = HashSet::new();
+
     // Channels the agent has been removed from. When a checked-out agent is
     // returned to the pool, its sessions for these channels are stripped, and
     // failed/panicked batches for these channels are dropped instead of requeued.
@@ -3002,6 +3267,7 @@ async fn tokio_main() -> Result<()> {
     // borrow, yielding a typed enum so the outer code can dispatch cleanly.
     enum PoolEvent {
         Result(Box<PromptResult>),
+        Command(AgentCommandResult),
         Panic(tokio::task::JoinError),
         SteerAck(SteerAckEvent),
         Wake(u32, Result<AgentPool, String>),
@@ -3148,7 +3414,7 @@ async fn tokio_main() -> Result<()> {
 
         // Borrow result_rx and join_set simultaneously via split-borrow helper.
         let pool_event: Option<PoolEvent> = {
-            let (result_rx, join_set) = pool.rx_and_join_set();
+            let (result_rx, command_rx, join_set) = pool.rx_command_and_join_set();
             tokio::select! {
                 biased;
                 // recv() returning None means all senders dropped (pool was torn down).
@@ -3159,6 +3425,9 @@ async fn tokio_main() -> Result<()> {
                         tracing::info!("result channel closed — exiting main loop");
                         break;
                     }
+                },
+                Some(result) = command_rx.recv(), if pool_ready => {
+                    Some(PoolEvent::Command(result))
                 },
                 // Guard: join_next() returns None immediately when JoinSet is
                 // empty, which would cause a tight spin. Only poll when there
@@ -3226,6 +3495,7 @@ async fn tokio_main() -> Result<()> {
                                     observer.as_ref(),
                                     owner_hex,
                                     relay.event_publisher(),
+                                    &config,
                                 );
                             } else {
                                 tracing::warn!("observer control frame received but no owner resolved — dropping");
@@ -3742,6 +4012,72 @@ async fn tokio_main() -> Result<()> {
         };
 
         match pool_event {
+            Some(PoolEvent::Command(result)) => {
+                if !remember_command_result(
+                    &result.request_id,
+                    &mut seen_command_requests_current,
+                    &mut seen_command_requests_previous,
+                ) {
+                    tracing::warn!(
+                        request_id = %result.request_id,
+                        "duplicate command terminal result — suppressing publication"
+                    );
+                    pool.return_agent(result.agent);
+                    continue;
+                }
+                let mut status = if result.outcome.is_ok() {
+                    "completed"
+                } else {
+                    "runtime_error"
+                };
+                let mut output_disposition = None;
+                let mut error = result.outcome.as_ref().err().map(ToString::to_string);
+
+                if result.outcome.is_ok() {
+                    match command_output_disposition(
+                        &result.output,
+                        result.tool_call_seen,
+                        result.output_truncated,
+                    ) {
+                        Err(disposition_error) => {
+                            status = "runtime_error";
+                            error = Some(disposition_error.into());
+                        }
+                        Ok(Some(disposition)) => output_disposition = Some(disposition),
+                        Ok(None) => {
+                            let recipient = owner_cache.get().unwrap_or_default();
+                            match publish_command_output(
+                                &relay.event_publisher(),
+                                &config.keys,
+                                &result.scope,
+                                recipient,
+                                &result.output,
+                            )
+                            .await
+                            {
+                                Ok(()) => output_disposition = Some("published"),
+                                Err(publish_error) => {
+                                    status = "runtime_error";
+                                    error = Some(publish_error);
+                                }
+                            }
+                        }
+                    }
+                }
+
+                // The scope was resolved while the worker was checked out,
+                // before this return repopulates the pool's affinity index.
+                pool.return_agent(result.agent);
+                emit_dispatch_command_result_with_details(
+                    observer.as_ref(),
+                    &result.request_id,
+                    Some(&result.session_id),
+                    status,
+                    Some(result.scope.channel_id()),
+                    output_disposition,
+                    error.as_deref(),
+                );
+            }
             Some(PoolEvent::Result(result)) => {
                 // Stop the typing indicator for the completed turn's exact scope,
                 // not the whole channel — a sibling thread still running in the
@@ -6077,6 +6413,81 @@ mod owner_control_command_tests {
             root_event_id: root.to_string(),
         }
     }
+
+    #[test]
+    fn command_output_disposition_blocks_tool_and_empty_publication() {
+        assert_eq!(
+            command_output_disposition("answer", false, false),
+            Ok(None)
+        );
+        assert_eq!(
+            command_output_disposition("answer", true, false),
+            Ok(Some("tool_handled"))
+        );
+        assert_eq!(
+            command_output_disposition(" \n\t", false, false),
+            Ok(Some("empty"))
+        );
+        assert_eq!(
+            command_output_disposition("answer", false, true),
+            Err("command output exceeded the 64 KiB publish limit")
+        );
+    }
+
+    #[test]
+    fn command_terminal_result_request_ids_are_deduplicated() {
+        let mut current = HashSet::new();
+        let mut previous = HashSet::new();
+        assert!(remember_command_result(
+            "request-1",
+            &mut current,
+            &mut previous
+        ));
+        assert!(!remember_command_result(
+            "request-1",
+            &mut current,
+            &mut previous
+        ));
+        assert!(remember_command_result(
+            "request-2",
+            &mut current,
+            &mut previous
+        ));
+    }
+
+    #[tokio::test]
+    async fn command_output_publishes_one_scoped_message() {
+        let agent_keys = Keys::generate();
+        let owner_keys = Keys::generate();
+        let channel_id = Uuid::new_v4();
+        let root = "ab".repeat(32);
+        let session_scope = thread_scope(channel_id, &root);
+        let (publisher, mut published) = RelayEventPublisher::test_pair();
+
+        publish_command_output(
+            &publisher,
+            &agent_keys,
+            &session_scope,
+            &owner_keys.public_key().to_hex(),
+            "command answer",
+        )
+        .await
+        .expect("command output should publish");
+
+        let event = published.recv().await.expect("one command event");
+        assert_eq!(event.kind.as_u16() as u32, KIND_STREAM_MESSAGE);
+        assert_eq!(event.content, "command answer");
+        let tags: Vec<Vec<String>> = event
+            .tags
+            .iter()
+            .map(|tag| tag.as_slice().to_vec())
+            .collect();
+        assert!(tags.contains(&vec!["h".into(), channel_id.to_string()]));
+        assert!(tags.contains(&vec!["p".into(), owner_keys.public_key().to_hex()]));
+        assert!(tags.contains(&vec!["e".into(), root, String::new(), "reply".into()]));
+        assert!(published.try_recv().is_err(), "one command result means one event");
+    }
+
 
     fn insert_task_meta(
         pool: &mut AgentPool,

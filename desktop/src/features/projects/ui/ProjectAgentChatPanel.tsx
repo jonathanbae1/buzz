@@ -309,6 +309,11 @@ export function ProjectAgentChatPanel({
         <MessageComposer
           channelId={conversation?.channel.id ?? homeChannel?.id ?? null}
           channelName={selectedAgent?.name ?? "project agent"}
+          commandTarget={
+            conversation
+              ? { candidateAgentPubkeys: [conversation.agent.pubkey] }
+              : null
+          }
           channelType={homeChannel?.channelType ?? "dm"}
           containerClassName="px-3 pb-3"
           disabled={!selectedAgent || isSending}

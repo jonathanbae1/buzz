@@ -26,6 +26,7 @@ pub(super) fn sample_record() -> ManagedAgentRecord {
         model: None,
         provider: None,
         persona_source_version: None,
+        workspace_path: None,
         env_vars: BTreeMap::new(),
         start_on_app_launch: false,
         auto_restart_on_config_change: true,
@@ -64,6 +65,20 @@ pub(super) fn sample_record() -> ManagedAgentRecord {
         effort_level: None,
         session_mode: None,
     }
+}
+#[test]
+fn persona_snapshot_retains_explicit_workspace_binding() {
+    let mut record = sample_record();
+    let workspace = std::path::PathBuf::from("/Users/example/project");
+    record.workspace_path = Some(workspace.clone());
+
+    apply_persona_snapshot(&mut record, &sample_persona());
+
+    assert_eq!(
+        record.workspace_path,
+        Some(workspace),
+        "persona re-snapshot must not erase the local workspace binding"
+    );
 }
 
 // ── preview_prospective_persona_snapshot (Finding 4: relay-mesh preflight

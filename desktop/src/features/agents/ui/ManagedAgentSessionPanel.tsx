@@ -8,7 +8,10 @@ import {
 } from "lucide-react";
 
 import type { UserProfileLookup } from "@/features/profile/lib/identity";
-import type { ManagedAgent } from "@/shared/api/types";
+import type {
+  AgentSessionCommandCatalog,
+  ManagedAgent,
+} from "@/shared/api/types";
 import { cn } from "@/shared/lib/cn";
 import { Badge } from "@/shared/ui/badge";
 import { Skeleton } from "@/shared/ui/skeleton";
@@ -25,18 +28,23 @@ import type {
 } from "./agentSessionTypes";
 import type { AgentSessionTranscriptVariant } from "./agentSessionTranscriptContext";
 import {
+  dispatchAgentSessionCommand,
+  getAgentSessionCommandCatalog,
+  subscribeAgentSessionCommandCatalog,
+} from "./agentSessionCommandCatalog";
+import {
   deriveLatestSessionId,
   mergeObserverEventWindows,
   resolveDisplayEvents,
   resolveRawRailLayout,
   scopeByChannel,
 } from "./agentSessionPanelLayout";
-import { shorten } from "./agentSessionUtils";
 import {
   useObserverEvents,
   useArchivedChannelEvents,
 } from "./useObserverEvents";
 import { buildTranscriptState } from "./agentSessionTranscript";
+import { shorten } from "./agentSessionUtils";
 
 type ManagedAgentSessionPanelProps = {
   agent: Pick<ManagedAgent, "pubkey" | "name"> & {
@@ -128,6 +136,27 @@ export function ManagedAgentSessionPanel({
     [displayEvents],
   );
 
+  const getCommandCatalog = React.useCallback(
+    () => getAgentSessionCommandCatalog(agent.pubkey, latestSessionId) ?? null,
+    [agent.pubkey, latestSessionId],
+  );
+  const subscribeCommandCatalog = React.useCallback(
+    (listener: () => void) =>
+      latestSessionId
+        ? subscribeAgentSessionCommandCatalog(
+            agent.pubkey,
+            latestSessionId,
+            () => listener(),
+          )
+        : () => {},
+    [agent.pubkey, latestSessionId],
+  );
+  const commandCatalog = React.useSyncExternalStore(
+    subscribeCommandCatalog,
+    getCommandCatalog,
+    getCommandCatalog,
+  );
+
   return (
     <section
       className={cn(
@@ -143,6 +172,12 @@ export function ManagedAgentSessionPanel({
           eventCount={displayEvents.length}
           hasObserver={hasObserver}
           latestSessionId={latestSessionId}
+        />
+      ) : null}
+      {commandCatalog ? (
+        <CommandCatalogBar
+          agentPubkey={agent.pubkey}
+          catalog={commandCatalog}
         />
       ) : null}
 
@@ -201,6 +236,66 @@ function SessionHeader({
       <Badge className="w-fit font-mono" variant="outline">
         {eventCount} event{eventCount === 1 ? "" : "s"}
       </Badge>
+    </div>
+  );
+}
+
+function CommandCatalogBar({
+  agentPubkey,
+  catalog,
+}: {
+  agentPubkey: string;
+  catalog: AgentSessionCommandCatalog;
+}) {
+  const [dispatchStatus, setDispatchStatus] = React.useState<string | null>(
+    null,
+  );
+  const [pendingCommand, setPendingCommand] = React.useState<string | null>(
+    null,
+  );
+
+  async function dispatch(commandName: string) {
+    if (pendingCommand) return;
+    setPendingCommand(commandName);
+    setDispatchStatus(null);
+    const result = await dispatchAgentSessionCommand({
+      agentPubkey,
+      sessionId: catalog.sessionId,
+      commandName,
+      candidateAgentPubkeys: [agentPubkey],
+    });
+    setPendingCommand(null);
+    setDispatchStatus(
+      result.status === "sent"
+        ? "Command sent"
+        : result.status.replaceAll("_", " "),
+    );
+  }
+
+  return (
+    <div className="mt-3 flex flex-wrap items-center gap-2 rounded-lg border border-border/60 bg-muted/20 px-3 py-2">
+      <span className="mr-1 text-xs font-medium text-muted-foreground">
+        Commands
+      </span>
+      {catalog.commands.map((command) => (
+        <button
+          key={command.name}
+          className="rounded-md border border-border/70 bg-background px-2 py-1 font-mono text-xs transition-colors hover:bg-muted disabled:cursor-wait disabled:opacity-60"
+          disabled={pendingCommand !== null}
+          onClick={() => void dispatch(command.name)}
+          title={command.description}
+          type="button"
+        >
+          {pendingCommand === command.name
+            ? "Sending…"
+            : command.name.startsWith("/")
+              ? command.name
+              : `/${command.name}`}
+        </button>
+      ))}
+      {dispatchStatus ? (
+        <span className="text-xs text-muted-foreground">{dispatchStatus}</span>
+      ) : null}
     </div>
   );
 }

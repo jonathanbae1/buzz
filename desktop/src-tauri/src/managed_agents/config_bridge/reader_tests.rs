@@ -125,6 +125,7 @@ fn test_record() -> ManagedAgentRecord {
         session_mode: None,
         agent_command_override: None,
         persona_source_version: None,
+        workspace_path: None,
         provider: None,
     }
 }

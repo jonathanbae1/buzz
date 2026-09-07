@@ -280,6 +280,25 @@ export const ChannelPane = React.memo(function ChannelPane({
     }
     return pubkeys;
   }, [activityAgents, agentPubkeys, agentSessionAgents]);
+  const commandTarget = React.useMemo(() => {
+    if (!activeChannel) return null;
+    const candidates =
+      activeChannel.channelType === "dm"
+        ? activeChannel.participantPubkeys.filter(
+            (pubkey) =>
+              pubkey.toLowerCase() !== currentPubkey?.toLowerCase() &&
+              knownAgentPubkeys.has(pubkey.toLowerCase()),
+          )
+        : activityAgents
+            .map((agent) => agent.pubkey)
+            .filter((pubkey) => knownAgentPubkeys.has(pubkey.toLowerCase()));
+    return { candidateAgentPubkeys: [...new Set(candidates)] };
+  }, [
+    activeChannel,
+    activityAgents,
+    currentPubkey,
+    knownAgentPubkeys,
+  ]);
   const handleSendMessage = React.useCallback(
     async (
       content: string,
@@ -757,6 +776,7 @@ export const ChannelPane = React.memo(function ChannelPane({
                     channelId={activeChannel?.id ?? null}
                     channelName={activeChannel?.name ?? "channel"}
                     channelType={activeChannel?.channelType ?? null}
+                    commandTarget={commandTarget}
                     containerClassName="px-5 pb-0"
                     layoutMode="dock"
                     disabled={isComposerDisabled}

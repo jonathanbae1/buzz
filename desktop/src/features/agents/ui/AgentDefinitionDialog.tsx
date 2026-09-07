@@ -515,9 +515,7 @@ export function AgentDefinitionDialog({
     ompProfileCatalogQuery.data?.state === "configured"
       ? ompProfileCatalogQuery.data.entries
       : [];
-  const ompProfileNames = new Set(
-    ompProfileEntries.map((entry) => entry.name),
-  );
+  const ompProfileNames = new Set(ompProfileEntries.map((entry) => entry.name));
   const ompProfileHasInvalidSelection =
     runtime.trim() === "omp" &&
     ompProfileSelection.length > 0 &&
@@ -557,11 +555,7 @@ export function AgentDefinitionDialog({
       });
     }
     return options;
-  }, [
-    ompProfileCatalogQuery.data,
-    ompProfileNames,
-    ompProfileSelection,
-  ]);
+  }, [ompProfileCatalogQuery.data, ompProfileNames, ompProfileSelection]);
   const canSubmit =
     canSubmitPersonaDialog({ displayName, isPending }) &&
     (!isCreateMode || runtime.trim().length > 0) &&
@@ -894,7 +888,10 @@ export function AgentDefinitionDialog({
           ) : null}
           {runtime.trim() === "omp" ? (
             <div className="space-y-1.5">
-              <RequiredFieldLabel htmlFor="persona-omp-profile" isRequired={false}>
+              <RequiredFieldLabel
+                htmlFor="persona-omp-profile"
+                isRequired={false}
+              >
                 omp profile
                 <span className={PERSONA_LABEL_OPTIONAL_CLASS}>Optional</span>
               </RequiredFieldLabel>
@@ -920,8 +917,8 @@ export function AgentDefinitionDialog({
               ) : null}
               {ompProfileCatalogQuery.data?.state === "invalid" ? (
                 <p className="text-xs text-warning">
-                  The omp profile catalogue is invalid. Repair it before choosing
-                  a different profile.
+                  The omp profile catalogue is invalid. Repair it before
+                  choosing a different profile.
                 </p>
               ) : null}
             </div>

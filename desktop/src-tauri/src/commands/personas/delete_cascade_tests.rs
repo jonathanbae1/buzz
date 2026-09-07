@@ -38,6 +38,7 @@ fn make_agent(
         model: None,
         provider: None,
         persona_source_version: None,
+        workspace_path: None,
         env_vars: BTreeMap::new(),
         start_on_app_launch: false,
         runtime_pid,

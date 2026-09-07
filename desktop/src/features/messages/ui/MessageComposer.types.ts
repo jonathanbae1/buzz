@@ -5,6 +5,7 @@ import type { ImetaMedia } from "@/features/messages/lib/imetaMediaMarkdown";
 import type { MediaUploadController } from "@/features/messages/lib/useMediaUpload";
 import type { UserProfileLookup } from "@/features/profile/lib/identity";
 import type { ChannelType } from "@/shared/api/types";
+import type { ComposerCommandTarget } from "./useComposerCommandPicker";
 
 export type MessageComposerEditTarget = {
   author: string;
@@ -33,6 +34,8 @@ export type MessageComposerProps = {
   channelId?: string | null;
   channelName: string;
   channelType?: ChannelType | null;
+  /** Exact managed-agent target for slash command dispatch in this conversation. */
+  commandTarget?: ComposerCommandTarget | null;
   containerClassName?: string;
   /**
    * `dock` delegates backdrop blur and bottom-rail geometry to a surrounding

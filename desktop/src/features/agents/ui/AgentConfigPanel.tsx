@@ -1,4 +1,5 @@
 import * as React from "react";
+import { managedAgentsQueryKey, useAgentConfigSurface } from "../hooks";
 import type { LucideIcon } from "lucide-react";
 import {
   Activity,
@@ -12,7 +13,7 @@ import {
   Pencil,
   Server,
 } from "lucide-react";
-import { useAgentConfigSurface } from "../hooks";
+import { useQueryClient } from "@tanstack/react-query";
 import { cn } from "@/shared/lib/cn";
 import { Spinner } from "@/shared/ui/spinner";
 import { PanelSectionGroup } from "@/shared/ui/PanelSectionGroup";
@@ -21,9 +22,11 @@ import {
   useCopyFeedback,
 } from "@/shared/ui/HoverCopyIndicator";
 import { McpServersSection, shouldRenderMcpServers } from "./McpServersSection";
+import { setManagedAgentWorkspace } from "@/shared/api/tauriManagedAgents";
 import type {
   ConfigField,
   ConfigOrigin,
+  ManagedAgent,
   NormalizedConfig,
   NormalizedField,
   OmpProfileSurface,
@@ -41,6 +44,7 @@ const ALL_AGENT_CONFIG_SECTIONS: readonly AgentConfigPanelSection[] = [
 
 type Props = {
   pubkey: string;
+  agent?: ManagedAgent;
   advancedMode?: "collapsed" | "flat";
   onEdit?: () => void;
   sections?: readonly AgentConfigPanelSection[];
@@ -48,6 +52,7 @@ type Props = {
 
 type AgentConfigSurfaceRowsProps = {
   advancedMode?: "collapsed" | "flat";
+  agent?: ManagedAgent;
   data: RuntimeConfigSurface;
   onEdit?: () => void;
   sections?: readonly AgentConfigPanelSection[];
@@ -360,7 +365,9 @@ function OmpProfileDisclosure({
       </div>
       <div className="flex items-center justify-between gap-3">
         <span className="font-medium text-foreground">State</span>
-        <span className="text-muted-foreground">{profileReasonLabel(profile)}</span>
+        <span className="text-muted-foreground">
+          {profileReasonLabel(profile)}
+        </span>
       </div>
       {profile.modelLane ? (
         <div className="flex items-center justify-between gap-3">
@@ -394,7 +401,10 @@ function OmpProfileDisclosure({
 
   if (variant === "profile") {
     return (
-      <ProfileConfigSection testId="user-profile-omp-profile-section" title="omp profile">
+      <ProfileConfigSection
+        testId="user-profile-omp-profile-section"
+        title="omp profile"
+      >
         {details}
       </ProfileConfigSection>
     );
@@ -432,8 +442,77 @@ function ClaudeConfigDirNotice() {
   );
 }
 
+function WorkspaceBindingRow({ agent }: { agent: ManagedAgent }) {
+  const queryClient = useQueryClient();
+  const [path, setPath] = React.useState(agent.workspacePath ?? "");
+  const [saving, setSaving] = React.useState(false);
+  const [error, setError] = React.useState<string | null>(null);
+
+  React.useEffect(() => {
+    setPath(agent.workspacePath ?? "");
+  }, [agent.workspacePath]);
+
+  const save = async () => {
+    if (saving) return;
+    setSaving(true);
+    setError(null);
+    try {
+      const updated = await setManagedAgentWorkspace(
+        agent.pubkey,
+        path.trim() || null,
+      );
+      queryClient.setQueryData<ManagedAgent[]>(
+        managedAgentsQueryKey,
+        (current) =>
+          current?.map((candidate) =>
+            candidate.pubkey === updated.pubkey ? updated : candidate,
+          ) ?? current,
+      );
+    } catch (reason) {
+      setError(reason instanceof Error ? reason.message : String(reason));
+    } finally {
+      setSaving(false);
+    }
+  };
+
+  return (
+    <div className="border-b border-border/50 px-4 py-3">
+      <div className="flex items-center gap-2">
+        <Layers className="h-4 w-4 shrink-0 text-muted-foreground" />
+        <span className="text-sm font-medium">Workspace</span>
+        {agent.workspaceChangePending ? (
+          <span className="text-xs text-amber-600">Pending relaunch</span>
+        ) : null}
+      </div>
+      <div className="mt-2 flex gap-2">
+        <input
+          aria-label="Managed agent workspace path"
+          className="min-w-0 flex-1 rounded-md border border-border bg-background px-2 py-1.5 font-mono text-xs"
+          onChange={(event) => setPath(event.target.value)}
+          placeholder="Leave empty for the default workspace"
+          spellCheck={false}
+          value={path}
+        />
+        <button
+          className="rounded-md border border-border px-2 py-1 text-xs hover:bg-muted disabled:opacity-50"
+          disabled={saving}
+          onClick={() => void save()}
+          type="button"
+        >
+          {saving ? "Saving…" : "Save"}
+        </button>
+      </div>
+      {error ? <p className="mt-1 text-xs text-destructive">{error}</p> : null}
+      <p className="mt-1 text-xs text-muted-foreground">
+        Changes persist immediately and apply after a safe relaunch.
+      </p>
+    </div>
+  );
+}
+
 export function AgentConfigPanel({
   advancedMode = "collapsed",
+  agent,
   onEdit,
   pubkey,
   sections = ALL_AGENT_CONFIG_SECTIONS,
@@ -482,6 +561,7 @@ export function AgentConfigPanel({
 
   return (
     <AgentConfigSurfaceRows
+      agent={agent}
       advancedMode={advancedMode}
       data={data}
       onEdit={onEdit}
@@ -492,6 +572,7 @@ export function AgentConfigPanel({
 
 export function AgentConfigSurfaceRows({
   advancedMode = "collapsed",
+  agent,
   data,
   onEdit,
   sections = ALL_AGENT_CONFIG_SECTIONS,
@@ -529,6 +610,7 @@ export function AgentConfigSurfaceRows({
   const showModelSection = sections.includes("model");
   const showMcpSection = sections.includes("mcp");
   const showAdvancedSection = sections.includes("advanced");
+  const showWorkspace = agent?.backend.type === "local" && showAdvancedSection;
 
   if (advancedMode === "flat") {
     return (
@@ -536,6 +618,7 @@ export function AgentConfigSurfaceRows({
         {ompProfile ? (
           <OmpProfileDisclosure profile={ompProfile} variant="profile" />
         ) : null}
+        {showWorkspace && agent ? <WorkspaceBindingRow agent={agent} /> : null}
         {showModelSection && normalizedEntries.length > 0 ? (
           <ProfileConfigSection
             testId="user-profile-model-settings-section"
@@ -591,6 +674,7 @@ export function AgentConfigSurfaceRows({
       {ompProfile ? (
         <OmpProfileDisclosure profile={ompProfile} variant="compact" />
       ) : null}
+      {showWorkspace && agent ? <WorkspaceBindingRow agent={agent} /> : null}
       {/* Normalized section */}
       <div className="divide-y divide-border/50">
         {normalizedEntries.length === 0 ? (

@@ -21,8 +21,8 @@
 //! The following fields are NEVER serialized:
 //!   - `private_key_nsec` / any private key material
 //!   - `auth_tag` (NIP-OA)
-//!   - `env_vars` (API keys / credentials)
 //!   - `relay_url` (machine-local endpoint)
+//!   - `workspace_path` (machine-local process binding)
 //!   - `acp_command` / `agent_command` / `agent_command_override` / `agent_args`
 //!     (machine-local harness paths)
 //!   - `mcp_command` (machine-local)

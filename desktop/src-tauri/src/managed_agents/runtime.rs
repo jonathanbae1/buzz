@@ -8,8 +8,8 @@ use crate::{
     managed_agents::{
         append_log_marker, known_acp_runtime, login_shell_path, managed_agent_log_path,
         missing_command_message, normalize_agent_args, open_log_file, resolve_command,
-        spawn_key_refusal, KnownAcpRuntime, ManagedAgentPairRuntime, ManagedAgentRecord,
-        ManagedAgentRuntimeKey, ManagedAgentSummary,
+        resolve_managed_agent_workspace, spawn_key_refusal, KnownAcpRuntime,
+        ManagedAgentPairRuntime, ManagedAgentRecord, ManagedAgentRuntimeKey, ManagedAgentSummary,
     },
     util::now_iso,
 };
@@ -149,6 +149,17 @@ pub fn build_managed_agent_summary(
     // green light as long as any pair anywhere is alive.
     let pair_key = workspace_pair_key(app, record);
     let pair_runtime = pair_key.as_ref().and_then(|key| runtimes.get(key));
+    let workspace_path = record
+        .workspace_path
+        .as_ref()
+        .map(|path| path.display().to_string());
+    let spawned_with_workspace_path = pair_runtime
+        .and_then(|runtime| runtime.spawned_with_workspace_path.as_ref())
+        .map(|path| path.display().to_string());
+    // Clearing a binding is also a desired change: an existing process keeps
+    // its old cwd until an explicit safe relaunch.
+    let workspace_change_pending = record.workspace_path.as_ref()
+        != pair_runtime.and_then(|runtime| runtime.spawned_with_workspace_path.as_ref());
 
     let (status, pid, log_path) = if record.backend != BackendKind::Local {
         // Two-axis status model for remote agents:
@@ -302,8 +313,11 @@ pub fn build_managed_agent_summary(
         acp_command: record.acp_command.clone(),
         agent_command: descriptor.command,
         agent_command_override: record.agent_command_override.clone(),
-        agent_args: descriptor.args,
         mcp_command: effective_mcp_command,
+        workspace_path,
+        spawned_with_workspace_path,
+        workspace_change_pending,
+        agent_args: descriptor.args,
         turn_timeout_seconds: record.turn_timeout_seconds,
         idle_timeout_seconds: record.idle_timeout_seconds,
         max_turn_duration_seconds: record.max_turn_duration_seconds,
@@ -501,6 +515,9 @@ pub fn spawn_agent_child(
             })?;
     let effective_command = &descriptor.command;
     let agent_args = &descriptor.args;
+    // Resolve the local process workspace before any log or process side
+    // effect. Explicit bindings are strict and never fall back to `~/.buzz`.
+    let spawned_with_workspace_path = resolve_managed_agent_workspace(record)?;
 
     let log_path = super::managed_agent_runtime_log_path(app, &runtime_key)?;
     append_log_marker(
@@ -561,11 +578,9 @@ pub fn spawn_agent_child(
     );
 
     let mut command = std::process::Command::new(&resolved_acp_command);
-    if let Some(home) = super::default_agent_workdir() {
-        command.current_dir(home);
+    if let Some(path) = spawned_with_workspace_path.as_deref() {
+        command.current_dir(path);
     }
-    command.stdin(std::process::Stdio::null());
-    command.stdout(std::process::Stdio::from(stdout));
     command.stderr(std::process::Stdio::from(stderr));
     if let Some(ref path) = augmented_path {
         command.env("PATH", path);
@@ -858,6 +873,7 @@ pub fn spawn_agent_child(
         log_path,
         spawn_config,
         spawned_setup_mode,
+        spawned_with_workspace_path,
         spawned_adapter_availability,
         start_nonce,
         &record.name,
@@ -868,6 +884,7 @@ pub fn spawn_agent_child(
         log_path,
         spawn_config,
         setup_mode: spawned_setup_mode,
+        spawned_with_workspace_path,
         adapter_availability: spawned_adapter_availability,
         start_nonce,
     })

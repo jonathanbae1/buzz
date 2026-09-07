@@ -184,6 +184,7 @@ fn local_agent() -> ManagedAgentRecord {
         model: Some("local-model".to_string()),
         provider: Some("local-provider".to_string()),
         persona_source_version: Some("local-hash".to_string()),
+        workspace_path: Some(std::path::PathBuf::from("/Users/local/workspace")),
         env_vars: BTreeMap::from([("API_KEY".to_string(), "localsecret".to_string())]),
         start_on_app_launch: true,
         auto_restart_on_config_change: true,
@@ -242,6 +243,7 @@ fn foreign_agent_event_with_secrets(d_tag: &str) -> nostr::Event {
         "parallelism": 99,
         "respond_to": "anyone",
         "respond_to_allowlist": ["deadbeef"],
+        "workspace_path": "/tmp/INJECTED_WORKSPACE",
         // Injected — must be dropped at deserialization, never applied.
         "private_key_nsec": "nsec1INJECTEDSECRET",
         "auth_tag": "INJECTEDAUTHTAG",
@@ -303,6 +305,11 @@ fn inbound_managed_agent_drops_injected_secrets_and_harness() {
     assert_eq!(a.mcp_command, "buzz-dev-mcp", "mcp command overwritten");
     assert_eq!(a.relay_url, "wss://relay.local", "relay url overwritten");
     assert_eq!(a.runtime_pid, Some(1234), "runtime pid overwritten");
+    assert_eq!(
+        a.workspace_path,
+        Some(std::path::PathBuf::from("/Users/local/workspace")),
+        "workspace binding overwritten by inbound event"
+    );
     match &a.backend {
         crate::managed_agents::BackendKind::Provider { config, .. } => {
             assert_eq!(
@@ -321,6 +328,7 @@ fn inbound_managed_agent_drops_injected_secrets_and_harness() {
         "INJECTEDHARNESS",
         "INJECTEDOVERRIDE",
         "INJECTEDBACKEND",
+        "INJECTED_WORKSPACE",
         "INJECTEDMCP",
     ] {
         assert!(!json.contains(needle), "injected value leaked: {needle}");

@@ -192,7 +192,7 @@ export function ManagedAgentRow({
             <p className="mb-2 text-xs font-medium text-muted-foreground">
               Configuration
             </p>
-            <AgentConfigPanel pubkey={agent.pubkey} />
+            <AgentConfigPanel agent={agent} pubkey={agent.pubkey} />
           </div>
         </div>
       ) : null}

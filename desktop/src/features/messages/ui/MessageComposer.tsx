@@ -45,6 +45,7 @@ import { ComposerReplyEditBanner } from "./ComposerReplyEditBanner";
 import { ComposerAttachments, DropZoneOverlay } from "./ComposerAttachments";
 import { focusMentionOptionsTrigger } from "./MentionAutocomplete";
 import { MessageComposerAutocompletes } from "./MessageComposerAutocompletes";
+import { useComposerCommandPicker } from "./useComposerCommandPicker";
 import { ComposerDockToolbar } from "./ComposerDockToolbar";
 import { ComposerUploadProgressPill } from "./ComposerUploadProgressPill";
 import { NonMemberMentionDialog } from "./NonMemberMentionDialog";
@@ -72,6 +73,7 @@ function MessageComposerImpl({
   channelId = null,
   channelName,
   channelType = null,
+  commandTarget = null,
   containerClassName,
   layoutMode = "standalone",
   disabled = false,
@@ -249,11 +251,16 @@ function MessageComposerImpl({
   editTargetRef.current = editTarget;
   extractMentionPubkeysRef.current = mentions.extractMentionPubkeys;
   ownerPubkeyRef.current = ownerPubkey;
+  const commandQueryUpdateRef = React.useRef<
+    (text: string, cursor: number) => void
+  >(() => {});
+  const commandPickerOpenRef = React.useRef(false);
   const isAutocompleteOpenRef = React.useRef(false);
   isAutocompleteOpenRef.current =
     mentions.isMentionOpen ||
     channelLinks.isChannelOpen ||
-    emojiAutocomplete.isEmojiAutocompleteOpen;
+    emojiAutocomplete.isEmojiAutocompleteOpen ||
+    commandPickerOpenRef.current;
   const submitMessageRef = React.useRef<() => void>(() => {});
   const composerScrollRef = React.useRef<HTMLDivElement>(null);
   const formRef = React.useRef<HTMLFormElement>(null);
@@ -308,6 +315,7 @@ function MessageComposerImpl({
       mentions.updateMentionQuery(text, cursor);
       channelLinks.updateChannelQuery(text, cursor);
       emojiAutocomplete.updateEmojiQuery(text, cursor);
+      commandQueryUpdateRef.current(text, cursor);
       if (text.trim().length > 0) {
         notifyTyping();
       }
@@ -447,6 +455,14 @@ function MessageComposerImpl({
     },
     [richText.replacePlainTextRange],
   );
+  const commandPicker = useComposerCommandPicker({
+    applyAutocompleteEdit,
+    channelId,
+    implicitMentionPrefix: implicitAgentMentionProvenance.getPrefix(),
+    target: commandTarget,
+  });
+  commandQueryUpdateRef.current = commandPicker.updateQuery;
+  commandPickerOpenRef.current = commandPicker.isCommandOpen;
   const {
     announcement: addressLockAnnouncement,
     lockedAgents,
@@ -621,6 +637,35 @@ function MessageComposerImpl({
     ) {
       return;
     }
+    isSubmitLockedRef.current = true;
+    setIsSubmitLocked(true);
+    try {
+      if (hasMedia) {
+        if (commandPicker.isCommandRecognized) {
+          commandPicker.reportDispatchError(
+            "Remove attachments before dispatching a command. The draft was kept.",
+          );
+          return;
+        }
+      } else {
+        const commandResult =
+          await commandPicker.dispatchSelectedCommand(trimmed);
+        if (commandResult.handled) {
+          if (!commandResult.succeeded) return;
+          setComposerContent("");
+          richText.clearContent();
+          mentions.clearMentions();
+          channelLinks.clearChannels();
+          emojiAutocomplete.clearEmojis();
+          setIsEmojiPickerOpen(false);
+          setPreviewContent("");
+          return;
+        }
+      }
+    } finally {
+      isSubmitLockedRef.current = false;
+      setIsSubmitLocked(false);
+    }
     const capturedThreadContext = onCaptureSendContext?.() ?? null;
     if (
       capturedThreadContext !== null &&
@@ -659,6 +704,9 @@ function MessageComposerImpl({
       onPreparingMentionSendChange?.(false);
     }
   }, [
+    commandPicker.dispatchSelectedCommand,
+    commandPicker.isCommandRecognized,
+    commandPicker.reportDispatchError,
     channelId,
     channelLinks.clearChannels,
     customEmoji,
@@ -726,6 +774,8 @@ function MessageComposerImpl({
   const handleEditorKeyDown = React.useCallback(
     (event: React.KeyboardEvent<HTMLDivElement>) => {
       if (handleAlwaysAddressShortcut(event)) return;
+      const commandResult = commandPicker.handleKeyDown(event);
+      if (commandResult.handled) return;
       // Let autocomplete handle keys first
       const emojiResult = emojiAutocomplete.handleEmojiKeyDown(event);
       if (emojiResult.handled) {
@@ -783,6 +833,7 @@ function MessageComposerImpl({
       }
     },
     [
+      commandPicker.handleKeyDown,
       handleAlwaysAddressShortcut,
       emojiAutocomplete.handleEmojiKeyDown,
       applyEmojiInsert,
@@ -880,6 +931,24 @@ function MessageComposerImpl({
               audienceControlsEnabled={Boolean(
                 audienceScope && editTarget == null,
               )}
+              commandPicker={{
+                activeCommand: commandPicker.activeCommand,
+                composerOwnsFocus,
+                isCommandRecognized: commandPicker.isCommandRecognized,
+                isCommandOpen: commandPicker.isCommandOpen,
+                isDispatching: commandPicker.isDispatching,
+                onDismiss: commandPicker.dismiss,
+                onRun: () => {
+                  void submitMessageRef.current();
+                },
+                onSelect: commandPicker.selectCommand,
+                onSelectSubcommand: commandPicker.selectSubcommand,
+                query: commandPicker.query,
+                selectedIndex: commandPicker.selectedIndex,
+                stateStatus: commandPicker.stateStatus,
+                suggestions: commandPicker.suggestions,
+                targetSummary: commandPicker.targetSummary,
+              }}
               channelLinks={channelLinks}
               composerOwnsFocus={composerOwnsFocus}
               emojiAutocomplete={emojiAutocomplete}
@@ -907,6 +976,25 @@ function MessageComposerImpl({
                 >
                   Dismiss
                 </button>
+              </div>
+            ) : null}
+            {commandPicker.dispatchError ? (
+              <div
+                className="mb-2 rounded-lg bg-destructive/10 px-3 py-2 text-xs text-destructive"
+                data-testid="composer-command-error"
+                role="alert"
+              >
+                {commandPicker.dispatchError}
+              </div>
+            ) : null}
+            {commandPicker.dispatchNotice ? (
+              <div
+                aria-live="polite"
+                className="mb-2 rounded-lg bg-muted/50 px-3 py-2 text-xs text-muted-foreground"
+                data-testid="composer-command-status"
+                role="status"
+              >
+                {commandPicker.dispatchNotice}
               </div>
             ) : null}
             {composerLinkPreviews}

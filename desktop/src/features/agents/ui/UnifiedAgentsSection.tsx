@@ -298,7 +298,9 @@ function OmpProfileRoster({
     >
       <div className="flex flex-wrap items-start justify-between gap-3">
         <div className="min-w-0">
-          <h2 className="text-sm font-semibold text-foreground">omp profiles</h2>
+          <h2 className="text-sm font-semibold text-foreground">
+            omp profiles
+          </h2>
           <p className="text-xs text-muted-foreground">
             Installed profiles are separate from personas and running instances.
           </p>
@@ -318,7 +320,9 @@ function OmpProfileRoster({
       </div>
 
       {isCatalogLoading ? (
-        <p className="text-sm text-muted-foreground">Reading installed profiles…</p>
+        <p className="text-sm text-muted-foreground">
+          Reading installed profiles…
+        </p>
       ) : null}
       {catalogError ? (
         <p className="text-sm text-destructive">

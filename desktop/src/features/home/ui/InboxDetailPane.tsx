@@ -512,6 +512,19 @@ function InboxMessageDetailPane({
         ? `Message in #${channelContextName}`
         : formatInboxTypeLabel(item);
   const contextChannelId = item.item.channelId;
+  const commandTarget = (() => {
+    if (!isDirectMessage) return null;
+    const knownAgents = new Set(
+      [...(agentPubkeys ?? [])].map((pubkey) => pubkey.toLowerCase()),
+    );
+    const participants = channel?.participantPubkeys ?? [item.item.pubkey];
+    const candidates = participants.filter(
+      (pubkey) =>
+        pubkey.toLowerCase() !== currentPubkey?.toLowerCase() &&
+        knownAgents.has(pubkey.toLowerCase()),
+    );
+    return { candidateAgentPubkeys: [...new Set(candidates)] };
+  })();
   const sourceEventId = selectedEventId ?? item.id;
   const contextThreadRootId = isThreadContext ? item.conversationId : null;
   const openContextLabel = isThreadContext
@@ -841,6 +854,7 @@ function InboxMessageDetailPane({
               onCancelReply={
                 composerReplyTarget ? () => setReplyTargetId(null) : undefined
               }
+              commandTarget={commandTarget}
               onEditSave={async (content, mediaTags, mentionPubkeys) => {
                 if (!composerEditTarget) {
                   return;

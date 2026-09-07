@@ -138,6 +138,9 @@ export type RawManagedAgent = {
   persona_orphaned: boolean;
   needs_restart: boolean;
   restart_diff?: RawRestartDiffEntry[];
+  workspace_path?: string | null;
+  spawned_with_workspace_path?: string | null;
+  workspace_change_pending?: boolean;
   env_vars?: Record<string, string>;
   status: ManagedAgent["status"];
   pid: number | null;
@@ -653,6 +656,9 @@ export function fromRawManagedAgent(agent: RawManagedAgent): ManagedAgent {
     needsRestart: agent.needs_restart ?? false,
     restartDiff: agent.restart_diff ?? [],
     envVars: agent.env_vars ?? {},
+    workspacePath: agent.workspace_path ?? null,
+    spawnedWithWorkspacePath: agent.spawned_with_workspace_path ?? null,
+    workspaceChangePending: agent.workspace_change_pending ?? false,
     status: agent.status,
     pid: agent.pid,
     createdAt: agent.created_at,

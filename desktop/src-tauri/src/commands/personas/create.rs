@@ -13,7 +13,10 @@ use crate::{
     util::now_iso,
 };
 
-use super::{normalize_description, pending, retain_persona_pending, trim_optional, trim_required};
+use super::{
+    normalize_description, pending, retain_persona_pending, trim_optional, trim_required,
+    validate_persona_env_assignments,
+};
 
 #[tauri::command]
 pub async fn create_persona(
@@ -48,13 +51,13 @@ pub async fn create_persona(
             .map_err(|error| error.to_string())?;
         let mut personas = load_personas(&app)?;
         pending::project_active_persona_sharing(&app, &state, &mut personas);
+        validate_persona_env_assignments(&input.env_vars, runtime.as_deref(), &personas, None)?;
         let name_pool: Vec<String> = input
             .name_pool
             .into_iter()
             .map(|s| s.trim().to_string())
             .filter(|s| !s.is_empty())
             .collect();
-        crate::managed_agents::validate_user_env_keys(&input.env_vars)?;
         let mut persona = AgentDefinition {
             id: Uuid::new_v4().to_string(),
             display_name,

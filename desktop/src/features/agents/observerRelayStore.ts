@@ -29,6 +29,10 @@ import {
   createEmptyTranscriptState,
   processTranscriptEvent,
 } from "./ui/agentSessionTranscript";
+import {
+  markAgentSessionCommandCatalogsStale,
+  putAgentSessionCommandCatalog,
+} from "./ui/agentSessionCommandCatalog";
 
 const MAX_OBSERVER_EVENTS = 3000;
 // Length the per-agent journal is evicted down to when it overflows
@@ -465,6 +469,39 @@ function unwrapObserverBatch(parsed: ObserverEvent): ObserverEvent[] {
   return events && events.length > 0 ? events : [parsed];
 }
 
+function captureAvailableCommands(
+  agentPubkey: string,
+  event: ObserverEvent,
+  source: "live" | "archive",
+) {
+  if (event.kind !== "acp_read") return;
+  const payload =
+    typeof event.payload === "object" && event.payload !== null
+      ? (event.payload as Record<string, unknown>)
+      : null;
+  if (payload?.method !== "session/update") return;
+  const params =
+    typeof payload.params === "object" && payload.params !== null
+      ? (payload.params as Record<string, unknown>)
+      : null;
+  const update =
+    typeof params?.update === "object" && params.update !== null
+      ? (params.update as Record<string, unknown>)
+      : null;
+  if (update?.sessionUpdate !== "available_commands_update") return;
+  const sessionId =
+    (typeof event.sessionId === "string" && event.sessionId) ||
+    (typeof params?.sessionId === "string" && params.sessionId) ||
+    null;
+  if (!sessionId) return;
+  putAgentSessionCommandCatalog(
+    agentPubkey,
+    sessionId,
+    update.availableCommands,
+    source,
+  );
+}
+
 // Per-event processing shared by every event a live frame carries (one for a
 // plain frame, many for a batch envelope).
 function processLiveObserverEvents(
@@ -488,6 +525,7 @@ function processLiveObserverEvents(
   const accepted = appendAgentEvents(agentPubkey, events);
 
   for (const parsed of accepted ?? []) {
+    captureAvailableCommands(agentPubkey, parsed, "live");
     // Track the latest-live-session-id per (agent, channel) on the live path.
     // Only set when the parsed event carries both a sessionId and channelId,
     // so we never attribute a session to the wrong channel.
@@ -520,13 +558,13 @@ function processLiveObserverEvents(
       }
     }
     if (parsed.kind === "session_config_captured") {
+      markAgentSessionCommandCatalogsStale(agentPubkey);
       void putAgentSessionConfig(agentPubkey, parsed.payload);
       onSessionConfigCaptured?.(agentPubkey);
     } else if (parsed.kind === "control_result") {
-      // Thread the envelope's channelId into the frame so the ModelPicker can
-      // count a terminal switch result once per distinct channel.
       dispatchControlResult(agentPubkey, parsed.payload, parsed.channelId);
     } else if (parsed.kind === "managed_agent_runtime_lifecycle") {
+      markAgentSessionCommandCatalogsStale(agentPubkey);
       void putManagedAgentRuntimeLifecycle(agentPubkey, parsed.payload).catch(
         (error) => {
           console.debug("Late/untracked lifecycle frame dropped:", error);
@@ -534,7 +572,6 @@ function processLiveObserverEvents(
       );
     }
   }
-
   // Preserve the harness's envelope backpressure: retained state was committed
   // before specialized callbacks, but external-store subscribers publish once.
   if (accepted) {
@@ -864,6 +901,7 @@ export async function ingestArchivedObserverEvents(
     try {
       const parsed = (await _decryptFn(event)) as ObserverEvent;
       for (const inner of unwrapObserverBatch(parsed)) {
+        captureAvailableCommands(agentPubkey, inner, "archive");
         // Route archived events to the channel-scoped archive window (no cap)
         // rather than the per-agent live-relay store (MAX_OBSERVER_EVENTS cap).
         // Events without a channelId fall through to the live store so they

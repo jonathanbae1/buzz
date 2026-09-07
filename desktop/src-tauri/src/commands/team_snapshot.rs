@@ -586,6 +586,7 @@ pub async fn confirm_team_snapshot_import(
             model: member.definition.model.clone(),
             provider: member.definition.provider.clone(),
             persona_source_version: None,
+            workspace_path: None,
             env_vars: std::collections::BTreeMap::new(),
             start_on_app_launch: false,
             auto_restart_on_config_change: true,
