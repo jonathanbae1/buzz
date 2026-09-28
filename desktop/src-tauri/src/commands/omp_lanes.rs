@@ -217,6 +217,10 @@ struct RoutingLock(File);
 
 impl RoutingLock {
     fn acquire() -> Result<Self, String> {
+        Self::acquire_with_timeout(Duration::from_secs(30))
+    }
+
+    fn acquire_with_timeout(timeout: Duration) -> Result<Self, String> {
         let path = lock_path()?;
         let parent = path.parent().ok_or("invalid routing lock path")?;
         fs::create_dir_all(parent).map_err(|e| format!("cannot create {}: {e}", parent.display()))?;
@@ -226,10 +230,10 @@ impl RoutingLock {
         loop {
             let rc = unsafe { libc::flock(std::os::fd::AsRawFd::as_raw_fd(&file), libc::LOCK_EX | libc::LOCK_NB) };
             if rc == 0 { return Ok(Self(file)); }
-            if start.elapsed() >= Duration::from_secs(30) {
+            if start.elapsed() >= timeout {
                 return Err(format!("lock_timeout: routing lock held at {}", path.display()));
             }
-            thread::sleep(Duration::from_secs(2));
+            thread::sleep(Duration::from_secs(2).min(timeout.saturating_sub(start.elapsed())));
         }
     }
 }
@@ -345,6 +349,236 @@ mod profile_record_tests {
 
         assert_eq!(roles, json!({"advisor": "model:medium"}));
         assert_eq!(agents, json!({"coder": "model"}));
+    }
+}
+#[cfg(test)]
+mod lane_commit_tests {
+    use super::{commit_omp_lanes, hash};
+    use std::{fs, path::{Path, PathBuf}, process::Command};
+
+    fn git(repo: &Path, args: &[&str]) {
+        let output = Command::new("git").args(args).current_dir(repo).output().unwrap();
+        assert!(output.status.success(), "git {:?}: {}", args, String::from_utf8_lossy(&output.stderr));
+    }
+
+    fn scratch_repo(root: &Path) -> PathBuf {
+        fs::create_dir_all(root.join("profiles")).unwrap();
+        let repo = root.to_path_buf();
+        git(&repo, &["init", "-q", "-b", "test"]);
+        git(&repo, &["config", "user.name", "Buzz Test"]);
+        git(&repo, &["config", "user.email", "buzz-test@example.invalid"]);
+        fs::write(repo.join("profiles/lanes.json"), b"{\"schemaVersion\":1,\"lanes\":{}}\n").unwrap();
+        git(&repo, &["add", "profiles/lanes.json"]);
+        git(&repo, &["commit", "-qm", "baseline"]);
+        repo
+    }
+
+    #[test]
+    fn commit_refusals_are_isolated() {
+        let root = tempfile::tempdir().unwrap();
+        let output = Command::new(std::env::current_exe().unwrap())
+            .args(["--exact", "commands::omp_lanes::lane_commit_tests::commit_refusals_child", "--nocapture"])
+            .env("MODEL_SWITCH_FIXTURE_ROOT", root.path())
+            .output().unwrap();
+        assert!(output.status.success(), "child failed: {}", String::from_utf8_lossy(&output.stdout));
+    }
+
+    #[test]
+    fn commit_refusals_child() {
+        let Ok(root) = std::env::var("MODEL_SWITCH_FIXTURE_ROOT") else { return; };
+        let root = PathBuf::from(root);
+        std::env::set_var("HOME", root.join("home"));
+        std::env::set_var("XDG_STATE_HOME", root.join("state"));
+        fs::create_dir_all(root.join("home")).unwrap();
+
+        let stale = scratch_repo(&root.join("stale"));
+        let prior = fs::read(stale.join("profiles/lanes.json")).unwrap();
+        fs::write(stale.join("profiles/lanes.json"), b"{\"schemaVersion\":1,\"lanes\":{\"quick\":{}}}\n").unwrap();
+        let refusal = commit_omp_lanes(stale.display().to_string(), hash(&prior));
+        assert_eq!(refusal.unwrap().refused.as_deref(), Some("revision_changed"));
+
+        let committed = scratch_repo(&root.join("committed"));
+        let prior = fs::read(committed.join("profiles/lanes.json")).unwrap();
+        fs::write(committed.join("profiles/lanes.json"), b"{\"schemaVersion\":1,\"lanes\":{\"quick\":{}}}\n").unwrap();
+        git(&committed, &["add", "profiles/lanes.json"]);
+        git(&committed, &["commit", "-qm", "terminal edit"]);
+        let refusal = commit_omp_lanes(committed.display().to_string(), hash(&prior));
+        assert_eq!(refusal.unwrap().refused.as_deref(), Some("revision_changed"));
+
+        let detached = scratch_repo(&root.join("detached"));
+        let revision = hash(&fs::read(detached.join("profiles/lanes.json")).unwrap());
+        git(&detached, &["checkout", "--detach", "-q"]);
+        let refusal = commit_omp_lanes(detached.display().to_string(), revision);
+        assert_eq!(refusal.unwrap().refused.as_deref(), Some("detached_head"));
+
+        let staged = scratch_repo(&root.join("staged"));
+        fs::write(staged.join("unrelated.txt"), "keep staged").unwrap();
+        git(&staged, &["add", "unrelated.txt"]);
+        let revision = hash(&fs::read(staged.join("profiles/lanes.json")).unwrap());
+        let refusal = commit_omp_lanes(staged.display().to_string(), revision).unwrap();
+        assert_eq!(refusal.refused.as_deref(), Some("unrelated_staged_changes"));
+        let staged_names = Command::new("git").args(["diff", "--cached", "--name-only"]).current_dir(&staged).output().unwrap();
+        assert_eq!(String::from_utf8_lossy(&staged_names.stdout).trim(), "unrelated.txt");
+
+        let hooked = scratch_repo(&root.join("hooked"));
+        let hooks = hooked.join("hooks");
+        fs::create_dir_all(&hooks).unwrap();
+        let hook = hooks.join("pre-commit");
+        fs::write(&hook, "#!/bin/sh\necho intentional-hook-failure >&2\nexit 1\n").unwrap();
+        use std::os::unix::fs::PermissionsExt;
+        fs::set_permissions(&hook, fs::Permissions::from_mode(0o755)).unwrap();
+        git(&hooked, &["config", "core.hooksPath", "hooks"]);
+        fs::write(hooked.join("profiles/lanes.json"), b"{\"schemaVersion\":1,\"lanes\":{\"quick\":{}}}\n").unwrap();
+        let revision = hash(&fs::read(hooked.join("profiles/lanes.json")).unwrap());
+        let refusal = commit_omp_lanes(hooked.display().to_string(), revision).unwrap();
+        assert_eq!(refusal.refused.as_deref(), Some("hook_failed"));
+        assert!(refusal.output.contains("intentional-hook-failure"));
+    }
+}
+#[cfg(test)]
+mod lane_save_tests {
+    use super::*;
+
+    fn setup(root: &Path) -> PathBuf {
+        std::env::set_var("HOME", root.join("home"));
+        std::env::set_var("XDG_STATE_HOME", root.join("state"));
+        std::env::set_var("PI_CONFIG_DIR", ".omp-lane-save-test");
+        std::env::set_var("MODEL_SWITCH_FIXTURE_ROOT", root);
+        std::env::remove_var("OH_MY_BUZZ_LOCK_HELD");
+        let repo = root.join("repo");
+        let lanes = repo.join("profiles/lanes.json");
+        fs::create_dir_all(lanes.parent().unwrap()).unwrap();
+        fs::create_dir_all(root.join("home/.omp-lane-save-test/oh-my-buzz")).unwrap();
+        fs::create_dir_all(root.join("config")).unwrap();
+        let original = br#"{"schemaVersion":1,"lanes":{"advisor":{"model":"m","effort":"low"}}}"#;
+        fs::write(&lanes, original).unwrap();
+        fs::write(repo.join("profiles/routing.conf"), "DEFAULT_AGENT_MODELS='{\"coder\":\"agent-model\"}'\nprofile_model_roles() { printf '{\"advisor\":\"m:low\"}\\n'; }\nlanes_gate() { return 0; }\n").unwrap();
+        fs::write(root.join("omp"), "#!/bin/sh\nif [ \"$3\" = modelRoles ]; then printf '{\"value\":{\"advisor\":\"m:low\"}}\\n'; else printf '{\"value\":{\"coder\":\"agent-model\"}}\\n'; fi\n").unwrap();
+        fs::write(root.join("installer-mode"), "partial").unwrap();
+        fs::write(repo.join("profiles/install.sh"), r#"#!/bin/sh
+set -eu
+if [ "${OH_MY_BUZZ_LOCK_HELD:-0}" != 1 ]; then
+    lock_file="${XDG_STATE_HOME:-$HOME/.local/state}/oh-my-buzz/routing.lock"
+    mkdir -p "$(dirname "$lock_file")"
+    exec perl -MFcntl=:flock -e 'my $path=shift; open my $h, ">>", $path or die $!; unless (flock($h, LOCK_EX|LOCK_NB)) { print STDERR "waiting for routing lock\n"; flock($h, LOCK_EX) or die $!; } local $ENV{OH_MY_BUZZ_LOCK_HELD}=1; system @ARGV; exit($? >> 8);' "$lock_file" sh "$0" "$@"
+fi
+case "$(cat "$MODEL_SWITCH_FIXTURE_ROOT/installer-mode")" in
+  partial) echo '  ok    default: model roles and task-agent selections synchronized'; echo '  ok    orchestrator: model roles and task-agent selections synchronized'; echo 'FAIL  planner: injected failure' >&2; exit 1 ;;
+  timeout) echo 'bounded-timeout-stderr' >&2; sleep 2; exit 0 ;;
+  slow)
+    [ "${OH_MY_BUZZ_LOCK_HELD:-0}" = 1 ] || { echo 'lock inheritance missing' >&2; exit 2; }
+    case "${1:-}" in --models-only) kind=models ;; *) kind=full ;; esac
+    echo "BEGIN-$kind" >> "$MODEL_SWITCH_FIXTURE_ROOT/events"
+    touch "$MODEL_SWITCH_FIXTURE_ROOT/installer-entered"
+    sleep 0.25
+    echo "END-$kind" >> "$MODEL_SWITCH_FIXTURE_ROOT/events"
+    ;;
+  success) [ "${OH_MY_BUZZ_LOCK_HELD:-0}" = 1 ] || { echo 'lock inheritance missing' >&2; exit 2; } ;;
+esac
+for profile in default orchestrator planner coder reviewer scout designer; do
+    echo "  ok    $profile: model roles and task-agent selections synchronized"
+done
+"#).unwrap();
+        use std::os::unix::fs::PermissionsExt;
+        for executable in [root.join("omp"), repo.join("profiles/install.sh")] {
+            fs::set_permissions(executable, fs::Permissions::from_mode(0o755)).unwrap();
+        }
+        let sidecar = serde_json::json!({
+            "schemaVersion": 1, "repoPath": repo.to_string_lossy(), "lanes": {"advisor": {"model":"m","effort":"low"}},
+            "deadIds": [], "providers": [],
+            "host": {"executable":root.join("omp").to_string_lossy(), "version":"test", "configRoot":root.join("config").to_string_lossy(), "managed":true}
+        });
+        fs::write(root.join("home/.omp-lane-save-test/oh-my-buzz/host.json"), serde_json::to_vec(&sidecar).unwrap()).unwrap();
+        repo
+    }
+
+    fn draft(repo: &Path, effort: &str) -> (Vec<OmpLaneEntry>, String) {
+        let bytes = fs::read(lanes_path(repo)).unwrap();
+        let mut lanes = lane_entries(&serde_json::from_slice(&bytes).unwrap()).unwrap();
+        lanes[0].effort = Some(effort.into());
+        (lanes, hash(&bytes))
+    }
+
+    #[test]
+    fn installer_failures_and_lock_protocol_are_isolated() {
+        let root = tempfile::tempdir().unwrap();
+        let output = Command::new(std::env::current_exe().unwrap())
+            .args(["--exact", "commands::omp_lanes::lane_save_tests::installer_failures_and_lock_child", "--nocapture"])
+            .env("MODEL_SWITCH_FIXTURE_ROOT", root.path())
+            .output().unwrap();
+        assert!(output.status.success(), "child failed: {} {}", String::from_utf8_lossy(&output.stdout), String::from_utf8_lossy(&output.stderr));
+    }
+
+    #[test]
+    fn installer_failures_and_lock_child() {
+        let Ok(root) = std::env::var("MODEL_SWITCH_FIXTURE_ROOT") else { return; };
+        let root = PathBuf::from(root);
+        let repo = setup(&root);
+
+        let (lanes, revision) = draft(&repo, "medium");
+        let partial = save_omp_lanes_with_timeout(repo.display().to_string(), lanes, revision, Duration::from_millis(500)).unwrap();
+        assert_eq!(partial.source, "written");
+        assert_eq!(partial.profiles.iter().map(|p| p.state.as_str()).collect::<Vec<_>>(), ["applied", "applied", "failed", "unknown", "unknown", "unknown", "unknown"]);
+        assert!(!partial.recovery.is_empty());
+        assert!(partial.stderr.contains("injected failure"));
+
+        fs::write(root.join("installer-mode"), "timeout").unwrap();
+        let (lanes, revision) = draft(&repo, "high");
+        let timed = save_omp_lanes_with_timeout(repo.display().to_string(), lanes, revision, Duration::from_millis(80)).unwrap();
+        assert!(timed.timed_out);
+        assert!(timed.stderr.contains("bounded-timeout-stderr"));
+        assert!(timed.profiles.iter().all(|profile| profile.state == "unknown"));
+
+        fs::write(root.join("installer-mode"), "success").unwrap();
+        let (lanes, revision) = draft(&repo, "low");
+        let after_timeout = save_omp_lanes_with_timeout(repo.display().to_string(), lanes, revision, Duration::from_millis(500)).unwrap();
+        assert!(after_timeout.profiles.iter().all(|profile| profile.state == "applied"));
+        assert!(lock_path().unwrap().exists());
+        let held = RoutingLock::acquire().unwrap();
+        let timeout = match RoutingLock::acquire_with_timeout(Duration::from_millis(30)) {
+            Err(error) => error,
+            Ok(lock) => { drop(lock); panic!("held lock unexpectedly acquired"); }
+        };
+        assert!(timeout.starts_with("lock_timeout:"));
+        assert!(timeout.contains("routing.lock"));
+        drop(held);
+        drop(RoutingLock::acquire().expect("existing unlocked lock file must be reusable"));
+
+        fs::write(&lanes_path(&repo), br#"{"schemaVersion":1,"lanes":{"advisor":{"model":"m","effort":"low"}}}"#).unwrap();
+        fs::write(root.join("installer-mode"), "slow").unwrap();
+        let (first_lanes, first_revision) = draft(&repo, "medium");
+        let (second_lanes, second_revision) = draft(&repo, "high");
+        let repo_path = repo.clone();
+        let first = thread::spawn(move || save_omp_lanes_with_timeout(repo_path.display().to_string(), first_lanes, first_revision, Duration::from_secs(2)));
+        let entered = root.join("installer-entered");
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while !entered.exists() && Instant::now() < deadline { thread::sleep(Duration::from_millis(5)); }
+        assert!(entered.exists(), "first save never entered installer");
+        let second = save_omp_lanes_with_timeout(repo.display().to_string(), second_lanes, second_revision, Duration::from_secs(1));
+        assert!(first.join().unwrap().is_ok());
+        assert!(second.unwrap_err().contains("stale_source"));
+
+        for args in [vec!["--models-only"], vec![]] {
+            fs::write(&lanes_path(&repo), br#"{"schemaVersion":1,"lanes":{"advisor":{"model":"m","effort":"low"}}}"#).unwrap();
+            fs::remove_file(&entered).ok();
+            fs::write(root.join("events"), "").unwrap();
+            let (lanes, revision) = draft(&repo, "medium");
+            let save_repo = repo.clone();
+            let save = thread::spawn(move || save_omp_lanes_with_timeout(save_repo.display().to_string(), lanes, revision, Duration::from_secs(2)));
+            let deadline = Instant::now() + Duration::from_secs(2);
+            while !entered.exists() && Instant::now() < deadline { thread::sleep(Duration::from_millis(5)); }
+            assert!(entered.exists(), "GUI save never entered installer");
+            let external = Command::new("sh").arg(repo.join("profiles/install.sh")).args(&args).current_dir(&repo).output().unwrap();
+            assert!(external.status.success(), "external installer failed: {}", String::from_utf8_lossy(&external.stderr));
+            assert!(String::from_utf8_lossy(&external.stderr).contains("waiting for routing lock"));
+            assert!(String::from_utf8_lossy(&external.stdout).contains("default: model roles"));
+            assert!(save.join().unwrap().is_ok());
+            let events = fs::read_to_string(root.join("events")).unwrap();
+            let lines = events.lines().collect::<Vec<_>>();
+            assert_eq!(lines.len(), 4, "installer invocations interleaved: {events}");
+            assert_eq!(lines[0].strip_prefix("BEGIN-"), lines[1].strip_prefix("END-"));
+            assert_eq!(lines[2].strip_prefix("BEGIN-"), lines[3].strip_prefix("END-"));
+        }
     }
 }
 
@@ -597,6 +831,15 @@ pub fn prepare_omp_lane_model_change(
 
 #[tauri::command]
 pub fn save_omp_lanes(repo_path: String, lanes: Vec<OmpLaneEntry>, revision: String) -> Result<OmpLaneSaveOutcome, String> {
+    save_omp_lanes_with_timeout(repo_path, lanes, revision, SAVE_TIMEOUT)
+}
+
+fn save_omp_lanes_with_timeout(
+    repo_path: String,
+    lanes: Vec<OmpLaneEntry>,
+    revision: String,
+    timeout: Duration,
+) -> Result<OmpLaneSaveOutcome, String> {
     let _lock = RoutingLock::acquire()?;
     let repo = PathBuf::from(repo_path);
     let (sidecar, repo) = read_sidecar(Some(&repo))?;
@@ -616,7 +859,7 @@ pub fn save_omp_lanes(repo_path: String, lanes: Vec<OmpLaneEntry>, revision: Str
         Path::new("sh"),
         &[runner.to_str().ok_or("invalid install path")?, "--models-only"],
         Some(&repo),
-        SAVE_TIMEOUT,
+        timeout,
         &[("OH_MY_BUZZ_LOCK_HELD", "1")],
     );
     let exe = PathBuf::from(&sidecar.host.executable);

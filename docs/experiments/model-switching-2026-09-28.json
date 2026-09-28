@@ -81,6 +81,18 @@
       "cwd": ".",
       "result": "blocked",
       "rawOutput": "Command timed out after 20 seconds"
+    },
+    {
+      "command": ". ./bin/activate-hermit && cargo test --manifest-path desktop/src-tauri/Cargo.toml --lib commands::omp_lanes::",
+      "cwd": ".",
+      "result": "pass: all isolated lane parser, commit-refusal, partial-apply, timeout, and lock-protocol tests",
+      "rawOutput": "running 5 tests\ntest commands::omp_lanes::lane_commit_tests::commit_refusals_child ... ok\ntest commands::omp_lanes::lane_save_tests::installer_failures_and_lock_child ... ok\ntest commands::omp_lanes::profile_record_tests::parses_pretty_printed_profile_records ... ok\ntest commands::omp_lanes::lane_commit_tests::commit_refusals_are_isolated ... ok\ntest commands::omp_lanes::lane_save_tests::installer_failures_and_lock_protocol_are_isolated ... ok\ntest result: ok. 5 passed; 0 failed; finished in 5.02s"
+    },
+    {
+      "command": "sh scripts/doctor.sh --fast",
+      "cwd": "/Users/juwonbae/Documents/oh-my-buzz",
+      "result": "all checks passed, 3 warnings retained",
+      "rawOutput": "PASS lane document passes schema, alias, catalog, effort and dead-id checks\nPASS role profiles and model routing\nPASS provenance and read-only bash boundary\nWARN no historical spawn proof for reviewer scout coder\nWARN 23 uncommitted changes in settings repo\nWARN designer activation proof absent\nResult: all checks passed, 3 warnings\nRound trip skipped (--fast)"
     }
   ],
   "behavioralEvidence": {
@@ -92,8 +104,6 @@
   "notRun": [
     "managed-agent turn nonce and session JSONL model_change",
     "picker checks 14-19c and make-lane confirm in native UI",
-    "plan checks 11/11b and 12a/12b isolated root",
-    "plan checks 25-28",
     "doctor round trip (skipped by --fast)"
   ]
 }
