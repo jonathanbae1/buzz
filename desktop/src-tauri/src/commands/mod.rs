@@ -1,3 +1,5 @@
+mod omp_lanes;
+
 mod agent_access;
 mod agent_auth;
 mod agent_config;
@@ -131,4 +133,5 @@ pub use updater::*;
 pub use window_chrome::*;
 pub use window_vibrancy::*;
 pub use workflows::*;
+pub use omp_lanes::*;
 pub use workspace::*;

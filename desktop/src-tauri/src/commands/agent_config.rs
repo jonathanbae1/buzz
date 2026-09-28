@@ -266,6 +266,7 @@ pub fn get_omp_profile_catalog() -> OmpProfileCatalog {
 #[tauri::command]
 pub async fn get_agent_config_surface(
     pubkey: String,
+    session_id: Option<String>,
     app: AppHandle,
     state: State<'_, AppState>,
 ) -> Result<RuntimeConfigSurface, String> {
@@ -303,7 +304,7 @@ pub async fn get_agent_config_surface(
             &crate::relay::relay_ws_url_with_override(&state),
         ),
     )?;
-    let session_cache = state.get_session_cache(&runtime_key);
+    let session_cache = session_id.as_deref().and_then(|id| state.get_session_cache(&runtime_key, id));
     let global = crate::managed_agents::load_global_agent_config(&app).unwrap_or_default();
 
     // #3493: for claude agents, resolve the settings.json and .claude.json paths
@@ -368,6 +369,7 @@ pub async fn get_agent_config_surface(
 #[tauri::command]
 pub fn put_agent_session_config(
     pubkey: String,
+    session_id: String,
     payload: serde_json::Value,
     app: AppHandle,
     state: State<'_, AppState>,
@@ -402,18 +404,31 @@ pub fn put_agent_session_config(
             )
         });
 
-    let config_options = parse_config_options(payload.get("configOptions"));
+    if session_id.trim().is_empty() {
+        return;
+    }
+    let Ok(runtime_key) = ManagedAgentRuntimeKey::new(pubkey.clone(), &relay_url) else {
+        return;
+    };
+    let previous = state.get_session_cache(&runtime_key, &session_id);
+    let config_options = payload.get("configOptions")
+        .map(|raw| parse_config_options(Some(raw)))
+        .or_else(|| previous.as_ref().map(|cache| cache.config_options.clone()))
+        .unwrap_or_default();
     let available_modes = parse_modes(&config_options, payload.get("modes"));
-    let mode_option = config_options
-        .iter()
-        .find(|option| option.category.as_deref() == Some("mode"));
-    let current_mode = parse_current_mode(&config_options, payload.get("modes"));
-    let mode_config_id = mode_option.map(|option| option.config_id.clone());
-    let (available_models, current_model) = parse_models(payload.get("models"));
-    let model_overridden = payload
-        .get("modelOverridden")
-        .and_then(|v| v.as_bool())
-        .unwrap_or(false);
+    let mode_option = config_options.iter().find(|option| option.category.as_deref() == Some("mode"));
+    let current_mode = parse_current_mode(&config_options, payload.get("modes"))
+        .or_else(|| previous.as_ref().and_then(|cache| cache.current_mode.clone()));
+    let mode_config_id = mode_option.map(|option| option.config_id.clone())
+        .or_else(|| previous.as_ref().and_then(|cache| cache.mode_config_id.clone()));
+    let (available_models, current_model) = if payload.get("models").is_some() {
+        parse_models(payload.get("models"))
+    } else {
+        previous.as_ref().map(|cache| (cache.available_models.clone(), cache.current_model.clone()))
+            .unwrap_or_default()
+    };
+    let model_overridden = payload.get("modelOverridden").and_then(|v| v.as_bool())
+        .or_else(|| previous.as_ref().map(|cache| cache.model_overridden)).unwrap_or(false);
 
     let cache = SessionConfigCache {
         config_options,
@@ -423,14 +438,10 @@ pub fn put_agent_session_config(
         available_models,
         current_model,
         model_overridden,
-        goose_native_config: None,
+        goose_native_config: previous.and_then(|cache| cache.goose_native_config),
         captured_at: crate::util::now_iso(),
     };
-
-    let Ok(runtime_key) = ManagedAgentRuntimeKey::new(pubkey, &relay_url) else {
-        return;
-    };
-    state.put_session_cache(runtime_key, cache);
+    state.put_session_cache(runtime_key, session_id, cache);
 }
 
 fn parse_config_options(raw: Option<&serde_json::Value>) -> Vec<AcpConfigOptionEntry> {

@@ -1,4 +1,5 @@
 import { AgentDefaultsSettingsCard } from "./AgentDefaultsSettingsCard";
+import { RoutingLanesSettingsCard } from "./RoutingLanesSettingsCard";
 import {
   setKeepMentionedAgentsPinned,
   useKeepMentionedAgentsPinned,
@@ -51,6 +52,7 @@ export function AgentsSettingsPanel() {
         <PreventSleepSettingsCard />
         <HarnessesSettingsPanel />
         <AgentDefaultsSettingsCard />
+        <RoutingLanesSettingsCard />
       </SettingsOptionGroupList>
     </section>
   );

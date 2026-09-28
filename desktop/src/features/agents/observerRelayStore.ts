@@ -157,14 +157,11 @@ const projectChannelRequestListeners = new Set<
 const knownAgentPubkeys = new Set<string>();
 const knownAgentsBySubscription = new Map<string, Set<string>>();
 const pendingUnknownAgentFrames: RelayEvent[] = [];
-
-// Callback invoked when session_config_captured is received, so React Query
-// can invalidate the config-surface query for the affected agent. Wired up
-// by useManagedAgentObserverBridge via setSessionConfigCapturedCallback.
-let onSessionConfigCaptured: ((pubkey: string) => void) | null = null;
+// Callback invoked when a session's ACP config projection changes.
+let onSessionConfigCaptured: ((pubkey: string, sessionId: string) => void) | null = null;
 
 export function setSessionConfigCapturedCallback(
-  cb: ((pubkey: string) => void) | null,
+  cb: ((pubkey: string, sessionId: string) => void) | null,
 ) {
   onSessionConfigCaptured = cb;
 }
@@ -501,6 +498,25 @@ function captureAvailableCommands(
     source,
   );
 }
+function captureSessionConfigUpdate(agentPubkey: string, event: ObserverEvent) {
+  if (event.kind !== "acp_read") return;
+  const payload = typeof event.payload === "object" && event.payload !== null
+    ? event.payload as Record<string, unknown>
+    : null;
+  if (payload?.method !== "session/update") return;
+  const params = typeof payload.params === "object" && payload.params !== null
+    ? payload.params as Record<string, unknown>
+    : null;
+  const update = typeof params?.update === "object" && params.update !== null
+    ? params.update as Record<string, unknown>
+    : null;
+  if (update?.sessionUpdate !== "config_option_update" || !Array.isArray(update.configOptions)) return;
+  const sessionId = event.sessionId ?? (typeof params?.sessionId === "string" ? params.sessionId : null);
+  if (!sessionId) return;
+  void putAgentSessionConfig(agentPubkey, sessionId, { configOptions: update.configOptions })
+    .then(() => onSessionConfigCaptured?.(agentPubkey, sessionId))
+    .catch((error) => console.error("Failed to persist session config update", error));
+}
 
 // Per-event processing shared by every event a live frame carries (one for a
 // plain frame, many for a batch envelope).
@@ -526,7 +542,7 @@ function processLiveObserverEvents(
 
   for (const parsed of accepted ?? []) {
     captureAvailableCommands(agentPubkey, parsed, "live");
-    // Track the latest-live-session-id per (agent, channel) on the live path.
+    captureSessionConfigUpdate(agentPubkey, parsed);
     // Only set when the parsed event carries both a sessionId and channelId,
     // so we never attribute a session to the wrong channel.
     if (parsed.sessionId && parsed.channelId) {
@@ -559,8 +575,11 @@ function processLiveObserverEvents(
     }
     if (parsed.kind === "session_config_captured") {
       markAgentSessionCommandCatalogsStale(agentPubkey);
-      void putAgentSessionConfig(agentPubkey, parsed.payload);
-      onSessionConfigCaptured?.(agentPubkey);
+      if (parsed.sessionId) {
+        void putAgentSessionConfig(agentPubkey, parsed.sessionId, parsed.payload)
+          .then(() => onSessionConfigCaptured?.(agentPubkey, parsed.sessionId!))
+          .catch((error) => console.error("Failed to persist captured session config", error));
+      }
     } else if (parsed.kind === "control_result") {
       dispatchControlResult(agentPubkey, parsed.payload, parsed.channelId);
     } else if (parsed.kind === "managed_agent_runtime_lifecycle") {
@@ -851,9 +870,9 @@ export function useManagedAgentObserverBridge(
   // Wire up config-surface query invalidation when session_config_captured fires.
   const queryClient = useQueryClient();
   React.useEffect(() => {
-    setSessionConfigCapturedCallback((pubkey) => {
+    setSessionConfigCapturedCallback((pubkey, sessionId) => {
       void queryClient.invalidateQueries({
-        queryKey: agentConfigSurfaceQueryKey(pubkey),
+        queryKey: agentConfigSurfaceQueryKey(pubkey, sessionId),
       });
     });
     return () => setSessionConfigCapturedCallback(null);
