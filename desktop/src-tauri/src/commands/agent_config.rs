@@ -304,7 +304,9 @@ pub async fn get_agent_config_surface(
             &crate::relay::relay_ws_url_with_override(&state),
         ),
     )?;
-    let session_cache = session_id.as_deref().and_then(|id| state.get_session_cache(&runtime_key, id));
+    let session_cache = session_id
+        .as_deref()
+        .and_then(|id| state.get_session_cache(&runtime_key, id));
     let global = crate::managed_agents::load_global_agent_config(&app).unwrap_or_default();
 
     // #3493: for claude agents, resolve the settings.json and .claude.json paths
@@ -411,24 +413,40 @@ pub fn put_agent_session_config(
         return;
     };
     let previous = state.get_session_cache(&runtime_key, &session_id);
-    let config_options = payload.get("configOptions")
+    let config_options = payload
+        .get("configOptions")
         .map(|raw| parse_config_options(Some(raw)))
         .or_else(|| previous.as_ref().map(|cache| cache.config_options.clone()))
         .unwrap_or_default();
     let available_modes = parse_modes(&config_options, payload.get("modes"));
-    let mode_option = config_options.iter().find(|option| option.category.as_deref() == Some("mode"));
-    let current_mode = parse_current_mode(&config_options, payload.get("modes"))
-        .or_else(|| previous.as_ref().and_then(|cache| cache.current_mode.clone()));
-    let mode_config_id = mode_option.map(|option| option.config_id.clone())
-        .or_else(|| previous.as_ref().and_then(|cache| cache.mode_config_id.clone()));
+    let mode_option = config_options
+        .iter()
+        .find(|option| option.category.as_deref() == Some("mode"));
+    let current_mode = parse_current_mode(&config_options, payload.get("modes")).or_else(|| {
+        previous
+            .as_ref()
+            .and_then(|cache| cache.current_mode.clone())
+    });
+    let mode_config_id = mode_option
+        .map(|option| option.config_id.clone())
+        .or_else(|| {
+            previous
+                .as_ref()
+                .and_then(|cache| cache.mode_config_id.clone())
+        });
     let (available_models, current_model) = if payload.get("models").is_some() {
         parse_models(payload.get("models"))
     } else {
-        previous.as_ref().map(|cache| (cache.available_models.clone(), cache.current_model.clone()))
+        previous
+            .as_ref()
+            .map(|cache| (cache.available_models.clone(), cache.current_model.clone()))
             .unwrap_or_default()
     };
-    let model_overridden = payload.get("modelOverridden").and_then(|v| v.as_bool())
-        .or_else(|| previous.as_ref().map(|cache| cache.model_overridden)).unwrap_or(false);
+    let model_overridden = payload
+        .get("modelOverridden")
+        .and_then(|v| v.as_bool())
+        .or_else(|| previous.as_ref().map(|cache| cache.model_overridden))
+        .unwrap_or(false);
 
     let cache = SessionConfigCache {
         config_options,

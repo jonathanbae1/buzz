@@ -699,7 +699,10 @@ pub fn plan_roster_deploy(
                         .join(" or ")
                 ),
             );
-            entry.candidates = unaccounted.iter().map(|persona| candidate(persona)).collect();
+            entry.candidates = unaccounted
+                .iter()
+                .map(|persona| candidate(persona))
+                .collect();
             entries.push(entry);
             continue;
         }
@@ -875,4 +878,3 @@ pub(crate) fn new_deployed_persona(
         updated_at: now.to_string(),
     }
 }
-

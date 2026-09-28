@@ -64,8 +64,18 @@ pub struct TaskError {
 }
 
 impl TaskError {
-    fn new(kind: TaskErrorKind, message: impl Into<String>, host: Option<String>, contract: Option<String>) -> Self {
-        TaskError { kind, message: message.into(), host, contract }
+    fn new(
+        kind: TaskErrorKind,
+        message: impl Into<String>,
+        host: Option<String>,
+        contract: Option<String>,
+    ) -> Self {
+        TaskError {
+            kind,
+            message: message.into(),
+            host,
+            contract,
+        }
     }
 }
 
@@ -85,8 +95,12 @@ struct Store {
 /// exported), then the machine's `~/.env`. `~/.env` is the one omp dotenv that is not
 /// profile-scoped, which is why the snapshot job and all six profiles read it too.
 fn resolve_store() -> TaskResult<Store> {
-    let mut url = std::env::var("AGENTMEMORY_URL").ok().filter(|v| !v.trim().is_empty());
-    let mut secret = std::env::var("AGENTMEMORY_SECRET").ok().filter(|v| !v.trim().is_empty());
+    let mut url = std::env::var("AGENTMEMORY_URL")
+        .ok()
+        .filter(|v| !v.trim().is_empty());
+    let mut secret = std::env::var("AGENTMEMORY_SECRET")
+        .ok()
+        .filter(|v| !v.trim().is_empty());
 
     if url.is_none() || secret.is_none() {
         if let Some((file_url, file_secret)) = read_env_file() {
@@ -129,12 +143,16 @@ fn resolve_store() -> TaskResult<Store> {
 }
 
 fn host_of(url: &str) -> Option<String> {
-    url.split("://").nth(1).map(|rest| rest.split('/').next().unwrap_or(rest).to_string())
+    url.split("://")
+        .nth(1)
+        .map(|rest| rest.split('/').next().unwrap_or(rest).to_string())
 }
 
 /// The configured store URL, from the environment then `~/.env`, without any scheme validation.
 fn configured_url() -> Option<String> {
-    let url = std::env::var("AGENTMEMORY_URL").ok().filter(|v| !v.trim().is_empty());
+    let url = std::env::var("AGENTMEMORY_URL")
+        .ok()
+        .filter(|v| !v.trim().is_empty());
     if url.is_some() {
         return url;
     }
@@ -155,7 +173,9 @@ fn read_env_file() -> Option<(Option<String>, Option<String>)> {
         if trimmed.is_empty() || trimmed.starts_with('#') {
             continue;
         }
-        let Some((key, value)) = trimmed.split_once('=') else { continue };
+        let Some((key, value)) = trimmed.split_once('=') else {
+            continue;
+        };
         let key = key.trim();
         let mut value = value.trim();
         if (value.starts_with('"') && value.ends_with('"') && value.len() >= 2)
@@ -180,7 +200,14 @@ fn client() -> TaskResult<reqwest::blocking::Client> {
         // module exists to prevent; a redirect to a new host is therefore a hard failure.
         .redirect(reqwest::redirect::Policy::none())
         .build()
-        .map_err(|e| TaskError::new(TaskErrorKind::Protocol, format!("could not build the HTTP client: {e}"), None, None))
+        .map_err(|e| {
+            TaskError::new(
+                TaskErrorKind::Protocol,
+                format!("could not build the HTTP client: {e}"),
+                None,
+                None,
+            )
+        })
 }
 
 fn classify(store: &Store, status: u16, body: Option<&Value>) -> Option<TaskError> {
@@ -199,7 +226,10 @@ fn classify(store: &Store, status: u16, body: Option<&Value>) -> Option<TaskErro
         )),
         _ if status >= 500 => Some(TaskError::new(
             TaskErrorKind::Protocol,
-            body.and_then(|b| b.get("error")).and_then(Value::as_str).unwrap_or("the store returned a server error.").to_string(),
+            body.and_then(|b| b.get("error"))
+                .and_then(Value::as_str)
+                .unwrap_or("the store returned a server error.")
+                .to_string(),
             Some(store.host.clone()),
             None,
         )),
@@ -224,7 +254,9 @@ fn send(store: &Store, method: &str, path: &str, body: Option<Value>) -> TaskRes
     }
     .header("authorization", format!("Bearer {}", store.secret));
     if let Some(payload) = body {
-        request = request.header("content-type", "application/json").json(&payload);
+        request = request
+            .header("content-type", "application/json")
+            .json(&payload);
     }
 
     let response = request.send().map_err(|e| {
@@ -357,7 +389,13 @@ fn str_array(value: &Value, key: &str) -> Vec<String> {
     value
         .get(key)
         .and_then(Value::as_array)
-        .map(|items| items.iter().filter_map(Value::as_str).map(str::to_string).collect())
+        .map(|items| {
+            items
+                .iter()
+                .filter_map(Value::as_str)
+                .map(str::to_string)
+                .collect()
+        })
         .unwrap_or_default()
 }
 
@@ -401,7 +439,10 @@ fn row_from(action: &Value, projection: &Value) -> TaskRow {
         created_at: str_field(action, "createdAt").unwrap_or_default(),
         updated_at: str_field(action, "updatedAt").unwrap_or_default(),
         assigned_to: str_field(action, "assignedTo"),
-        assignment_target: assignment.get("targetAgentId").and_then(Value::as_str).map(str::to_string),
+        assignment_target: assignment
+            .get("targetAgentId")
+            .and_then(Value::as_str)
+            .map(str::to_string),
         assignment_revision: i64_field(&assignment, "revision"),
         dispatch: dispatch_of(action),
         lease_live: lease.get("live").and_then(Value::as_bool).unwrap_or(false),
@@ -506,12 +547,18 @@ pub fn agent_tasks_status() -> StoreStatus {
     };
     match health_payload(&store) {
         Ok(health) => {
-            let contract = health.get("m1Contract").and_then(Value::as_str).map(str::to_string);
+            let contract = health
+                .get("m1Contract")
+                .and_then(Value::as_str)
+                .map(str::to_string);
             let unavailable = unavailability(contract.as_deref());
             StoreStatus {
                 configured: true,
                 host: Some(store.host.clone()),
-                service_version: health.get("version").and_then(Value::as_str).map(str::to_string),
+                service_version: health
+                    .get("version")
+                    .and_then(Value::as_str)
+                    .map(str::to_string),
                 managed_available: unavailable.is_none(),
                 managed_unavailable_reason: unavailable,
                 contract,
@@ -535,15 +582,29 @@ pub fn agent_tasks_status() -> StoreStatus {
 pub fn agent_tasks_list() -> Result<TaskBoard, TaskError> {
     let store = resolve_store()?;
     let health = health_payload(&store)?;
-    let contract = health.get("m1Contract").and_then(Value::as_str).map(str::to_string);
+    let contract = health
+        .get("m1Contract")
+        .and_then(Value::as_str)
+        .map(str::to_string);
     let compatible = contract.as_deref() == Some(M1_CONTRACT);
 
-    let listed = send(&store, "GET", &format!("/actions?project={PROJECT}&limit=200"), None)?;
-    let actions = listed.get("actions").and_then(Value::as_array).cloned().unwrap_or_default();
+    let listed = send(
+        &store,
+        "GET",
+        &format!("/actions?project={PROJECT}&limit=200"),
+        None,
+    )?;
+    let actions = listed
+        .get("actions")
+        .and_then(Value::as_array)
+        .cloned()
+        .unwrap_or_default();
 
     let mut tasks = Vec::with_capacity(actions.len());
     for action in &actions {
-        let Some(id) = str_field(action, "id") else { continue };
+        let Some(id) = str_field(action, "id") else {
+            continue;
+        };
         // The projection is what makes `ready` mean something: terminal, invalid target,
         // unresolved dependencies and live conflicts all prevent Run.
         let detail = send(&store, "GET", &format!("/actions/get?actionId={id}"), None)?;
@@ -612,7 +673,12 @@ pub fn agent_tasks_register_dispatch(
 #[tauri::command]
 pub fn agent_tasks_get(action_id: String) -> Result<Value, TaskError> {
     let store = resolve_store()?;
-    send(&store, "GET", &format!("/actions/get?actionId={action_id}"), None)
+    send(
+        &store,
+        "GET",
+        &format!("/actions/get?actionId={action_id}"),
+        None,
+    )
 }
 
 #[cfg(test)]
@@ -639,8 +705,14 @@ mod probe {
         }
         let url = std::env::var("AGENTMEMORY_URL").unwrap();
         let status = agent_tasks_status();
-        assert!(status.configured, "a configured store must report configured=true");
-        assert!(status.host.is_some(), "a configured store must report its host");
+        assert!(
+            status.configured,
+            "a configured store must report configured=true"
+        );
+        assert!(
+            status.host.is_some(),
+            "a configured store must report its host"
+        );
         eprintln!("status = {status:?}");
 
         if url.starts_with("https://") {
@@ -671,7 +743,10 @@ mod probe {
         // A plain-HTTP store must be refused outright rather than downgraded, because the bearer
         // would otherwise travel in clear text. This is the security property the adapter exists
         // to enforce, and it is observable on any HTTP endpoint.
-        assert!(!status.managed_available, "plain HTTP must never be managed-available");
+        assert!(
+            !status.managed_available,
+            "plain HTTP must never be managed-available"
+        );
         let error = agent_tasks_list().expect_err("plain HTTP must be refused");
         assert!(
             matches!(error.kind, TaskErrorKind::InsecureUrl),
@@ -689,7 +764,10 @@ mod probe {
         std::env::set_var("AGENTMEMORY_URL", "http://127.0.0.1:3311");
         std::env::set_var("AGENTMEMORY_SECRET", "unused");
         let error = resolve_store().expect_err("plain HTTP must be refused");
-        assert!(matches!(error.kind, TaskErrorKind::InsecureUrl), "{error:?}");
+        assert!(
+            matches!(error.kind, TaskErrorKind::InsecureUrl),
+            "{error:?}"
+        );
         std::env::remove_var("AGENTMEMORY_URL");
         std::env::remove_var("AGENTMEMORY_SECRET");
     }

@@ -68,15 +68,14 @@ pub struct ApplyRosterDeployRequest {
 }
 
 /// Read the catalogue and refuse to plan against a broken one.
-fn configured_declarations() -> Result<
-    Vec<crate::managed_agents::config_bridge::types::OmpProfileCatalogEntry>,
-    String,
-> {
+fn configured_declarations(
+) -> Result<Vec<crate::managed_agents::config_bridge::types::OmpProfileCatalogEntry>, String> {
     let catalog = read_omp_profile_catalog();
     if catalog.state != OmpProfileState::Configured {
         return Err(match catalog.state {
             OmpProfileState::Invalid => {
-                "the installed omp profile catalogue is invalid; repair it before deploying".to_string()
+                "the installed omp profile catalogue is invalid; repair it before deploying"
+                    .to_string()
             }
             _ => "the installed omp profile catalogue is unavailable".to_string(),
         });
@@ -90,7 +89,14 @@ fn configured_declarations() -> Result<
 fn recompute(
     app: &AppHandle,
     submissions: Option<&RosterDeployPlan>,
-) -> Result<(RosterDeployPlan, Vec<crate::managed_agents::AgentDefinition>, Vec<TeamRecord>), String> {
+) -> Result<
+    (
+        RosterDeployPlan,
+        Vec<crate::managed_agents::AgentDefinition>,
+        Vec<TeamRecord>,
+    ),
+    String,
+> {
     let declarations = configured_declarations()?;
     let gates = ActivationGates::load();
     let personas = load_personas(app)?;
@@ -192,10 +198,7 @@ fn admit(submitted: &RosterPlanEntry, current: &RosterPlanEntry) -> Result<(), S
     Ok(())
 }
 
-fn admit_team_create(
-    submitted: &TeamPlanEntry,
-    current: &TeamPlanEntry,
-) -> Result<(), String> {
+fn admit_team_create(submitted: &TeamPlanEntry, current: &TeamPlanEntry) -> Result<(), String> {
     if submitted.verdict != TeamPresetVerdict::Create
         || current.verdict != TeamPresetVerdict::Create
     {
@@ -363,9 +366,8 @@ pub async fn apply_roster_deploy(
                         });
                         continue;
                     };
-                    let Some(persona_index) = personas
-                        .iter()
-                        .position(|persona| persona.id == persona_id)
+                    let Some(persona_index) =
+                        personas.iter().position(|persona| persona.id == persona_id)
                     else {
                         stale = true;
                         applied.push(AppliedEntry {
@@ -519,8 +521,8 @@ pub async fn apply_roster_deploy(
 mod tests {
     use super::*;
 
-    use crate::managed_agents::AgentDefinition;
     use crate::managed_agents::deployment::roster::RosterCandidate;
+    use crate::managed_agents::AgentDefinition;
 
     fn roster_candidate(persona_id: &str, expected_digest: &str) -> RosterCandidate {
         RosterCandidate {
@@ -634,13 +636,8 @@ mod tests {
     #[test]
     fn explicit_create_resolves_unmapped_only_while_candidate_set_is_unchanged() {
         let candidate = roster_candidate("persona-1", "digest-a");
-        let current = roster_entry(
-            "scout",
-            RosterVerdict::Unmapped,
-            vec![candidate.clone()],
-        );
-        let mut submitted =
-            roster_entry("scout", RosterVerdict::Create, vec![candidate.clone()]);
+        let current = roster_entry("scout", RosterVerdict::Unmapped, vec![candidate.clone()]);
+        let mut submitted = roster_entry("scout", RosterVerdict::Create, vec![candidate.clone()]);
         submitted.kind = Some(RosterVerdictKind::UnmappedUnaccounted);
         assert_eq!(admit(&submitted, &current), Ok(()));
 
@@ -658,11 +655,7 @@ mod tests {
     #[test]
     fn explicit_create_is_refused_when_an_existing_agent_claims_the_selector() {
         let candidate = roster_candidate("persona-1", "digest-a");
-        let mut current = roster_entry(
-            "scout",
-            RosterVerdict::Unmapped,
-            vec![candidate.clone()],
-        );
+        let mut current = roster_entry("scout", RosterVerdict::Unmapped, vec![candidate.clone()]);
         current.kind = Some(RosterVerdictKind::UnmappedClaimants);
         let mut submitted = roster_entry("scout", RosterVerdict::Create, vec![candidate]);
         submitted.kind = Some(RosterVerdictKind::UnmappedClaimants);
@@ -689,13 +682,9 @@ mod tests {
         let mut personas = vec![persona()];
         let before = personas[0].clone();
 
-        let result = persist_adoption(
-            &mut personas,
-            0,
-            "coder",
-            "2026-09-28T00:00:00Z",
-            |_| Err("disk full".to_string()),
-        );
+        let result = persist_adoption(&mut personas, 0, "coder", "2026-09-28T00:00:00Z", |_| {
+            Err("disk full".to_string())
+        });
 
         assert_eq!(result.unwrap_err(), "disk full");
         assert_eq!(personas[0].deployment_identity, before.deployment_identity);
@@ -703,4 +692,3 @@ mod tests {
         assert_eq!(personas[0].updated_at, before.updated_at);
     }
 }
-

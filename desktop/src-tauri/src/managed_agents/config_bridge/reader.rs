@@ -41,8 +41,7 @@ fn valid_lane(value: &str) -> bool {
             && part
                 .chars()
                 .all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '-'))
-    })
-    {
+    }) {
         return false;
     }
     model_parts

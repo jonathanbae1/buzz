@@ -62,10 +62,9 @@ fn inbound_for(d_tag: &str, display_name: &str) -> AgentDefinition {
         parallelism: None,
         created_at: "2025-06-01T00:00:00Z".to_string(),
         updated_at: "2025-06-01T00:00:00Z".to_string(),
-    
-deployment_identity: None,
-}
 
+        deployment_identity: None,
+    }
 }
 
 #[test]

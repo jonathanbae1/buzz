@@ -56,7 +56,10 @@ fn installed_personas(path: &PathBuf) -> Vec<crate::managed_agents::AgentDefinit
         .collect()
 }
 
-fn replay() -> Option<(RosterDeployPlan, Vec<crate::managed_agents::AgentDefinition>)> {
+fn replay() -> Option<(
+    RosterDeployPlan,
+    Vec<crate::managed_agents::AgentDefinition>,
+)> {
     let path = installed_store_path()?;
     let catalogue = installed_catalogue()?;
     let personas = installed_personas(&path);
@@ -83,7 +86,8 @@ fn skip(reason: &str) {
 }
 
 #[test]
-fn g0_replay_over_the_real_installed_store_is_read_only_and_creates_nothing_for_deployed_profiles() {
+fn g0_replay_over_the_real_installed_store_is_read_only_and_creates_nothing_for_deployed_profiles()
+{
     let Some((plan, personas)) = replay() else {
         skip("no installed Buzz store, or no readable profile catalogue, on this machine");
         return;
@@ -176,10 +180,7 @@ fn g1_real_legacy_rows_are_adopted_and_the_unambiguous_ones_patch_only_identity(
                 row.display_name, row.env_vars
             );
         };
-        eprintln!(
-            "  legacy `{}` -> {:?}",
-            row.display_name, entry.verdict
-        );
+        eprintln!("  legacy `{}` -> {:?}", row.display_name, entry.verdict);
         // Never a create: a legacy row that is recognized must not be duplicated.
         assert_ne!(
             entry.verdict,

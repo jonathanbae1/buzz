@@ -145,8 +145,12 @@ fn tracked_paths_exclude_untracked_scratch_files() {
 
     let auth = build_test_git_auth_config().expect("build test auth config");
     let tracked = parse_tracked_paths(
-        &run_git(&["ls-files", "--cached", "-z", "--", "wiki"], Some(root), &auth)
-            .expect("list tracked paths"),
+        &run_git(
+            &["ls-files", "--cached", "-z", "--", "wiki"],
+            Some(root),
+            &auth,
+        )
+        .expect("list tracked paths"),
     );
     assert_eq!(tracked, vec!["wiki/README.md", "wiki/store.md"]);
 
@@ -174,7 +178,11 @@ fn tracked_paths_surface_a_git_failure_as_an_error() {
     let repo_dir = tempfile::tempdir().expect("create non-repository directory");
     let auth = build_test_git_auth_config().expect("build test auth config");
 
-    let result = run_git(&["ls-files", "--cached", "-z"], Some(repo_dir.path()), &auth);
+    let result = run_git(
+        &["ls-files", "--cached", "-z"],
+        Some(repo_dir.path()),
+        &auth,
+    );
 
     assert!(result.is_err(), "a non-repository must not read as empty");
 }

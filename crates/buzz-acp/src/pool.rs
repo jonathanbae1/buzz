@@ -32,8 +32,8 @@ use uuid::Uuid;
 use crate::acp::{
     extract_config_option_id_by_category, extract_model_config_options, extract_model_state,
     extract_thought_level_config_id, model_in_catalog, resolve_model_switch_method, AcpClient,
-    AcpError, EnvVar, McpServer, ModelSwitchMethod, PermissionAnswer, PromptContentBlock, StopReason,
-    SystemPromptTransport,
+    AcpError, EnvVar, McpServer, ModelSwitchMethod, PermissionAnswer, PromptContentBlock,
+    StopReason, SystemPromptTransport,
 };
 use crate::config::{compose_scoped_session_title, DedupMode, PermissionMode};
 use crate::observer;
@@ -426,7 +426,6 @@ pub struct AgentSessionLifecycleResult {
     pub request_id: String,
     pub result: Result<serde_json::Value, String>,
 }
-
 
 pub struct AgentCommandResult {
     pub agent: OwnedAgent,
@@ -1073,7 +1072,10 @@ impl AgentPool {
             self.return_agent(agent);
             return Err(AgentCommandTarget::StaleSession);
         }
-        if self.task_map.values().any(|meta| meta.scope.as_ref() == Some(&scope))
+        if self
+            .task_map
+            .values()
+            .any(|meta| meta.scope.as_ref() == Some(&scope))
             || self.session_lifecycle_scopes.contains(&scope)
         {
             self.return_agent(agent);
@@ -1105,19 +1107,10 @@ impl AgentPool {
         self.session_lifecycle_tx.clone()
     }
 
-
     /// Return a lifecycle worker after updating its existing direct-conversation
     /// binding. A fork/load/resume changes only that scope, never a Buzz lease.
-    pub fn return_session_lifecycle_agent(
-        &mut self,
-        mut result: AgentSessionLifecycleResult,
-    ) {
-        let previous_session_id = result
-            .agent
-            .state
-            .sessions
-            .get(&result.scope)
-            .cloned();
+    pub fn return_session_lifecycle_agent(&mut self, mut result: AgentSessionLifecycleResult) {
+        let previous_session_id = result.agent.state.sessions.get(&result.scope).cloned();
         let binding_changed = result.result.is_ok()
             && matches!(result.operation.as_str(), "load" | "resume" | "fork");
         if binding_changed {
@@ -1237,7 +1230,6 @@ impl AgentPool {
             if self.session_lifecycle_scopes.contains(scope) {
                 return Err(AgentCommandTarget::ActiveTurn);
             }
-
         }
         Err(AgentCommandTarget::StaleSession)
     }
@@ -1529,7 +1521,6 @@ impl AgentPool {
             &mut self.join_set,
         )
     }
-
 
     /// Non-blocking drain of the result channel. Used during shutdown to
     /// collect agents that completed while join_set was being drained.
@@ -3483,19 +3474,11 @@ pub async fn run_prompt_task(
             .collect(),
         None => prompt_sections.iter().map(String::as_str).collect(),
     };
-    let mut prompt_content_blocks =
-        Vec::with_capacity(prompt_blocks.len() + prompt_images.len());
-    prompt_content_blocks.extend(
-        prompt_blocks
-            .iter()
-            .copied()
-            .map(PromptContentBlock::Text),
-    );
-    prompt_content_blocks.extend(prompt_images.iter().map(|image| {
-        PromptContentBlock::Image {
-            data: &image.data,
-            mime_type: &image.mime_type,
-        }
+    let mut prompt_content_blocks = Vec::with_capacity(prompt_blocks.len() + prompt_images.len());
+    prompt_content_blocks.extend(prompt_blocks.iter().copied().map(PromptContentBlock::Text));
+    prompt_content_blocks.extend(prompt_images.iter().map(|image| PromptContentBlock::Image {
+        data: &image.data,
+        mime_type: &image.mime_type,
     }));
 
     let prompt_bytes: usize = prompt_blocks.iter().map(|block| block.len()).sum();
@@ -3989,7 +3972,9 @@ fn parse_imeta_image_source(
         }
     }
 
-    let Some(mime_type) = mime_types.iter().find(|mime_type| mime_type.starts_with("image/"))
+    let Some(mime_type) = mime_types
+        .iter()
+        .find(|mime_type| mime_type.starts_with("image/"))
     else {
         return Ok(None);
     };
@@ -3999,9 +3984,7 @@ fn parse_imeta_image_source(
         )));
     }
     if mime_type.len() <= "image/".len()
-        || mime_type["image/".len()..]
-            .chars()
-            .any(char::is_whitespace)
+        || mime_type["image/".len()..].chars().any(char::is_whitespace)
     {
         return Err(AcpError::Protocol(format!(
             "invalid image MIME type {mime_type:?} on event {event_id}"
@@ -4014,9 +3997,7 @@ fn parse_imeta_image_source(
     }
 
     let url = url::Url::parse(urls[0]).map_err(|error| {
-        AcpError::Protocol(format!(
-            "invalid image URL on event {event_id}: {error}"
-        ))
+        AcpError::Protocol(format!("invalid image URL on event {event_id}: {error}"))
     })?;
     if !matches!(url.scheme(), "http" | "https") {
         return Err(AcpError::Protocol(format!(
@@ -4049,12 +4030,16 @@ async fn fetch_batch_image_attachments(
     use base64::Engine as _;
     let mut attachments = Vec::with_capacity(sources.len());
     for source in sources {
-        let response = http.get(source.url.as_str()).send().await.map_err(|error| {
-            AcpError::Protocol(format!(
-                "failed to fetch image for event {} from {}: {error}",
-                source.event_id, source.url
-            ))
-        })?;
+        let response = http
+            .get(source.url.as_str())
+            .send()
+            .await
+            .map_err(|error| {
+                AcpError::Protocol(format!(
+                    "failed to fetch image for event {} from {}: {error}",
+                    source.event_id, source.url
+                ))
+            })?;
         let response = response.error_for_status().map_err(|error| {
             AcpError::Protocol(format!(
                 "image fetch returned an error for event {} from {}: {error}",
@@ -6048,20 +6033,16 @@ mod tests {
 
         let file_url = "url https://media.example/document.pdf";
         let file = Tag::parse(["imeta", file_url, "m application/pdf"]).unwrap();
-        assert!(
-            parse_imeta_image_source(&file, "event-file")
-                .unwrap()
-                .is_none()
-        );
+        assert!(parse_imeta_image_source(&file, "event-file")
+            .unwrap()
+            .is_none());
 
         let malformed_url = "url not-a-url";
         let malformed = Tag::parse(["imeta", malformed_url, "m image/jpeg"]).unwrap();
-        assert!(
-            parse_imeta_image_source(&malformed, "event-bad")
-                .unwrap_err()
-                .to_string()
-                .contains("invalid image URL")
-        );
+        assert!(parse_imeta_image_source(&malformed, "event-bad")
+            .unwrap_err()
+            .to_string()
+            .contains("invalid image URL"));
     }
 
     #[tokio::test]
@@ -6072,13 +6053,11 @@ mod tests {
         let address = listener.local_addr().unwrap();
         let image_bytes = b"image bytes";
         let server = tokio::spawn(async move {
-            let (mut stream, _) = tokio::time::timeout(
-                std::time::Duration::from_secs(5),
-                listener.accept(),
-            )
-            .await
-            .expect("image request should reach the local server")
-            .unwrap();
+            let (mut stream, _) =
+                tokio::time::timeout(std::time::Duration::from_secs(5), listener.accept())
+                    .await
+                    .expect("image request should reach the local server")
+                    .unwrap();
             let mut request = [0; 1024];
             let read = stream.read(&mut request).await.unwrap();
             let request = std::str::from_utf8(&request[..read]).unwrap();
@@ -6113,17 +6092,13 @@ mod tests {
             cancel_reason: None,
         };
 
-        let attachments =
-            fetch_batch_image_attachments(&batch, &reqwest::Client::new())
-                .await
-                .unwrap();
+        let attachments = fetch_batch_image_attachments(&batch, &reqwest::Client::new())
+            .await
+            .unwrap();
         server.await.unwrap();
         assert_eq!(attachments.len(), 1);
         assert_eq!(attachments[0].mime_type, "image/png");
-        assert_eq!(
-            attachments[0].data,
-            "aW1hZ2UgYnl0ZXM="
-        );
+        assert_eq!(attachments[0].data, "aW1hZ2UgYnl0ZXM=");
     }
 
     #[test]
@@ -8739,11 +8714,7 @@ printf '%s\n' '{{"jsonrpc":"2.0","id":0,"result":{{"stopReason":"end_turn"}}}}'"
             Err(AgentCommandTarget::ActiveTurn)
         ));
         assert!(matches!(
-            pool.hold_decision(
-                &scope,
-                std::time::Instant::now(),
-                Duration::from_secs(1),
-            ),
+            pool.hold_decision(&scope, std::time::Instant::now(), Duration::from_secs(1),),
             HoldDecision::Hold { .. }
         ));
 

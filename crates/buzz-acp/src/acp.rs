@@ -54,8 +54,6 @@ impl CommandOutput {
     }
 }
 
-
-
 /// An MCP server configuration passed to `session/new`.
 ///
 /// Corresponds to the `McpServerStdio` variant in the ACP schema.
@@ -827,7 +825,6 @@ impl AcpClient {
         self.command_output.take().unwrap_or_default()
     }
 
-
     /// Return a clone of the observer handle, if attached.
     pub(crate) fn observer_handle(&self) -> Option<ObserverHandle> {
         self.observer.clone()
@@ -969,9 +966,7 @@ impl AcpClient {
             if let Some(cursor) = cursor.as_deref() {
                 params["cursor"] = serde_json::Value::String(cursor.to_string());
             }
-            let page = self
-                .send_lifecycle_request("session/list", params)
-                .await?;
+            let page = self.send_lifecycle_request("session/list", params).await?;
             if let Some(items) = page.get("sessions").and_then(serde_json::Value::as_array) {
                 sessions.extend(items.iter().cloned());
             }
@@ -1148,7 +1143,10 @@ impl AcpClient {
     /// Empty when the category is not advertised; the caller turns that into an
     /// `Unsupported` refusal rather than writing a value nothing offered.
     pub fn category_option_values(&self, category: ConfigCategory) -> Vec<String> {
-        let Some(options) = self.session_config_options.as_ref().and_then(|v| v.as_array())
+        let Some(options) = self
+            .session_config_options
+            .as_ref()
+            .and_then(|v| v.as_array())
         else {
             return Vec::new();
         };
@@ -1157,9 +1155,9 @@ impl AcpClient {
             other => &[other.option_category()],
         };
         for want in wanted {
-            let found = options.iter().find(|opt| {
-                opt.get("category").and_then(|c| c.as_str()) == Some(*want)
-            });
+            let found = options
+                .iter()
+                .find(|opt| opt.get("category").and_then(|c| c.as_str()) == Some(*want));
             if let Some(opt) = found {
                 return opt
                     .get("options")
@@ -1274,13 +1272,8 @@ impl AcpClient {
         max_duration: std::time::Duration,
     ) -> Result<StopReason, AcpError> {
         let params = build_prompt_params(session_id, prompt_blocks);
-        self.session_prompt_params_with_idle_timeout(
-            session_id,
-            params,
-            idle_timeout,
-            max_duration,
-        )
-        .await
+        self.session_prompt_params_with_idle_timeout(session_id, params, idle_timeout, max_duration)
+            .await
     }
 
     /// Send text and image content blocks in one `session/prompt` request.
@@ -1292,13 +1285,8 @@ impl AcpClient {
         max_duration: std::time::Duration,
     ) -> Result<StopReason, AcpError> {
         let params = build_prompt_content_params(session_id, prompt_blocks);
-        self.session_prompt_params_with_idle_timeout(
-            session_id,
-            params,
-            idle_timeout,
-            max_duration,
-        )
-        .await
+        self.session_prompt_params_with_idle_timeout(session_id, params, idle_timeout, max_duration)
+            .await
     }
 
     async fn session_prompt_params_with_idle_timeout(
@@ -1472,10 +1460,7 @@ impl AcpClient {
     /// stored in `TaskMeta.config_tx`. Panics on a stacked receiver, since one
     /// `AcpClient` serves exactly one turn at a time and stacking would
     /// misroute a write into the wrong turn's reader.
-    pub fn install_config_rx(
-        &mut self,
-        rx: tokio::sync::mpsc::Receiver<SessionConfigRequest>,
-    ) {
+    pub fn install_config_rx(&mut self, rx: tokio::sync::mpsc::Receiver<SessionConfigRequest>) {
         assert!(
             self.config_rx.is_none(),
             "install_config_rx: previous turn's receiver was not consumed — \
@@ -2016,11 +2001,15 @@ impl AcpClient {
             // The permission answer deadline joins in only while a request is
             // outstanding, so it cannot shorten an ordinary turn.
             let permission_deadline = self.permission_deadline;
-            let next_deadline = [Some(idle_deadline), Some(hard_deadline), permission_deadline]
-                .into_iter()
-                .flatten()
-                .min()
-                .expect("idle and hard deadlines are always present");
+            let next_deadline = [
+                Some(idle_deadline),
+                Some(hard_deadline),
+                permission_deadline,
+            ]
+            .into_iter()
+            .flatten()
+            .min()
+            .expect("idle and hard deadlines are always present");
             let idle_fires_first = idle_deadline == next_deadline;
             let permission_fires_first = permission_deadline == Some(next_deadline);
 
@@ -2361,8 +2350,7 @@ impl AcpClient {
                                 .iter()
                                 .position(|(config_id, ..)| *id == serde_json::json!(*config_id))
                             {
-                                let (_, config_id, value, ack_tx) =
-                                    pending_configs.remove(index);
+                                let (_, config_id, value, ack_tx) = pending_configs.remove(index);
                                 let ack = match msg.get("error") {
                                     Some(error) => Err(SessionConfigError::Rejected {
                                         message: agent_error_message(error),
@@ -2377,12 +2365,10 @@ impl AcpClient {
                                         // so the next validation reads the
                                         // adapter's own statement of the
                                         // running values, not our local guess.
-                                        if let Some(options) =
-                                            msg.pointer("/result/configOptions")
+                                        if let Some(options) = msg.pointer("/result/configOptions")
                                         {
                                             if !options.is_null() {
-                                                self.session_config_options =
-                                                    Some(options.clone());
+                                                self.session_config_options = Some(options.clone());
                                             }
                                         }
                                         Ok(msg["result"].clone())
@@ -2798,7 +2784,10 @@ impl AcpClient {
                 Some(PermissionOption {
                     option_id: option.get("optionId")?.as_str()?.to_string(),
                     kind: option.get("kind")?.as_str()?.to_string(),
-                    name: option.get("name").and_then(|n| n.as_str()).map(str::to_string),
+                    name: option
+                        .get("name")
+                        .and_then(|n| n.as_str())
+                        .map(str::to_string),
                 })
             })
             .collect();
@@ -3104,7 +3093,6 @@ fn build_prompt_content_params(
         "prompt": blocks,
     })
 }
-
 
 /// Build `_goose/unstable/session/steer` params from one or more text
 /// content blocks plus the freshest `expectedRunId`.
@@ -3688,10 +3676,7 @@ mod tests {
             serde_json::json!({ "type": "text", "text": "/goal ship it" })
         );
         assert!(
-            prompt[0]["text"]
-                .as_str()
-                .unwrap()
-                .starts_with('/'),
+            prompt[0]["text"].as_str().unwrap().starts_with('/'),
             "slash-command detection must continue to see the first text block"
         );
         assert_eq!(
@@ -3757,14 +3742,20 @@ mod tests {
             // The always-allow id: never hardcoded, echoed from the request.
             option_id: "opt-always-7".to_string(),
         };
-        assert_eq!(client.settle_pending_permission(&answer).await.unwrap(), true);
+        assert_eq!(
+            client.settle_pending_permission(&answer).await.unwrap(),
+            true
+        );
         assert!(
             !client.has_pending_permission(),
             "the request must be gone after it was settled"
         );
 
         // Exactly-once: the same answer a second time addresses nothing.
-        assert_eq!(client.settle_pending_permission(&answer).await.unwrap(), false);
+        assert_eq!(
+            client.settle_pending_permission(&answer).await.unwrap(),
+            false
+        );
     }
 
     #[tokio::test]
@@ -3779,7 +3770,10 @@ mod tests {
             nonce: request.nonce + 1,
             option_id: "opt-allow-99".to_string(),
         };
-        assert_eq!(client.settle_pending_permission(&stale).await.unwrap(), false);
+        assert_eq!(
+            client.settle_pending_permission(&stale).await.unwrap(),
+            false
+        );
         assert!(
             client.has_pending_permission(),
             "a rejected answer must leave the real request answerable"
@@ -3846,7 +3840,10 @@ mod tests {
         let result = client
             .cancel_with_cleanup_grace("sess-perm", std::time::Duration::from_secs(5))
             .await;
-        assert!(matches!(result, Ok(StopReason::Cancelled)), "got {result:?}");
+        assert!(
+            matches!(result, Ok(StopReason::Cancelled)),
+            "got {result:?}"
+        );
         assert!(
             !client.has_pending_permission(),
             "a stopped turn must leave no pending request behind"
@@ -3907,8 +3904,7 @@ mod tests {
         assert_eq!(parsed["id"], serde_json::json!(1), "same JSON-RPC id");
         assert_eq!(parsed["result"]["outcome"]["outcome"], "selected");
         assert_eq!(
-            parsed["result"]["outcome"]["optionId"],
-            "opt-always-7",
+            parsed["result"]["outcome"]["optionId"], "opt-always-7",
             "the answered option id must reach the wire verbatim"
         );
         assert!(
@@ -3982,7 +3978,10 @@ mod tests {
             nonce: request.nonce,
             option_id: "opt-allow-99".to_string(),
         };
-        assert_eq!(client.settle_pending_permission(&late).await.unwrap(), false);
+        assert_eq!(
+            client.settle_pending_permission(&late).await.unwrap(),
+            false
+        );
         assert!(!client.has_pending_permission());
     }
 
@@ -4793,9 +4792,10 @@ mod tests {
 
         assert_eq!(result["sessions"][0]["cwd"], "/private/work");
         assert!(
-            observer.snapshot().iter().all(|event| {
-                event.kind != "acp_write" && event.kind != "acp_read"
-            }),
+            observer
+                .snapshot()
+                .iter()
+                .all(|event| { event.kind != "acp_write" && event.kind != "acp_read" }),
             "lifecycle request and response frames must not be published"
         );
     }
@@ -5175,7 +5175,6 @@ mod tests {
         assert!(ordinary.text.is_empty());
         assert!(!ordinary.tool_call_seen);
     }
-
 
     /// Build a `session/update` JSON-RPC notification carrying a
     /// `session_info_update` with the given `_meta.goose.activeRunId` value.

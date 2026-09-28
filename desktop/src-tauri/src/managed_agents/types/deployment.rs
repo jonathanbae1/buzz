@@ -72,7 +72,10 @@ mod tests {
     fn deployment_identity_round_trips_and_is_optional() {
         let identity = DeploymentIdentity::new("coder", "2026-09-28T00:00:00Z");
         let json = serde_json::to_string(&identity).unwrap();
-        assert_eq!(json, r#"{"profile":"coder","deployed_at":"2026-09-28T00:00:00Z"}"#);
+        assert_eq!(
+            json,
+            r#"{"profile":"coder","deployed_at":"2026-09-28T00:00:00Z"}"#
+        );
         assert_eq!(
             serde_json::from_str::<DeploymentIdentity>(&json).unwrap(),
             identity

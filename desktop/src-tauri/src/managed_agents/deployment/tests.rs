@@ -34,13 +34,26 @@ fn declaration(name: &str) -> OmpProfileCatalogEntry {
 /// roles. `curator` is deliberately absent — it is a task agent, not a profile
 /// (the recall slice's decision), so it must never appear as a roster entry.
 fn catalogue() -> Vec<OmpProfileCatalogEntry> {
-    ["default", "orchestrator", "planner", "coder", "reviewer", "scout", "designer"]
-        .iter()
-        .map(|name| declaration(name))
-        .collect()
+    [
+        "default",
+        "orchestrator",
+        "planner",
+        "coder",
+        "reviewer",
+        "scout",
+        "designer",
+    ]
+    .iter()
+    .map(|name| declaration(name))
+    .collect()
 }
 
-fn persona(id: &str, display: &str, runtime: Option<&str>, selector: Option<&str>) -> AgentDefinition {
+fn persona(
+    id: &str,
+    display: &str,
+    runtime: Option<&str>,
+    selector: Option<&str>,
+) -> AgentDefinition {
     AgentDefinition {
         id: id.to_string(),
         display_name: display.to_string(),
@@ -82,7 +95,12 @@ fn deployed(id: &str, display: &str, profile: &str, selector: Option<&str>) -> A
 fn installed_roster() -> Vec<AgentDefinition> {
     vec![
         persona("2726b5be", "coder", Some("omp"), Some("coder")),
-        persona("4d5caf55", "orchestrator", Some("omp"), Some("orchestrator")),
+        persona(
+            "4d5caf55",
+            "orchestrator",
+            Some("omp"),
+            Some("orchestrator"),
+        ),
         persona("705670a5", "reviewer", Some("omp"), Some("reviewer")),
         persona("ad0cc4d2", "scout", Some("omp"), Some("scout")),
         persona("f1465360", "planner", Some("omp"), Some("planner")),
@@ -99,7 +117,14 @@ fn gates_except(gated: &[&str]) -> ActivationGates {
     let proofs = catalogue()
         .iter()
         .filter(|declaration| !gated.contains(&declaration.name.as_str()))
-        .map(|declaration| proof_record(&declaration.name, OMP_UNDER_TEST, "2026-09-28T00:00:00Z", "fixture"))
+        .map(|declaration| {
+            proof_record(
+                &declaration.name,
+                OMP_UNDER_TEST,
+                "2026-09-28T00:00:00Z",
+                "fixture",
+            )
+        })
         .collect();
     ActivationGates::from_parts(
         std::path::PathBuf::from("/tmp/fixture/proofs.json"),
@@ -129,7 +154,10 @@ fn entry<'a>(plan: &'a RosterDeployPlan, name: &str) -> &'a RosterPlanEntry {
 #[test]
 fn g0a_baseline_creates_nothing() {
     let plan = plan(&installed_roster());
-    assert_eq!(plan.counts.create, 0, "a second deploy must not create anything");
+    assert_eq!(
+        plan.counts.create, 0,
+        "a second deploy must not create anything"
+    );
     // All five real rows are recognized. They carry no provenance, but each is
     // the single unambiguous holder of its profile with no name conflict, so
     // provenance migration adopts them rather than minting duplicates.
@@ -151,10 +179,22 @@ fn g0a_baseline_creates_nothing() {
 #[test]
 fn roster_entries_are_exactly_the_catalogue() {
     let plan = plan(&installed_roster());
-    let names: Vec<&str> = plan.entries.iter().map(|entry| entry.name.as_str()).collect();
+    let names: Vec<&str> = plan
+        .entries
+        .iter()
+        .map(|entry| entry.name.as_str())
+        .collect();
     assert_eq!(
         names,
-        vec!["default", "orchestrator", "planner", "coder", "reviewer", "scout", "designer"]
+        vec![
+            "default",
+            "orchestrator",
+            "planner",
+            "coder",
+            "reviewer",
+            "scout",
+            "designer"
+        ]
     );
     assert!(!names.contains(&"curator"));
 }
@@ -187,8 +227,15 @@ fn g0c_renamed_legacy_row_with_erased_selector_is_unmapped() {
     let plan = plan(&personas);
     let coder = entry(&plan, "coder");
     assert_eq!(coder.verdict, RosterVerdict::Unmapped, "{coder:?}");
-    assert_eq!(plan.counts.create, 0, "nothing may be created while a question is open");
-    assert_eq!(coder.candidates.len(), 1, "the erased row is offered as a candidate");
+    assert_eq!(
+        plan.counts.create, 0,
+        "nothing may be created while a question is open"
+    );
+    assert_eq!(
+        coder.candidates.len(),
+        1,
+        "the erased row is offered as a candidate"
+    );
     assert_eq!(coder.candidates[0].display_name, "my coder");
     // Apply is refused while the question is unanswered.
     assert!(plan.apply_blocked);
@@ -226,7 +273,10 @@ fn g0d_name_only_match_on_an_omp_persona_is_name_taken() {
     let coder = entry(&plan, "coder");
     assert_eq!(coder.verdict, RosterVerdict::Conflict);
     assert_eq!(coder.kind, Some(RosterVerdictKind::NameTaken));
-    assert_eq!(plan.counts.create, 0, "a name conflict must never be created past");
+    assert_eq!(
+        plan.counts.create, 0,
+        "a name conflict must never be created past"
+    );
     assert!(plan.apply_blocked);
 }
 
@@ -262,7 +312,10 @@ fn a_name_match_never_adopts_even_when_it_holds_the_selector() {
     // conflict fires first — a name-only match never adopts.
     assert_eq!(scout.verdict, RosterVerdict::Conflict);
     assert_eq!(scout.kind, Some(RosterVerdictKind::NameTaken));
-    assert_eq!(plan.counts.create, 0, "a name-only match must never be created past");
+    assert_eq!(
+        plan.counts.create, 0,
+        "a name-only match must never be created past"
+    );
     assert!(plan.apply_blocked);
 }
 
@@ -288,7 +341,10 @@ fn g0e_deployed_row_with_a_cleared_selector_is_diverged_cleared() {
     // `diverged`, which is not an action verdict, and its target is the
     // existing row so no `create` can mint a duplicate.
     assert!(
-        !matches!(reviewer.verdict, RosterVerdict::Create | RosterVerdict::Adopt),
+        !matches!(
+            reviewer.verdict,
+            RosterVerdict::Create | RosterVerdict::Adopt
+        ),
         "a diverged row must not be an action"
     );
     assert_eq!(reviewer.persona_id.as_deref(), Some("705670a5"));
@@ -315,7 +371,11 @@ fn g0e_deployed_row_reassigned_to_another_profile_is_diverged_reassigned() {
     assert_eq!(reviewer.verdict, RosterVerdict::Diverged);
     assert_eq!(reviewer.kind, Some(RosterVerdictKind::DivergedReassigned));
     assert_eq!(reviewer.current_selector.as_deref(), Some("scout"));
-    assert!(reviewer.message.contains("Left as is"), "{}", reviewer.message);
+    assert!(
+        reviewer.message.contains("Left as is"),
+        "{}",
+        reviewer.message
+    );
     // `scout` is not minted beside the reassigned row: the selector is taken,
     // so a create would fail the duplicate-selector check at save time.
     assert_eq!(plan.counts.create, 0, "{:?}", plan.counts);
@@ -337,7 +397,11 @@ fn g1_migration_maps_the_five_real_rows_and_patches_only_identity() {
         .iter()
         .filter(|entry| entry.verdict == RosterVerdict::Adopt)
         .collect();
-    assert_eq!(adopts.len(), 5, "all five legacy rows must be adopted, not re-created");
+    assert_eq!(
+        adopts.len(),
+        5,
+        "all five legacy rows must be adopted, not re-created"
+    );
 
     for adopt in &adopts {
         let mut before = personas
@@ -374,7 +438,10 @@ fn g1_migration_maps_the_five_real_rows_and_patches_only_identity() {
 
         // And the two identity keys did move.
         assert_eq!(
-            before.deployment_identity.as_ref().map(|id| id.profile.as_str()),
+            before
+                .deployment_identity
+                .as_ref()
+                .map(|id| id.profile.as_str()),
             Some(adopt.name.as_str())
         );
     }
@@ -396,10 +463,7 @@ fn g1_ambiguous_fixture_stays_unmapped() {
     let plan = plan(&personas);
     let coder = entry(&plan, "coder");
     assert_eq!(coder.verdict, RosterVerdict::Unmapped, "{coder:?}");
-    assert_eq!(
-        coder.kind,
-        Some(RosterVerdictKind::UnmappedClaimants)
-    );
+    assert_eq!(coder.kind, Some(RosterVerdictKind::UnmappedClaimants));
     assert_eq!(coder.candidates.len(), 2, "both holders are offered");
     assert!(plan.apply_blocked);
 }
@@ -411,14 +475,16 @@ fn g1_ambiguous_fixture_stays_unmapped() {
 fn g1_non_omp_holder_is_unmapped_not_adopted() {
     let mut personas = installed_roster();
     personas.retain(|row| row.display_name != "coder");
-    personas.push(persona("goose-coder", "Goose Coder", Some("goose"), Some("coder")));
+    personas.push(persona(
+        "goose-coder",
+        "Goose Coder",
+        Some("goose"),
+        Some("coder"),
+    ));
     let plan = plan(&personas);
     let coder = entry(&plan, "coder");
     assert_eq!(coder.verdict, RosterVerdict::Unmapped);
-    assert_eq!(
-        coder.kind,
-        Some(RosterVerdictKind::UnmappedClaimants)
-    );
+    assert_eq!(coder.kind, Some(RosterVerdictKind::UnmappedClaimants));
     assert!(coder.candidates.is_empty());
     assert_eq!(plan.counts.adopt, 4);
 }
@@ -455,7 +521,12 @@ fn two_rows_claiming_one_profile_is_reported_as_conflict() {
     let mut personas = installed_roster();
     personas[0].deployment_identity =
         Some(DeploymentIdentity::new("coder", "2026-09-20T00:00:00Z"));
-    personas.push(persona("clone", "coder-clone", Some("omp"), Some("reviewer")));
+    personas.push(persona(
+        "clone",
+        "coder-clone",
+        Some("omp"),
+        Some("reviewer"),
+    ));
     personas[5].deployment_identity =
         Some(DeploymentIdentity::new("coder", "2026-09-20T00:00:00Z"));
 
@@ -551,7 +622,10 @@ fn presets_are_planned_by_slug_and_design_review_is_blocked() {
         .unwrap();
     assert_eq!(design.verdict, TeamPresetVerdict::Blocked);
     assert!(design.message.contains("designer"), "{}", design.message);
-    assert!(design.members.iter().any(|member| member.persona_id.is_none()));
+    assert!(design
+        .members
+        .iter()
+        .any(|member| member.persona_id.is_none()));
 }
 
 /// A second deploy of an unchanged preset creates nothing and does not write.
@@ -590,14 +664,23 @@ fn an_edited_preset_team_is_preserved_and_reported_edited() {
     let plan = plan_roster_deploy(&catalogue(), &personas, &teams, &gates(), &[]);
     let build = plan.teams.iter().find(|team| team.slug == "build").unwrap();
     assert_eq!(build.verdict, TeamPresetVerdict::Edited, "{build:?}");
-    assert!(build.message.contains("preserved verbatim"), "{}", build.message);
+    assert!(
+        build.message.contains("preserved verbatim"),
+        "{}",
+        build.message
+    );
 }
 
 /// Membership is a digest input, so a user who removed a member keeps that.
 #[test]
 fn a_removed_member_is_an_edit_not_a_silent_re_add() {
     let personas = installed_roster();
-    let teams = vec![built_team("team-1", "build", "1", vec!["2726b5be", "705670a5"])];
+    let teams = vec![built_team(
+        "team-1",
+        "build",
+        "1",
+        vec!["2726b5be", "705670a5"],
+    )];
     let plan = plan_roster_deploy(&catalogue(), &personas, &teams, &gates(), &[]);
     let build = plan.teams.iter().find(|team| team.slug == "build").unwrap();
     assert_eq!(build.verdict, TeamPresetVerdict::Edited);
@@ -629,7 +712,12 @@ fn a_same_named_team_without_provenance_is_not_the_preset() {
 #[test]
 fn shared_members_are_disclosed_with_every_preset_that_uses_them() {
     let mut personas = installed_roster();
-    personas.push(deployed("designer-row", "designer", "designer", Some("designer")));
+    personas.push(deployed(
+        "designer-row",
+        "designer",
+        "designer",
+        Some("designer"),
+    ));
     let plan = plan_roster_deploy(&catalogue(), &personas, &[], &gates(), &[]);
     let shared: Vec<&SharedMember> = plan
         .shared_members
@@ -650,5 +738,7 @@ fn plan_teams_reports_a_create_with_no_stored_team() {
     let entries = plan(&installed_roster()).entries;
     let teams = plan_teams(&entries, &[]);
     assert_eq!(teams.len(), 2);
-    assert!(teams.iter().any(|team| team.verdict == TeamPresetVerdict::Create));
+    assert!(teams
+        .iter()
+        .any(|team| team.verdict == TeamPresetVerdict::Create));
 }

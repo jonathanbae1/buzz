@@ -193,9 +193,9 @@ fn team_export_with_instance_and_memory_level_uses_supplied_entries() {
         version: None,
         created_at: "now".to_string(),
         updated_at: "now".to_string(),
-    
-preset_source: None,
-};
+
+        preset_source: None,
+    };
 
     // Build a fake instance record tied to this team+persona.
     let instance = ManagedAgentRecord {

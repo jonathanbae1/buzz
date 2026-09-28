@@ -222,8 +222,9 @@ pub async fn get_project_local_repo_tracked_paths(
         .filter(|value| !value.is_empty());
 
     tauri::async_runtime::spawn_blocking(move || {
-        let repo_dir = find_local_repo_dir(repos_dir.as_deref(), &project_dtag, clone_url.as_deref())?
-            .ok_or_else(|| "No local checkout found for this repository.".to_string())?;
+        let repo_dir =
+            find_local_repo_dir(repos_dir.as_deref(), &project_dtag, clone_url.as_deref())?
+                .ok_or_else(|| "No local checkout found for this repository.".to_string())?;
         let mut args = vec!["ls-files", "--cached", "-z"];
         if let Some(prefix) = prefix.as_deref() {
             args.push("--");

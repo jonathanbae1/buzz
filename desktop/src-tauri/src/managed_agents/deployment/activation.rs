@@ -154,7 +154,6 @@ impl ActivationGates {
         }
         ActivationState::authorized()
     }
-
 }
 
 /// Resolve `proofs.json` under the same root the catalogue is read from.
@@ -293,7 +292,10 @@ mod tests {
     /// would have nothing to match against.
     #[test]
     fn unknown_running_version_gates_even_with_a_record() {
-        let gates = gates(Ok(vec![proof_record("designer", "18.3.5", "now", "x")]), None);
+        let gates = gates(
+            Ok(vec![proof_record("designer", "18.3.5", "now", "x")]),
+            None,
+        );
         assert!(!gates.state("designer").is_authorized());
     }
 
@@ -309,7 +311,10 @@ mod tests {
 
     #[test]
     fn malformed_proof_file_gates_with_its_own_reason() {
-        let gates = gates(Err("the activation proof is malformed".to_string()), Some("18.3.5"));
+        let gates = gates(
+            Err("the activation proof is malformed".to_string()),
+            Some("18.3.5"),
+        );
         assert_eq!(
             gates.state("designer").reason().unwrap(),
             "the activation proof is malformed"
@@ -341,13 +346,14 @@ mod tests {
         assert!(err.contains("schema version 99"), "{err}");
 
         std::fs::write(&path, b"not json").unwrap();
-        assert_eq!(read_proofs(&path).unwrap_err(), "the activation proof is malformed");
+        assert_eq!(
+            read_proofs(&path).unwrap_err(),
+            "the activation proof is malformed"
+        );
 
         std::fs::remove_file(&path).unwrap();
-        assert!(
-            read_proofs(&path)
-                .unwrap_err()
-                .contains("no activation proof is recorded")
-        );
+        assert!(read_proofs(&path)
+            .unwrap_err()
+            .contains("no activation proof is recorded"));
     }
 }

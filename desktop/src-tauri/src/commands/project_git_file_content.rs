@@ -1,9 +1,9 @@
 use super::project_git::first_output_line;
-use super::project_git_types::ProjectLocalRepoDocument;
 use super::project_git_exec::{
     build_git_auth_config, clean_branch, clean_target_ref, run_git, validate_workspace_clone_url,
     GitAuthConfig,
 };
+use super::project_git_types::ProjectLocalRepoDocument;
 use super::project_repo_paths::find_local_repo_dir;
 use crate::app_state::AppState;
 use tauri::State;
@@ -236,8 +236,9 @@ pub async fn get_project_local_repo_document_content(
 ) -> Result<ProjectLocalRepoDocument, String> {
     validate_repo_file_path(&path)?;
     tauri::async_runtime::spawn_blocking(move || {
-        let repo_dir = find_local_repo_dir(repos_dir.as_deref(), &project_dtag, clone_url.as_deref())?
-            .ok_or_else(|| "No local checkout found for this repository.".to_string())?;
+        let repo_dir =
+            find_local_repo_dir(repos_dir.as_deref(), &project_dtag, clone_url.as_deref())?
+                .ok_or_else(|| "No local checkout found for this repository.".to_string())?;
         Ok(match read_preview_file(&repo_dir, &path, None) {
             Ok(content) => ProjectLocalRepoDocument {
                 path,

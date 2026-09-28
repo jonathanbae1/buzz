@@ -13,7 +13,7 @@
 //! member in a channel is the existing `AddTeamToChannelDialog` flow and is
 //! deliberately outside the idempotency contract.
 
-use crate::managed_agents::{TeamRecord, TeamPresetSource};
+use crate::managed_agents::{TeamPresetSource, TeamRecord};
 
 use super::roster::{
     preset_content_digest, team_content_digest, RosterPlanEntry, TeamMemberResolution,
@@ -94,17 +94,16 @@ fn resolve_member(profile: &str, entries: &[RosterPlanEntry]) -> TeamMemberResol
             profile: profile.to_string(),
             persona_id: None,
             display_name: None,
-            message: entry.detail.clone().unwrap_or_else(|| {
-                format!("`{profile}` cannot be deployed on this machine yet.")
-            }),
+            message: entry
+                .detail
+                .clone()
+                .unwrap_or_else(|| format!("`{profile}` cannot be deployed on this machine yet.")),
         },
         super::roster::RosterVerdict::Unmapped => TeamMemberResolution {
             profile: profile.to_string(),
             persona_id: None,
             display_name: None,
-            message: format!(
-                "`{profile}` needs a user mapping before the preset can be created."
-            ),
+            message: format!("`{profile}` needs a user mapping before the preset can be created."),
         },
         super::roster::RosterVerdict::Conflict => TeamMemberResolution {
             profile: profile.to_string(),
@@ -294,7 +293,6 @@ pub(crate) fn member_ids(preset: &TeamPreset, entries: &[RosterPlanEntry]) -> Ve
         })
         .collect()
 }
-
 
 #[cfg(test)]
 mod tests {

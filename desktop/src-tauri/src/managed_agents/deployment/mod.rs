@@ -18,5 +18,3 @@ mod installed_store_tests;
 
 #[cfg(test)]
 mod tests;
-
-
