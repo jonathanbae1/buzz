@@ -468,10 +468,10 @@ case "$(cat "$MODEL_SWITCH_FIXTURE_ROOT/installer-mode")" in
   slow)
     [ "${OH_MY_BUZZ_LOCK_HELD:-0}" = 1 ] || { echo 'lock inheritance missing' >&2; exit 2; }
     case "${1:-}" in --models-only) kind=models ;; *) kind=full ;; esac
-    echo "BEGIN-$kind" >> "$MODEL_SWITCH_FIXTURE_ROOT/events"
+    echo "BEGIN-$kind" >> "$MODEL_SWITCH_FIXTURE_ROOT/installer-order.log"
     touch "$MODEL_SWITCH_FIXTURE_ROOT/installer-entered"
     sleep 0.25
-    echo "END-$kind" >> "$MODEL_SWITCH_FIXTURE_ROOT/events"
+    echo "END-$kind" >> "$MODEL_SWITCH_FIXTURE_ROOT/installer-order.log"
     ;;
   success) [ "${OH_MY_BUZZ_LOCK_HELD:-0}" = 1 ] || { echo 'lock inheritance missing' >&2; exit 2; } ;;
 esac
@@ -561,7 +561,7 @@ done
         for args in [vec!["--models-only"], vec![]] {
             fs::write(&lanes_path(&repo), br#"{"schemaVersion":1,"lanes":{"advisor":{"model":"m","effort":"low"}}}"#).unwrap();
             fs::remove_file(&entered).ok();
-            fs::write(root.join("events"), "").unwrap();
+            fs::write(root.join("installer-order.log"), "").unwrap();
             let (lanes, revision) = draft(&repo, "medium");
             let save_repo = repo.clone();
             let save = thread::spawn(move || save_omp_lanes_with_timeout(save_repo.display().to_string(), lanes, revision, Duration::from_secs(2)));
@@ -573,7 +573,7 @@ done
             assert!(String::from_utf8_lossy(&external.stderr).contains("waiting for routing lock"));
             assert!(String::from_utf8_lossy(&external.stdout).contains("default: model roles"));
             assert!(save.join().unwrap().is_ok());
-            let events = fs::read_to_string(root.join("events")).unwrap();
+            let events = fs::read_to_string(root.join("installer-order.log")).unwrap();
             let lines = events.lines().collect::<Vec<_>>();
             assert_eq!(lines.len(), 4, "installer invocations interleaved: {events}");
             assert_eq!(lines[0].strip_prefix("BEGIN-"), lines[1].strip_prefix("END-"));
