@@ -1,4 +1,4 @@
-import { Activity, Bot, Folders, Inbox, ListChecks, Zap } from "lucide-react";
+import { Activity, BookOpen, Bot, Folders, Inbox, ListChecks, Zap } from "lucide-react";
 
 import { TopbarSearch } from "@/features/search/ui/TopbarSearch";
 import { SidebarProjectsSection } from "@/features/sidebar/ui/SidebarProjectsSection";
@@ -22,7 +22,8 @@ type SidebarSelectedView =
   | "workflows"
   | "pulse"
   | "projects"
-  | "agent-tasks";
+  | "agent-tasks"
+  | "wiki";
 
 type AppSidebarPinnedHeaderProps = {
   channelLabels: Record<string, string>;
@@ -47,6 +48,7 @@ type AppSidebarPrimaryMenuProps = {
   onSelectProjects: () => void;
   onSelectPulse: () => void;
   onSelectTasks: () => void;
+  onSelectWiki: () => void;
   onSelectWorkflows: () => void;
   projectsOverviewActive: boolean;
   selectedView: SidebarSelectedView;
@@ -98,6 +100,7 @@ export function AppSidebarPrimaryMenu({
   onSelectProjects,
   onSelectPulse,
   onSelectTasks,
+  onSelectWiki,
   onSelectWorkflows,
   projectsOverviewActive,
   selectedView,
@@ -155,6 +158,20 @@ export function AppSidebarPrimaryMenu({
               >
                 <ListChecks className="h-4 w-4" />
                 <SidebarMenuLabel>Tasks</SidebarMenuLabel>
+              </SidebarMenuButton>
+            </SidebarMenuItem>
+          </FeatureGate>
+          <FeatureGate feature="wiki">
+            <SidebarMenuItem>
+              <SidebarMenuButton
+                data-testid="open-wiki-view"
+                isActive={selectedView === "wiki"}
+                onClick={onSelectWiki}
+                tooltip="Wiki"
+                type="button"
+              >
+                <BookOpen className="h-4 w-4" />
+                <SidebarMenuLabel>Wiki</SidebarMenuLabel>
               </SidebarMenuButton>
             </SidebarMenuItem>
           </FeatureGate>

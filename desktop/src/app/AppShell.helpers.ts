@@ -10,7 +10,8 @@ export type AppView =
   | "workflows"
   | "pulse"
   | "projects"
-  | "agent-tasks";
+  | "agent-tasks"
+  | "wiki";
 
 const WINDOW_DRAG_HANDLE_HEIGHT = 44;
 const TAURI_DRAG_REGION_ATTR = "data-tauri-drag-region";
@@ -266,6 +267,13 @@ export function deriveShellRoute(pathname: string): {
     return {
       selectedChannelId: null,
       selectedView: "agent-tasks",
+    };
+  }
+
+  if (pathname === "/wiki") {
+    return {
+      selectedChannelId: null,
+      selectedView: "wiki",
     };
   }
 

@@ -42,6 +42,29 @@ pub struct ProjectLocalRepoSnapshotInfo {
     pub snapshot: ProjectRepoSnapshotInfo,
 }
 
+/// Tracked paths in a local checkout, plus the resolved checkout root.
+///
+/// `root` is reported so a caller can show which directory answered — a
+/// repo-relative path is meaningless without it, and a wrong root is the
+/// failure this pair exists to make visible.
+#[derive(Serialize)]
+pub struct ProjectLocalRepoPathsInfo {
+    pub root: String,
+    pub paths: Vec<String>,
+}
+
+/// One document's content, or the reason it is unavailable.
+///
+/// Mirror of [`crate::commands::project_git_file_content::PreviewProblem`] on
+/// the wire: `content: Option<String>` alone cannot distinguish "missing" from
+/// "too large", and a search index must be able to say which pages it covers.
+#[derive(Serialize)]
+pub struct ProjectLocalRepoDocument {
+    pub path: String,
+    pub content: Option<String>,
+    pub unavailable_reason: Option<String>,
+}
+
 #[derive(Serialize)]
 pub struct ProjectLocalRepoInfo {
     pub name: String,

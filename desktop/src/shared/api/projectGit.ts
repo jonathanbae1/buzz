@@ -1,5 +1,7 @@
 import type {
+  ProjectLocalRepoDocument,
   ProjectLocalRepository,
+  ProjectLocalRepoPaths,
   ProjectLocalRepoSnapshot,
   ProjectRepoBranchResult,
   ProjectRepoCloneResult,
@@ -40,6 +42,17 @@ type RawProjectRepoFile = {
   preview_content: string | null;
   last_changed_at: number | null;
   latest_commit: RawProjectRepoCommit | null;
+};
+
+type RawProjectLocalRepoPaths = {
+  root: string;
+  paths: string[];
+};
+
+type RawProjectLocalRepoDocument = {
+  path: string;
+  content: string | null;
+  unavailable_reason: string | null;
 };
 
 type RawProjectRepoContributor = {
@@ -288,6 +301,76 @@ export async function getProjectLocalRepoFileContent(input: {
   path: string;
 }): Promise<string | null> {
   return invokeTauri<string | null>("get_project_local_repo_file_content", {
+    reposDir: input.reposDir ?? null,
+    projectDtag: input.projectDtag,
+    cloneUrl: input.cloneUrl ?? null,
+    path: input.path,
+  });
+}
+
+/**
+ * One document's content, or the reason it is unavailable.
+ *
+ * Distinct from `getProjectLocalRepoFileContent`, which collapses "missing",
+ * "too large" and "not UTF-8" into `null`. A search index has to be able to say
+ * which pages it covers.
+ */
+export async function getProjectLocalRepoDocumentContent(input: {
+  reposDir?: string | null;
+  projectDtag: string;
+  cloneUrl?: string | null;
+  path: string;
+}): Promise<ProjectLocalRepoDocument> {
+  const raw = await invokeTauri<RawProjectLocalRepoDocument>(
+    "get_project_local_repo_document_content",
+    {
+      reposDir: input.reposDir ?? null,
+      projectDtag: input.projectDtag,
+      cloneUrl: input.cloneUrl ?? null,
+      path: input.path,
+    },
+  );
+  return {
+    path: raw.path,
+    content: raw.content,
+    unavailableReason: raw.unavailable_reason,
+  };
+}
+
+/**
+ * Tracked paths for a local checkout, plus the resolved checkout root.
+ *
+ * Deliberately not derived from `getProjectLocalRepoSnapshot`: that command
+ * passes `--others`, so an untracked scratch file would be indistinguishable
+ * from a curated one. This one runs `git ls-files --cached` only and surfaces
+ * a git failure as a thrown error rather than an empty list.
+ */
+export async function getProjectLocalRepoTrackedPaths(input: {
+  reposDir?: string | null;
+  projectDtag: string;
+  cloneUrl?: string | null;
+  prefix?: string | null;
+}): Promise<ProjectLocalRepoPaths> {
+  const raw = await invokeTauri<RawProjectLocalRepoPaths>(
+    "get_project_local_repo_tracked_paths",
+    {
+      reposDir: input.reposDir ?? null,
+      projectDtag: input.projectDtag,
+      cloneUrl: input.cloneUrl ?? null,
+      prefix: input.prefix ?? null,
+    },
+  );
+  return { root: raw.root, paths: raw.paths };
+}
+
+/** Open one tracked file from the local checkout in the OS default editor. */
+export async function openProjectLocalRepoFile(input: {
+  reposDir?: string | null;
+  projectDtag: string;
+  cloneUrl?: string | null;
+  path: string;
+}): Promise<void> {
+  return invokeTauri<void>("open_project_local_repo_file", {
     reposDir: input.reposDir ?? null,
     projectDtag: input.projectDtag,
     cloneUrl: input.cloneUrl ?? null,

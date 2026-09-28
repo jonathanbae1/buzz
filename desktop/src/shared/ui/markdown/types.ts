@@ -56,6 +56,37 @@ export type MarkdownRuntime = {
   /** Display name of the message author sharing an agent snapshot. */
   snapshotSharedBy?: string;
   /**
+   * Resolves relative hrefs when the document surface is active. Supplied by
+   * the caller (never captured in the cached component map), so the parse
+   * cache stays policy-free.
+   */
+  documentLinkPolicy?: MarkdownDocumentLinkPolicy;
+  /**
+   * Navigate to another document in the same collection, scrolled to
+   * `heading` when given. Only used when `documentSurface` is set.
+   */
+  onOpenDocumentLink?: (href: string, heading?: string) => void;
+  /**
+   * Open a root-confined file outside the collection (e.g. `../buzz-fork.json`)
+   * through the local content reader, with an *Open in editor* action. The
+   * action is explicit so the anchor never encodes one into a path prefix.
+   */
+  onOpenDocumentArtifact?: (
+    path: string,
+    action: "preview" | "editor",
+  ) => void;
+  /**
+   * Decide whether a `(source: path:line)` citation resolves to exactly one
+   * tracked file. Supplied by the caller, which is the only party that knows
+   * the checkout; without it every citation renders inert.
+   */
+  resolveSourceCitation?: (
+    path: string | undefined,
+    line?: number,
+  ) => DocumentCitationResolution;
+  /** Navigate to a resolved `(source: …)` citation. */
+  onOpenSourceCitation?: (path: string, line?: number) => void;
+  /**
    * Called by AgentSnapshotCard after a successful verified in-memory fetch.
    * The implementation should navigate to /agents and trigger the existing
    * snapshot import flow with the supplied bytes. Optional — when absent the
@@ -112,4 +143,62 @@ export type MarkdownProps = {
    * a nudge card.
    */
   configNudgeAuthorPubkey?: string | null;
+  /**
+   * Render as a document rather than a chat message: headings get stable
+   * GitHub-style ids, and relative markdown hrefs inside `content` are routed
+   * through `documentLinkPolicy` instead of being handed to the OS opener as
+   * meaningless relative URLs. Off by default so chat and README rendering are
+   * byte-for-byte unchanged.
+   */
+  documentSurface?: boolean;
+  /**
+   * Resolve one relative/absolute href from document content. Only consulted
+   * when `documentSurface` is set. Returning `null` renders the link as inert
+   * monospace text — never a live link to a wrong target.
+   */
+  documentLinkPolicy?: MarkdownDocumentLinkPolicy;
+  /** Navigate to another document in the same collection (document surface). */
+  onOpenDocumentLink?: (href: string, heading?: string) => void;
+  /** Open a root-confined artifact outside the collection (document surface). */
+  onOpenDocumentArtifact?: (
+    path: string,
+    action: "preview" | "editor",
+  ) => void;
+  /**
+   * Decide whether a `(source: path:line)` citation resolves to exactly one
+   * tracked file. Supplied by the caller, which is the only party that knows
+   * the checkout; without it every citation renders inert.
+   */
+  resolveSourceCitation?: (
+    path: string | undefined,
+    line?: number,
+  ) => DocumentCitationResolution;
+  /** Navigate to a resolved `(source: …)` citation. */
+  onOpenSourceCitation?: (path: string, line?: number) => void;
 };
+
+/**
+ * Whether a `(source: …)` citation resolves to exactly one tracked file.
+ *
+ * The chip cannot navigate without this: a citation that matches zero or
+ * several files must render inert, because opening one of two same-named files
+ * looks authoritative and is wrong.
+ */
+export type DocumentCitationResolution =
+  | { navigable: false }
+  | { navigable: true; path: string; line?: number };
+
+/** Where a document-surface relative link points, decided by resolution. */
+export type MarkdownDocumentLinkTarget =
+  /** A page inside the same document collection (optionally + heading). */
+  | { kind: "document"; href: string; heading?: string }
+  /** A file inside the checkout but outside the collection (root-confined). */
+  | { kind: "artifact"; path: string }
+  /** An absolute http(s) URL: the only class ExternalLinkAnchor is correct for. */
+  | { kind: "external"; href: string }
+  /** Nothing resolvable: render inert. */
+  | { kind: "unresolved" };
+
+export type MarkdownDocumentLinkPolicy = (
+  href: string,
+) => MarkdownDocumentLinkTarget;

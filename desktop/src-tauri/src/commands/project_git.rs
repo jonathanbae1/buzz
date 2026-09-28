@@ -2,12 +2,14 @@ use super::project_git_exec::{
     build_git_auth_config, clean_branch, clean_target_ref, run_git, validate_workspace_clone_url,
     GitAuthConfig,
 };
-use super::project_git_file_content::{checkout_project_repo, read_preview_content};
+use super::project_git_file_content::{
+    checkout_project_repo, read_preview_content, validate_repo_file_path,
+};
 use super::project_git_push::push_project_local_repository_blocking;
 pub use super::project_git_types::{
-    GitIdentityInfo, ProjectLocalRepoInfo, ProjectLocalRepoSnapshotInfo, ProjectRepoCommitInfo,
-    ProjectRepoContributorInfo, ProjectRepoFileInfo, ProjectRepoPullResult, ProjectRepoPushResult,
-    ProjectRepoSnapshotInfo, ProjectRepoSyncStatusInfo,
+    GitIdentityInfo, ProjectLocalRepoInfo, ProjectLocalRepoPathsInfo, ProjectLocalRepoSnapshotInfo,
+    ProjectRepoCommitInfo, ProjectRepoContributorInfo, ProjectRepoFileInfo, ProjectRepoPullResult,
+    ProjectRepoPushResult, ProjectRepoSnapshotInfo, ProjectRepoSyncStatusInfo,
 };
 use super::project_repo_paths::{canonical_repos_roots, find_local_repo_dir};
 use crate::app_state::AppState;
@@ -184,6 +186,102 @@ fn parse_worktree_files(
             }
         })
         .collect()
+}
+
+/// Parse `git ls-files -z` output into tracked paths, keeping an optional
+/// `prefix` filter applied by git itself.
+///
+/// Deliberately narrower than [`parse_worktree_files`]: no size, no preview
+/// content, no commit metadata. Callers that need content fetch it per path
+/// through `get_project_local_repo_file_content`.
+pub(crate) fn parse_tracked_paths(output: &str) -> Vec<String> {
+    output
+        .split('\0')
+        .filter(|path| !path.trim().is_empty())
+        .map(str::to_string)
+        .collect()
+}
+
+/// List tracked paths in a local checkout, optionally under `prefix`.
+///
+/// Runs `git ls-files --cached -z` with **no** `--others`/`--exclude-standard`,
+/// so an untracked scratch file can never be listed as a page. Returns
+/// `Result` rather than a swallowed empty list: a broken git must surface as
+/// an error instead of reading as "this repository has no files".
+#[tauri::command]
+pub async fn get_project_local_repo_tracked_paths(
+    repos_dir: Option<String>,
+    project_dtag: String,
+    clone_url: Option<String>,
+    prefix: Option<String>,
+    state: State<'_, AppState>,
+) -> Result<ProjectLocalRepoPathsInfo, String> {
+    let auth = build_git_auth_config(&state)?;
+    let prefix = prefix
+        .map(|value| value.trim().trim_matches('/').to_string())
+        .filter(|value| !value.is_empty());
+
+    tauri::async_runtime::spawn_blocking(move || {
+        let repo_dir = find_local_repo_dir(repos_dir.as_deref(), &project_dtag, clone_url.as_deref())?
+            .ok_or_else(|| "No local checkout found for this repository.".to_string())?;
+        let mut args = vec!["ls-files", "--cached", "-z"];
+        if let Some(prefix) = prefix.as_deref() {
+            args.push("--");
+            args.push(prefix);
+        }
+        let output = run_git(&args, Some(&repo_dir), &auth)
+            .map_err(|error| format!("Could not list tracked files: {error}"))?;
+        Ok(ProjectLocalRepoPathsInfo {
+            root: repo_dir.display().to_string(),
+            paths: parse_tracked_paths(&output),
+        })
+    })
+    .await
+    .map_err(|error| format!("local repo tracked paths task failed: {error}"))?
+}
+
+#[tauri::command]
+pub async fn open_project_local_repo_file(
+    repos_dir: Option<String>,
+    project_dtag: String,
+    clone_url: Option<String>,
+    path: String,
+    app: AppHandle,
+) -> Result<(), String> {
+    validate_repo_file_path(&path)?;
+    let repo_dir = tauri::async_runtime::spawn_blocking(move || {
+        find_local_repo_dir(repos_dir.as_deref(), &project_dtag, clone_url.as_deref())?
+            .ok_or_else(|| "No local checkout found for this repository.".to_string())
+    })
+    .await
+    .map_err(|error| format!("local repo lookup task failed: {error}"))??;
+    let target = resolve_repo_file(&repo_dir, &path)?;
+    app.opener()
+        .open_path(target.to_string_lossy(), None::<&str>)
+        .map_err(|error| format!("open local repository file: {error}"))
+}
+
+/// Canonicalise a repo-relative file path, refusing anything that leaves the
+/// checkout root. The opener receives an absolute, root-confined path.
+pub(crate) fn resolve_repo_file(
+    repo_dir: &std::path::Path,
+    path: &str,
+) -> Result<std::path::PathBuf, String> {
+    validate_repo_file_path(path)?;
+    let repo_root = repo_dir
+        .canonicalize()
+        .map_err(|error| format!("checkout is not accessible: {error}"))?;
+    let target = repo_root
+        .join(path)
+        .canonicalize()
+        .map_err(|error| format!("file is not accessible: {error}"))?;
+    if !target.starts_with(&repo_root) {
+        return Err("Repository file path must stay inside the checkout.".to_string());
+    }
+    if !target.is_file() {
+        return Err("Repository file path is not a file.".to_string());
+    }
+    Ok(target)
 }
 
 fn normalize_branch_name(branch: &str) -> &str {
