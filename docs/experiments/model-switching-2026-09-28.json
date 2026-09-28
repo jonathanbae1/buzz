@@ -53,6 +53,18 @@
       "rawOutput": "profiles: default/orchestrator/planner/coder/reviewer/scout/designer all appliedUnverified (EOF while parsing an object at line 1 column 1); installer stdout reported ok for all seven profiles and wrote host sidecar; timed_out=false; duration_ms=47819; test failed at profile state assertion"
     },
     {
+      "command": ". ./bin/activate-hermit && cargo test --manifest-path desktop/src-tauri/Cargo.toml --lib live_advisor_round_trip -- --nocapture",
+      "cwd": ".",
+      "result": "passed: advisor medium then restored to baseline low through the Rust save command; all seven profiles verified at each state",
+      "rawOutput": "running 1 test\ntest commands::omp_lanes::readback_probe::live_advisor_round_trip has been running for over 60 seconds\ntest commands::omp_lanes::readback_probe::live_advisor_round_trip ... ok\ntest result: ok. 1 passed; 0 failed; finished in 216.08s"
+    },
+    {
+      "command": ". ./bin/activate-hermit && cargo test --manifest-path desktop/src-tauri/Cargo.toml --lib parses_pretty_printed_profile_records",
+      "cwd": ".",
+      "result": "passed: parser handles consecutive pretty-printed JSON records",
+      "rawOutput": "running 1 test\ntest commands::omp_lanes::profile_record_tests::parses_pretty_printed_profile_records ... ok\ntest result: ok. 1 passed; 0 failed; finished in 0.00s"
+    },
+    {
       "command": "PI_CODING_AGENT_DIR=$HOME/.omp/agent /Users/juwonbae/.local/share/omb/omb config get modelRoles --json",
       "cwd": "/Users/juwonbae/Documents/buzz-wt/model-switching",
       "result": "pass: current restored value observed",
@@ -74,7 +86,7 @@
   "behavioralEvidence": {
     "idleStateGating": "Selectors disable for active turns scoped to this channel and show wait copy. The native UI was not controlled.",
     "nativeAcceptance": "Not completed. The isolated dev bundle identifier is xyz.block.buzz.app.dev.model-switching. Native accessibility process enumeration timed out.",
-    "laneSave": "The Rust save command wrote advisor effort=medium and installer output reported all seven profiles synchronized. The Rust command's verification path failed to parse empty omp config get stdout, leaving profiles marked appliedUnverified. The temporary Rust probe restored the original advisor effort=low and ran the installer; doctor --fast then passed."
+    "laneSave": "An initial live save wrote advisor effort=medium in all seven profiles but returned appliedUnverified because expected_profile_records split pretty-printed JSON at the first newline. The parser now reads both JSON values as a stream. A subsequent live Rust-command round trip saved medium and then the original low value, with all seven profiles marked applied and read back at both states; the original lane file and installed profiles were restored."
   },
   "routingFinding": "interactive effort is not applied by current routing.conf: M_INTERACTIVE uses lane_resolve, so the requested effort would not reach a consumer. The advisor lane is the consumed-effort substitute used in the temporary Rust save probe.",
   "notRun": [

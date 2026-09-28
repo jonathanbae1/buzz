@@ -318,8 +318,34 @@ fn expected_profile_records(repo: &Path, profile: &str) -> Result<(Value, Value)
         .map_err(|e| format!("could not derive expected records: {e}"))?;
     if !output.status.success() { return Err(String::from_utf8_lossy(&output.stderr).trim().to_string()); }
     let text = String::from_utf8_lossy(&output.stdout);
-    let (roles, agents) = text.split_once('\n').ok_or("routing record derivation returned incomplete output")?;
-    Ok((serde_json::from_str(roles).map_err(|e| e.to_string())?, serde_json::from_str(agents).map_err(|e| e.to_string())?))
+    parse_profile_records(&text)
+}
+
+fn parse_profile_records(text: &str) -> Result<(Value, Value), String> {
+    let mut records = serde_json::Deserializer::from_str(text).into_iter::<Value>();
+    let roles = records.next().ok_or("routing record derivation returned no model roles")?
+        .map_err(|e| format!("invalid derived model roles: {e}"))?;
+    let agents = records.next().ok_or("routing record derivation returned no agent overrides")?
+        .map_err(|e| format!("invalid derived agent overrides: {e}"))?;
+    if records.next().is_some() {
+        return Err("routing record derivation returned extra JSON values".into());
+    }
+    Ok((roles, agents))
+}
+#[cfg(test)]
+mod profile_record_tests {
+    use super::parse_profile_records;
+    use serde_json::json;
+
+    #[test]
+    fn parses_pretty_printed_profile_records() {
+        let (roles, agents) = parse_profile_records(
+            "{\n  \"advisor\": \"model:medium\"\n}\n{\n  \"coder\": \"model\"\n}\n",
+        ).unwrap();
+
+        assert_eq!(roles, json!({"advisor": "model:medium"}));
+        assert_eq!(agents, json!({"coder": "model"}));
+    }
 }
 
 fn profile_config_dir(config_root: &Path, profile: &str) -> PathBuf {
