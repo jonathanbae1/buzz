@@ -157,6 +157,102 @@ pub struct PermissionAnswer {
 /// outcome, so expiry refuses the tool call — it never approves it, which is
 /// exactly what the removed auto-answer did.
 pub const PERMISSION_ANSWER_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(600);
+/// The three selector categories a `set_session_config` frame may address.
+///
+/// The wire string is the request's `category` field, and it is deliberately
+/// the *category* rather than a config id: the adapter defines the config id
+/// (Claude Code spells its effort option `effort`, omp spells it `thinking`),
+/// so resolving by category is what lets one path serve every adapter.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ConfigCategory {
+    Mode,
+    Model,
+    ThoughtLevel,
+}
+
+impl ConfigCategory {
+    /// Parse the frame's `category` field. An unknown value is a refusal,
+    /// never a silently ignored frame.
+    pub fn parse(raw: &str) -> Option<Self> {
+        match raw {
+            "mode" => Some(Self::Mode),
+            "model" => Some(Self::Model),
+            "thought_level" => Some(Self::ThoughtLevel),
+            _ => None,
+        }
+    }
+
+    /// The ACP `configOptions[].category` value this selector reads.
+    pub fn option_category(self) -> &'static str {
+        match self {
+            Self::Mode => "mode",
+            Self::Model => "model",
+            // Adapters that predate the canonical category emitted `effort`;
+            // `resolve_category_config_id` falls back to that string.
+            Self::ThoughtLevel => "thought_level",
+        }
+    }
+
+    pub fn as_wire_str(self) -> &'static str {
+        match self {
+            Self::Mode => "mode",
+            Self::Model => "model",
+            Self::ThoughtLevel => "thought_level",
+        }
+    }
+}
+
+/// Why a `session/set_config_option` write failed.
+///
+/// `Rejected` and `Unsupported` are distinct on purpose: the first means the
+/// adapter refused a value it knows about (the prior value stands), the second
+/// means the adapter advertises no option for this category at all, so nothing
+/// could be written. `Transport` means the stdio stream may be poisoned and the
+/// caller must respawn rather than reuse the client.
+#[derive(Debug)]
+pub enum SessionConfigError {
+    /// The adapter returned an application-level error. Nothing was mutated.
+    Rejected { message: String },
+    /// No advertised `configOptions` entry carries this category, so the
+    /// selector is not writable on this adapter.
+    Unsupported { category: String },
+    /// The value is not in the advertised option list for this category.
+    InvalidValue { value: String, offered: Vec<String> },
+    /// Transport-class failure — the client must not be reused.
+    Transport(AcpError),
+}
+
+impl std::fmt::Display for SessionConfigError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Rejected { message } => write!(f, "adapter rejected the value: {message}"),
+            Self::Unsupported { category } => {
+                write!(f, "the adapter advertises no {category} config option")
+            }
+            Self::InvalidValue { value, offered } => write!(
+                f,
+                "{value} is not an advertised value (offered: {})",
+                offered.join(", ")
+            ),
+            Self::Transport(error) => write!(f, "transport error: {error}"),
+        }
+    }
+}
+
+/// A config write requested by the main loop for a live session.
+///
+/// Delivered to the read loop over a per-turn channel, exactly like
+/// [`crate::pool::SteerRequest`], because only the read loop owns the agent's
+/// reader while a prompt is in flight. Unlike a steer, the write neither
+/// cancels the prompt nor starts a new turn: it is a plain JSON-RPC request
+/// whose response is routed back to `ack_tx` by id.
+#[derive(Debug)]
+pub struct SessionConfigRequest {
+    pub category: ConfigCategory,
+    pub value: String,
+    /// Reports the write outcome to whoever is awaiting it.
+    pub ack_tx: tokio::sync::oneshot::Sender<Result<serde_json::Value, SessionConfigError>>,
+}
 
 /// Errors that can occur in the ACP client.
 #[derive(Debug, thiserror::Error)]
@@ -203,6 +299,22 @@ fn agent_error_from_json(error: &serde_json::Value) -> AcpError {
         None => error.to_string(),
     };
     AcpError::AgentError { code, message }
+}
+
+/// Render an ACP error response as a message for a refusal frame.
+///
+/// The numeric code is preserved when present so the desktop can distinguish a
+/// protocol-level refusal from a business one, and the whole JSON is used when
+/// no `message` member exists — a provider-specific `data` payload is then not
+/// lost, which is the difference between a diagnosable refusal and "rejected".
+fn agent_error_message(error: &serde_json::Value) -> String {
+    match error.get("message").and_then(|m| m.as_str()) {
+        Some(message) => match error.get("code").and_then(|c| c.as_i64()) {
+            Some(code) => format!("{message} (code {code})"),
+            None => message.to_string(),
+        },
+        None => error.to_string(),
+    }
 }
 
 fn build_initialize_params() -> serde_json::Value {
@@ -304,6 +416,25 @@ pub struct AcpClient {
     /// outside of a goose-native turn — the read loop's steer arm is
     /// disabled in that case.
     steer_rx: Option<tokio::sync::mpsc::Receiver<crate::pool::SteerRequest>>,
+    /// Per-turn channel for exact-session config writes (`session/set_config_option`)
+    /// requested while the prompt is in flight. Installed by
+    /// [`install_config_rx`](Self::install_config_rx) at dispatch and consumed
+    /// (via `take()`) by the read loop, which owns the reader for the turn's
+    /// duration. Separate from `steer_rx` because a config write is not a
+    /// message: it must not be framed as a steer, must not cancel, and must not
+    /// start a new turn. `None` outside a controllable turn.
+    config_rx: Option<tokio::sync::mpsc::Receiver<SessionConfigRequest>>,
+    /// The advertised `configOptions` array of the session (or sessions) this
+    /// client created, as last seen.
+    ///
+    /// This is the harness's own authoritative projection for resolving a
+    /// selector's `configId` by *category* and for rejecting an unadvertised
+    /// value *before* any mutation. It is seeded from `session/new` and replaced
+    /// by the adapter's own `config_option_update` push, which is the only other
+    /// statement of the running values. Config ids are stable per adapter for
+    /// the life of a session, but the values behind them are not, so this is
+    /// refreshed rather than cached once.
+    session_config_options: Option<serde_json::Value>,
     /// Usage tracker for goose/buzz-agent's cumulative notification format.
     goose_usage: UsageTracker,
     /// Per-turn prompt-response usage and Claude's optional cumulative cost.
@@ -659,6 +790,8 @@ impl AcpClient {
             active_run_id: None,
             steering_supported: false,
             steer_rx: None,
+            config_rx: None,
+            session_config_options: None,
             goose_usage: UsageTracker::default(),
             standard_usage: StandardUsageTracker::default(),
             standard_adapter,
@@ -789,6 +922,11 @@ impl AcpClient {
             .ok_or_else(|| AcpError::Protocol("session/new response missing sessionId".into()))?
             .to_owned();
         tracing::info!(target: "acp::session", "session created: {session_id}");
+        // Seed the harness's own projection from the same response the desktop
+        // reads. A selector's configId is resolved by CATEGORY from here, never
+        // from a literal, because adapters disagree on the id (omp advertises
+        // `thinking` for `thought_level`) and on the key (`configId` vs `id`).
+        self.session_config_options = result.get("configOptions").cloned();
         Ok(SessionNewResponse {
             session_id,
             raw: result,
@@ -856,6 +994,134 @@ impl AcpClient {
             "modelId": model_id,
         });
         self.send_request("session/set_model", params).await
+    }
+
+    /// Resolve the advertised `configId` for a selector category.
+    ///
+    /// The lookup is by *category*, never by a literal id: omp advertises
+    /// `thinking` for category `thought_level`, claude-agent-acp advertises
+    /// `effort`, and both spell the id under `configId` or `id`. `thought_level`
+    /// falls back to the legacy invented category `effort` only when the
+    /// canonical one is entirely absent, so an advertised-but-unset
+    /// `thought_level` entry is still selected rather than flipping the write
+    /// route to a different option.
+    pub fn resolve_category_config_id(&self, category: ConfigCategory) -> Option<String> {
+        let options = self.session_config_options.as_ref()?.as_array()?;
+        let by_category = |want: &str| {
+            options.iter().find_map(|opt| {
+                (opt.get("category").and_then(|c| c.as_str()) == Some(want))
+                    .then(|| {
+                        opt.get("configId")
+                            .or_else(|| opt.get("id"))
+                            .and_then(|v| v.as_str())
+                            .map(str::to_string)
+                    })
+                    .flatten()
+            })
+        };
+        match category {
+            ConfigCategory::ThoughtLevel => {
+                by_category("thought_level").or_else(|| by_category("effort"))
+            }
+            other => by_category(other.option_category()),
+        }
+    }
+
+    /// The advertised values for a selector category, in adapter order.
+    ///
+    /// Empty when the category is not advertised; the caller turns that into an
+    /// `Unsupported` refusal rather than writing a value nothing offered.
+    pub fn category_option_values(&self, category: ConfigCategory) -> Vec<String> {
+        let Some(options) = self.session_config_options.as_ref().and_then(|v| v.as_array())
+        else {
+            return Vec::new();
+        };
+        let wanted: &[&str] = match category {
+            ConfigCategory::ThoughtLevel => &["thought_level", "effort"],
+            other => &[other.option_category()],
+        };
+        for want in wanted {
+            let found = options.iter().find(|opt| {
+                opt.get("category").and_then(|c| c.as_str()) == Some(*want)
+            });
+            if let Some(opt) = found {
+                return opt
+                    .get("options")
+                    .and_then(|v| v.as_array())
+                    .map(|arr| {
+                        arr.iter()
+                            .filter_map(|o| o.get("value").and_then(|v| v.as_str()))
+                            .map(str::to_string)
+                            .collect()
+                    })
+                    .unwrap_or_default();
+            }
+        }
+        Vec::new()
+    }
+
+    /// Apply a config write to an exact session, validating before mutating.
+    ///
+    /// Validation order is load-bearing: the category must be advertised and the
+    /// value must be in that option's advertised list *before* the request is
+    /// written. A rejected value therefore leaves both the session and this
+    /// client's projection untouched — the failure mode the plan's check 19
+    /// asserts, and the reason an unsupported effort cannot be silently clamped.
+    ///
+    /// `categories_offered` overrides the internal projection when the caller
+    /// holds a fresher snapshot (the main loop reads the cached capabilities the
+    /// desktop also reads); pass `None` to use the client's own copy.
+    pub async fn session_apply_config_option(
+        &mut self,
+        session_id: &str,
+        category: ConfigCategory,
+        value: &str,
+    ) -> Result<serde_json::Value, SessionConfigError> {
+        let Some(config_id) = self.resolve_category_config_id(category) else {
+            return Err(SessionConfigError::Unsupported {
+                category: category.as_wire_str().to_string(),
+            });
+        };
+        let offered = self.category_option_values(category);
+        // An adapter may advertise no `options` list at all (the value is then
+        // open-ended, e.g. a free-form model string). Only enumerate-and-reject
+        // when the adapter actually enumerated something.
+        if !offered.is_empty() && !offered.iter().any(|o| o == value) {
+            return Err(SessionConfigError::InvalidValue {
+                value: value.to_string(),
+                offered,
+            });
+        }
+
+        let result = tokio::time::timeout(Self::CONFIG_WRITE_TIMEOUT, async {
+            self.session_set_config_option(session_id, &config_id, value)
+                .await
+        })
+        .await;
+
+        match result {
+            Ok(Ok(value)) => {
+                tracing::info!(
+                    target: "acp::config",
+                    "applied {category:?} = {value:?} via configId={config_id} on session {session_id}"
+                );
+                // The adapter echoes the refreshed `configOptions`. Adopting it
+                // keeps the projection authoritative for the next validation
+                // instead of trusting the locally-written value.
+                if let Some(options) = value.get("configOptions") {
+                    if !options.is_null() {
+                        self.session_config_options = Some(options.clone());
+                    }
+                }
+                Ok(value)
+            }
+            Ok(Err(error)) => Err(SessionConfigError::Rejected {
+                message: error.to_string(),
+            }),
+            Err(_) => Err(SessionConfigError::Transport(AcpError::Timeout(
+                Self::CONFIG_WRITE_TIMEOUT,
+            ))),
+        }
     }
 
     /// Send `session/prompt` with idle-based timeout instead of wall-clock.
@@ -1047,6 +1313,47 @@ impl AcpClient {
     /// Idempotent — safe to call when `steer_rx` is already `None`.
     pub fn clear_steer_rx(&mut self) {
         self.steer_rx = None;
+    }
+
+    /// Install the per-turn receiver for exact-session config writes.
+    ///
+    /// Called by the dispatch path with the same lifetime as
+    /// [`install_steer_rx`](Self::install_steer_rx); the matching `Sender` is
+    /// stored in `TaskMeta.config_tx`. Panics on a stacked receiver, since one
+    /// `AcpClient` serves exactly one turn at a time and stacking would
+    /// misroute a write into the wrong turn's reader.
+    pub fn install_config_rx(
+        &mut self,
+        rx: tokio::sync::mpsc::Receiver<SessionConfigRequest>,
+    ) {
+        assert!(
+            self.config_rx.is_none(),
+            "install_config_rx: previous turn's receiver was not consumed — \
+             stacking receivers would misroute config writes across turns"
+        );
+        self.config_rx = Some(rx);
+    }
+
+    /// Clear any installed config receiver without consuming it.
+    ///
+    /// Called on every exit path of the prompt task alongside
+    /// [`clear_steer_rx`](Self::clear_steer_rx) so the `is_none()` invariant
+    /// holds for the next dispatch. Idempotent.
+    pub fn clear_config_rx(&mut self) {
+        self.config_rx = None;
+    }
+
+    /// Returns `true` if no config receiver is currently installed.
+    #[cfg(test)]
+    pub fn config_rx_is_none(&self) -> bool {
+        self.config_rx.is_none()
+    }
+
+    /// Test seam: the advertised configOptions this client holds, so tests can
+    /// assert that a refused write left the projection untouched.
+    #[cfg(test)]
+    pub fn session_config_options_for_test(&self) -> Option<serde_json::Value> {
+        self.session_config_options.clone()
     }
 
     /// Returns `true` if no steer receiver is currently installed.
@@ -1242,6 +1549,15 @@ impl AcpClient {
 
     /// Default timeout for non-prompt RPCs (initialize, session/new, etc.).
     const REQUEST_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(60);
+
+    /// Deadline for one `session/set_config_option` write.
+    ///
+    /// Deliberately shorter than [`Self::REQUEST_TIMEOUT`]: a selector write is
+    /// a bounded mutation of live state and the caller has a UI waiting on it,
+    /// while `REQUEST_TIMEOUT` guards general requests like `session/new`. A
+    /// write that outlives this is treated as a transport failure so the caller
+    /// respawns rather than reusing a possibly-poisoned stream.
+    const CONFIG_WRITE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
 
     /// Send a JSON-RPC request and wait for the matching response.
     ///
@@ -1487,6 +1803,23 @@ impl AcpClient {
         // Dropped at scope exit (return paths drain `pending_steer` first
         // so the ack_tx oneshot is never leaked silently).
         let mut steer_rx = self.steer_rx.take();
+        // Config-write receiver for this turn, taken for the same reason: the
+        // read loop owns the reader, so a mid-turn `set_config_option` must be
+        // written from here. This one is deliberately NOT gated on a
+        // pending-write flag — a config write is a single JSON-RPC request with
+        // no withhold/ack protocol, so consecutive writes are safe.
+        let mut config_rx = self.config_rx.take();
+
+        // In-flight config writes: `(jsonrpc id, config_id, value, ack_tx)`.
+        // Unlike `pending_steer` there is no single-slot gate — several writes
+        // may be outstanding at once and each is routed back by id. Drained on
+        // every return path so no caller is left waiting on a oneshot.
+        let mut pending_configs: Vec<(
+            u64,
+            String,
+            String,
+            tokio::sync::oneshot::Sender<Result<serde_json::Value, SessionConfigError>>,
+        )> = Vec::new();
 
         // Same shape for the permission answer channel: the read loop owns the
         // writer for the turn, so an answer must reach it here. Taken into a
@@ -1702,6 +2035,69 @@ impl AcpClient {
                     // response or the steer response next.
                     None
                 }
+                // Exact-session config write (`session/set_config_option`).
+                // Validation happens here, before the write, so a rejected
+                // value leaves both the session and our projection untouched.
+                // Not gated on `pending_steer`: a config write is an ordinary
+                // JSON-RPC request with no withhold/ack protocol, so it can be
+                // written while a steer request is outstanding.
+                Some(request) = async {
+                    match config_rx.as_mut() {
+                        Some(rx) => rx.recv().await,
+                        None => None,
+                    }
+                } => {
+                    let SessionConfigRequest { category, value, ack_tx } = request;
+                    match self.resolve_category_config_id(category) {
+                        None => {
+                            let _ = ack_tx.send(Err(SessionConfigError::Unsupported {
+                                category: category.as_wire_str().to_string(),
+                            }));
+                        }
+                        Some(config_id) => {
+                            let offered = self.category_option_values(category);
+                            // An adapter that enumerates the option values gets
+                            // rejected here on anything outside the list, which
+                            // is the only way to prevent a silent clamp; one
+                            // that advertises no list is treated as open.
+                            if !offered.is_empty() && !offered.iter().any(|o| o == &value) {
+                                let _ = ack_tx.send(Err(SessionConfigError::InvalidValue {
+                                    value: value.clone(),
+                                    offered,
+                                }));
+                            } else {
+                                let id = self.next_id;
+                                self.next_id += 1;
+                                let msg = serde_json::json!({
+                                    "jsonrpc": "2.0",
+                                    "id": id,
+                                    "method": "session/set_config_option",
+                                    "params": {
+                                        "sessionId": session_id,
+                                        "configId": config_id,
+                                        "value": value,
+                                    },
+                                });
+                                tracing::debug!(
+                                    target: "acp::wire",
+                                    "→ {}",
+                                    serde_json::to_string(&msg).unwrap_or_default()
+                                );
+                                match self.write_ndjson(&msg).await {
+                                    Ok(()) => pending_configs.push((id, config_id, value, ack_tx)),
+                                    Err(e) => {
+                                        tracing::warn!(
+                                            "config write failed (configId={config_id}): {e}"
+                                        );
+                                        let _ = ack_tx.send(Err(SessionConfigError::Transport(e)));
+                                    }
+                                }
+                            }
+                        }
+                    }
+                    // No reader line consumed; loop to re-evaluate deadlines.
+                    None
+                }
                 _ = tokio::time::sleep_until(next_deadline) => {
                     // The pre-select check at the top of the next iteration
                     // would catch this anyway, but firing the deadline arm
@@ -1794,6 +2190,43 @@ impl AcpClient {
                     // share the `no method` guard.
                     if let Some(id) = msg.get("id") {
                         if msg.get("method").is_none() {
+                            // Config writes first: they are keyed by their own
+                            // ids and must never be mistaken for the prompt
+                            // response, which would end the turn.
+                            if let Some(index) = pending_configs
+                                .iter()
+                                .position(|(config_id, ..)| *id == serde_json::json!(*config_id))
+                            {
+                                let (_, config_id, value, ack_tx) =
+                                    pending_configs.remove(index);
+                                let ack = match msg.get("error") {
+                                    Some(error) => Err(SessionConfigError::Rejected {
+                                        message: agent_error_message(error),
+                                    }),
+                                    None => {
+                                        tracing::info!(
+                                            target: "acp::config",
+                                            "adapter accepted configId={config_id} = {value:?} \
+                                             on session {session_id}"
+                                        );
+                                        // Adopt the adapter's refreshed options
+                                        // so the next validation reads the
+                                        // adapter's own statement of the
+                                        // running values, not our local guess.
+                                        if let Some(options) =
+                                            msg.pointer("/result/configOptions")
+                                        {
+                                            if !options.is_null() {
+                                                self.session_config_options =
+                                                    Some(options.clone());
+                                            }
+                                        }
+                                        Ok(msg["result"].clone())
+                                    }
+                                };
+                                let _ = ack_tx.send(ack);
+                                continue;
+                            }
                             if let Some((steer_id, _, _)) = pending_steer.as_ref() {
                                 if *id == serde_json::json!(*steer_id) {
                                     // Take the ack_tx out and route the

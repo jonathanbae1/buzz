@@ -90,6 +90,14 @@ pub struct TaskMeta {
     /// tasks and for prompt tasks on an agent with no observer attached to
     /// answer requests.
     pub permission_tx: Option<tokio::sync::mpsc::Sender<PermissionAnswer>>,
+    /// Config-write channel for an exact-session `set_config_option` against the
+    /// in-flight turn's live session. `None` for heartbeat tasks and for turns
+    /// whose worker does not expose a writable config surface.
+    ///
+    /// A config write is **not** a control signal: it neither cancels nor
+    /// requeues, so it needs its own channel rather than a `ControlSignal`
+    /// variant, and it must reach the read loop (the only owner of the reader).
+    pub config_tx: Option<tokio::sync::mpsc::Sender<crate::acp::SessionConfigRequest>>,
     /// Successful non-cancelling steers acknowledged while this task owned the
     /// live session. The session ID prevents a late ack from contaminating a
     /// replacement session after task return.
@@ -347,6 +355,12 @@ pub struct AgentPool {
     result_rx: mpsc::UnboundedReceiver<PromptResult>,
     command_result_tx: mpsc::UnboundedSender<AgentCommandResult>,
     command_result_rx: mpsc::UnboundedReceiver<AgentCommandResult>,
+    /// Completed out-of-band config writes whose worker must go back in its slot.
+    /// Writes are applied against a checked-out worker (see
+    /// [`AgentPool::route_session_config`]), so the pool must be told when the
+    /// slot can be reclaimed or the agent leaks out of the pool.
+    config_return_tx: mpsc::UnboundedSender<AgentConfigReturn>,
+    config_return_rx: mpsc::UnboundedReceiver<AgentConfigReturn>,
     pub join_set: JoinSet<()>,
     task_map: HashMap<tokio::task::Id, TaskMeta>,
     /// Authoritative directory of which worker most recently owned each session
@@ -385,6 +399,15 @@ pub enum PermissionAnswerError {
     /// still in flight, or the read loop has already gone.
     #[error("permission answer channel refused the answer: {0}")]
     Undeliverable(String),
+}
+/// A worker that finished an out-of-band config write and must be reinserted.
+///
+/// The write's outcome travels separately (the caller's own oneshot), because the
+/// session-scoped cone admitted here is fully covered by those two facts: the
+/// intrinsic result and the new projection, both kept on the frames the caller
+/// already correlates. This payload exists so the pool can reclaim the slot.
+pub struct AgentConfigReturn {
+    pub agent: OwnedAgent,
 }
 
 pub struct AgentCommandResult {
@@ -881,6 +904,7 @@ impl AgentPool {
     pub fn from_slots(slots: Vec<Option<OwnedAgent>>) -> Self {
         let (result_tx, result_rx) = mpsc::unbounded_channel();
         let (command_result_tx, command_result_rx) = mpsc::unbounded_channel();
+        let (config_return_tx, config_return_rx) = mpsc::unbounded_channel();
         let mut session_scopes = HashMap::new();
         for agent in slots.iter().flatten() {
             for (scope, session_id) in &agent.state.sessions {
@@ -893,6 +917,8 @@ impl AgentPool {
             result_rx,
             command_result_tx,
             command_result_rx,
+            config_return_tx,
+            config_return_rx,
             join_set: JoinSet::new(),
             task_map: HashMap::new(),
             session_owners: HashMap::new(),
@@ -1060,6 +1086,103 @@ impl AgentPool {
         self.command_result_tx.clone()
     }
 
+    /// Route an exact-session config write to whichever surface owns that session.
+    ///
+    /// The pool owns the ack channel so the caller only has to await it and emit
+    /// the result frame; the write itself is delivered either into the in-flight
+    /// turn's read loop (the only writer while the reader is held) or applied by
+    /// the caller against a checked-out idle worker.
+    ///
+    /// Two paths, chosen by whether a turn is in flight for the session's scope:
+    ///
+    /// * **Busy** — the write rides `TaskMeta.config_tx` into the turn's read
+    ///   loop. Deliberately *borrow*-based: taking the worker out of its slot
+    ///   would serialize every in-flight turn behind a config write.
+    /// * **Idle** — nobody owns the reader, so the worker is checked out and the
+    ///   caller applies the write against its own `AcpClient`. Checking out is
+    ///   what makes it race-free: the slot is empty while the write runs, so a
+    ///   dispatch cannot claim the same worker mid-write. The caller returns it
+    ///   through [`AgentPool::config_return_tx`].
+    ///
+    /// The owning scope comes from the pool's own maps, never from the client: a
+    /// client-supplied session id is a lookup key, not an authorization.
+    pub fn route_session_config(
+        &mut self,
+        session_id: &str,
+        category: crate::acp::ConfigCategory,
+        value: String,
+    ) -> Result<ConfigRouteOutcome, AgentCommandTarget> {
+        let owners: Vec<usize> = self
+            .agents
+            .iter()
+            .enumerate()
+            .filter_map(|(index, slot)| {
+                slot.as_ref().and_then(|agent| {
+                    agent
+                        .state
+                        .sessions
+                        .values()
+                        .any(|id| id == session_id)
+                        .then_some(index)
+                })
+            })
+            .collect();
+        if owners.len() > 1 {
+            return Err(AgentCommandTarget::Ambiguous);
+        }
+        let Some(scope) = self.session_scopes.get(session_id).cloned() else {
+            return Err(AgentCommandTarget::StaleSession);
+        };
+
+        // Busy path: an in-flight task for this scope owns the reader.
+        if self
+            .task_map
+            .values()
+            .any(|m| m.scope.as_ref() == Some(&scope))
+        {
+            let meta = self
+                .task_map
+                .values_mut()
+                .find(|m| m.scope.as_ref() == Some(&scope))
+                .expect("just matched");
+            let Some(tx) = meta.config_tx.as_ref() else {
+                // The turn cannot accept config writes (no channel installed).
+                return Err(AgentCommandTarget::ActiveTurn);
+            };
+            let (ack_tx, ack_rx) = tokio::sync::oneshot::channel();
+            let request = crate::acp::SessionConfigRequest {
+                category,
+                value,
+                ack_tx,
+            };
+            // A full channel means a write is already queued for this turn: a
+            // refusal the caller reports, never a silent drop. Dropping the
+            // request there also drops `ack_tx`, so nothing waits on it.
+            tx.try_send(request)
+                .map_err(|_| AgentCommandTarget::ActiveTurn)?;
+            return Ok(ConfigRouteOutcome::Busy { ack_rx });
+        }
+
+        // Idle path: check the owning worker out so the write cannot race a dispatch.
+        let Some(index) = owners.first().copied() else {
+            return Err(AgentCommandTarget::StaleSession);
+        };
+        let Some(agent) = self.agents[index].take() else {
+            return Err(AgentCommandTarget::ActiveTurn);
+        };
+        Ok(ConfigRouteOutcome::Idle {
+            agent,
+            scope,
+            category,
+            value,
+        })
+    }
+
+    /// Sender for returning a worker after an out-of-band config write.
+    pub fn config_return_tx(&self) -> mpsc::UnboundedSender<AgentConfigReturn> {
+        self.config_return_tx.clone()
+    }
+
     /// Count of agents that are alive: idle OR checked out (have a task_map entry).
     ///
     /// Used to detect when all agents have exited so the caller can respawn.
@@ -1067,6 +1190,27 @@ impl AgentPool {
         let idle = self.agents.iter().filter(|s| s.is_some()).count();
         let checked_out = self.task_map.len();
         idle + checked_out
+    }
+
+    /// Test seam: the agent slots, so tests can assert a worker was returned
+    /// after an out-of-band write instead of leaking out of the pool.
+    #[cfg(test)]
+    pub(crate) fn agents_for_test(&self) -> &Vec<Option<OwnedAgent>> {
+        &self.agents
+    }
+
+    /// Test seam: run the main loop's config-return arm (drain + reinsert).
+    #[cfg(test)]
+    pub(crate) fn drain_config_returns_for_test(&mut self) {
+        while let Ok(returned) = self.config_return_rx.try_recv() {
+            self.return_agent(returned.agent);
+        }
+    }
+
+    /// Test seam: append a worker in the next free slot.
+    #[cfg(test)]
+    pub(crate) fn push_agent_for_test(&mut self, agent: OwnedAgent) {
+        self.agents.push(Some(agent));
     }
 
     pub fn task_map(&self) -> &HashMap<tokio::task::Id, TaskMeta> {
@@ -1213,11 +1357,13 @@ impl AgentPool {
     ) -> (
         &mut mpsc::UnboundedReceiver<PromptResult>,
         &mut mpsc::UnboundedReceiver<AgentCommandResult>,
+        &mut mpsc::UnboundedReceiver<AgentConfigReturn>,
         &mut JoinSet<()>,
     ) {
         (
             &mut self.result_rx,
             &mut self.command_result_rx,
+            &mut self.config_return_rx,
             &mut self.join_set,
         )
     }
@@ -1380,6 +1526,26 @@ impl AgentPool {
         self.held_since.remove(&scope);
         IdleSwitchResult::Switched
     }
+}
+
+/// Where [`AgentPool::route_session_config`] sent a config write.
+///
+/// `Busy` means it is on its way into the in-flight turn's read loop; `Idle`
+/// hands the caller a checked-out worker to apply it against. Either way
+/// `ack_rx` resolves exactly once with the adapter's verdict, so the caller can
+/// emit one correlated result frame per request.
+pub enum ConfigRouteOutcome {
+    Busy {
+        ack_rx: tokio::sync::oneshot::Receiver<
+            Result<serde_json::Value, crate::acp::SessionConfigError>,
+        >,
+    },
+    Idle {
+        agent: OwnedAgent,
+        scope: SessionScope,
+        category: crate::acp::ConfigCategory,
+        value: String,
+    },
 }
 
 /// Outcome of [`AgentPool::hold_decision`] for one queued batch.
@@ -2393,6 +2559,7 @@ fn send_prompt_result(
 ) {
     agent.acp.clear_steer_rx();
     agent.acp.clear_permission_answer_rx();
+    agent.acp.clear_config_rx();
     let _ = result_tx.send(PromptResult {
         agent,
         source,
@@ -7974,6 +8141,7 @@ printf '%s\n' '{{"jsonrpc":"2.0","id":0,"result":{{"stopReason":"end_turn"}}}}'"
                 control_tx: None,
                 steer_tx: None,
                 permission_tx: None,
+                config_tx: None,
                 successful_steer_deliveries: HashSet::new(),
             },
         );

@@ -41,7 +41,8 @@ use filter::SubscriptionRule;
 use futures_util::FutureExt;
 use nostr::{PublicKey, ToBech32};
 use pool::{
-    AgentCommandResult, AgentCommandTarget, AgentPool, ControlSignal, IdleSwitchResult, OwnedAgent,
+    AgentCommandResult, AgentCommandTarget, AgentConfigReturn, AgentPool, ConfigRouteOutcome,
+    ControlSignal, IdleSwitchResult, OwnedAgent,
     PromptContext, PromptOutcome, PromptResult, PromptSource, SessionState, TimeoutKind,
 };
 use pool_lifecycle::PoolLifecycle;
@@ -1622,6 +1623,9 @@ fn handle_relay_observer_control_event(
         Some("permission_response") => {
             handle_permission_response_control(&payload, pool, observer);
         }
+        Some("set_session_config") => {
+            handle_set_session_config_control(&payload, pool, observer);
+        }
         Some("publish_project_owner_announcements") => {
             handle_publish_project_owner_announcements_control(
                 &payload,
@@ -1863,6 +1867,234 @@ fn handle_dispatch_command_control(
         Some(scope.channel_id()),
         None,
         None,
+    );
+}
+
+/// Handle a `set_session_config` control frame — the exact-session selector
+/// write used by the per-conversation mode/model/thinking picker.
+///
+/// This is deliberately NOT `switch_model`. That frame is channel-addressed and
+/// its two paths both destroy the session (the idle path sets `desired_model`
+/// and invalidates; the busy path cancels, invalidates and requeues), which is
+/// the opposite of a one-off selector change. This arm is session-addressed and
+/// mutates the live session in place through `session/set_config_option`: no
+/// agent-level model state is touched, no session is invalidated, no prompt is
+/// cancelled, and a sibling session in the same process is unaffected.
+///
+/// Addressing mirrors `dispatch_command`: the client-supplied `sessionId` is
+/// only a lookup key, the scope is resolved from the pool's own maps, and an id
+/// that no longer resolves is refused with `stale_session` rather than retried.
+fn handle_set_session_config_control(
+    payload: &serde_json::Value,
+    pool: &mut AgentPool,
+    observer: Option<&observer::ObserverHandle>,
+) {
+    let request_id = payload
+        .get("requestId")
+        .and_then(|value| value.as_str())
+        .filter(|value| !value.trim().is_empty())
+        .unwrap_or_default()
+        .to_string();
+    let session_id = payload
+        .get("sessionId")
+        .and_then(|value| value.as_str())
+        .filter(|value| !value.trim().is_empty())
+        .map(str::to_string);
+    let category_raw = payload
+        .get("category")
+        .and_then(|value| value.as_str())
+        .unwrap_or_default();
+    let value = payload
+        .get("value")
+        .and_then(|value| value.as_str())
+        .map(str::to_string);
+
+    let Some(session_id) = session_id else {
+        emit_set_session_config_result(
+            observer,
+            &request_id,
+            None,
+            "error",
+            None,
+            Some("missing sessionId"),
+        );
+        return;
+    };
+    let Some(category) = crate::acp::ConfigCategory::parse(category_raw) else {
+        // An unknown category is refused loudly; treating it as "no selector
+        // named that" would let a desktop typo look like a successful no-op.
+        emit_set_session_config_result(
+            observer,
+            &request_id,
+            Some(&session_id),
+            "error",
+            None,
+            Some(&format!("unknown category: {category_raw}")),
+        );
+        return;
+    };
+    let Some(value) = value.filter(|v| !v.trim().is_empty()) else {
+        emit_set_session_config_result(
+            observer,
+            &request_id,
+            Some(&session_id),
+            "error",
+            None,
+            Some("missing value"),
+        );
+        return;
+    };
+
+    let route = match pool.route_session_config(&session_id, category, value.clone()) {
+        Ok(route) => route,
+        Err(AgentCommandTarget::Ambiguous) => {
+            emit_set_session_config_result(
+                observer,
+                &request_id,
+                Some(&session_id),
+                "ambiguous_target",
+                None,
+                None,
+            );
+            return;
+        }
+        Err(AgentCommandTarget::ActiveTurn) => {
+            emit_set_session_config_result(
+                observer,
+                &request_id,
+                Some(&session_id),
+                "active_turn",
+                None,
+                None,
+            );
+            return;
+        }
+        Err(AgentCommandTarget::StaleSession) => {
+            emit_set_session_config_result(
+                observer,
+                &request_id,
+                Some(&session_id),
+                "stale_session",
+                None,
+                None,
+            );
+            return;
+        }
+    };
+
+    match route {
+        // Busy: the in-flight turn's read loop writes it and resolves the ack.
+        // The result frame is emitted from a watcher so the main loop is never
+        // blocked on a selector write.
+        ConfigRouteOutcome::Busy { ack_rx } => {
+            let observer = observer.cloned();
+            let request_id = request_id.clone();
+            let session_id_for_task = session_id.clone();
+            let category_for_task = category;
+            tokio::spawn(async move {
+                let (status, error) = match ack_rx.await {
+                    Ok(Ok(_)) => ("applied", None),
+                    Ok(Err(failure)) => ("rejected", Some(failure.to_string())),
+                    // The sender dropped without answering: the turn ended mid-write
+                    // (or the client was respawned). Report it rather than hang.
+                    Err(_) => ("turn_ended", Some("no reply from the session".to_string())),
+                };
+                emit_set_session_config_result(
+                    observer.as_ref(),
+                    &request_id,
+                    Some(&session_id_for_task),
+                    status,
+                    Some(category_for_task),
+                    error.as_deref(),
+                );
+            });
+        }
+        // Idle: apply against the checked-out worker, then hand it back so the
+        // pool reclaims the slot. This path is why `route_session_config`
+        // checks the worker out instead of borrowing it.
+        ConfigRouteOutcome::Idle {
+            mut agent,
+            scope,
+            category: idle_category,
+            value: idle_value,
+        } => {
+            let return_tx = pool.config_return_tx();
+            let observer = observer.cloned();
+            let request_id = request_id.clone();
+            let session_id_for_task = session_id.clone();
+            let channel_id = scope.channel_id();
+            agent.acp.set_observer_context(observer::ObserverContext {
+                channel_id: Some(channel_id.to_string()),
+                session_id: Some(session_id_for_task.clone()),
+                turn_id: None,
+                started_at: Some(chrono::Utc::now().to_rfc3339()),
+            });
+            tokio::spawn(async move {
+                let category = idle_category;
+                let outcome = agent
+                    .acp
+                    .session_apply_config_option(&session_id_for_task, category, &idle_value)
+                    .await;
+                // Hand the worker back FIRST: failing to answer the caller must
+                // not also cost the pool its slot.
+                let _ = return_tx.send(AgentConfigReturn { agent });
+                let (status, error) = match outcome {
+                    Ok(_) => ("applied", None),
+                    Err(failure) => ("rejected", Some(failure.to_string())),
+                };
+                emit_set_session_config_result(
+                    observer.as_ref(),
+                    &request_id,
+                    Some(&session_id_for_task),
+                    status,
+                    Some(category),
+                    error.as_deref(),
+                );
+            });
+        }
+    }
+}
+
+/// Emit the terminal result frame for a `set_session_config` request.
+///
+/// Carries both `requestId` and `sessionId` (like `dispatch_command`) so the
+/// desktop can correlate a late or replayed result to the exact pick and the
+/// exact conversation. `status` is one of `applied`, `rejected`, `stale_session`,
+/// `ambiguous_target`, `active_turn`, `turn_ended`, `error` — each an explicit
+/// refusal rather than a generic failure, so the UI can say what to do next.
+fn emit_set_session_config_result(
+    observer: Option<&observer::ObserverHandle>,
+    request_id: &str,
+    session_id: Option<&str>,
+    status: &str,
+    category: Option<crate::acp::ConfigCategory>,
+    error: Option<&str>,
+) {
+    let Some(observer) = observer else {
+        return;
+    };
+    let mut payload = serde_json::json!({
+        "type": "set_session_config",
+        "requestId": request_id,
+        "sessionId": session_id,
+        "status": status,
+    });
+    if let Some(category) = category {
+        payload["category"] = serde_json::Value::String(category.as_wire_str().to_string());
+    }
+    if let Some(error) = error {
+        payload["error"] = serde_json::Value::String(error.to_string());
+    }
+    observer.emit(
+        "control_result",
+        None,
+        &observer::ObserverContext {
+            channel_id: None,
+            session_id: session_id.map(str::to_string),
+            turn_id: None,
+            started_at: None,
+        },
+        payload,
     );
 }
 
@@ -3380,6 +3612,7 @@ async fn tokio_main() -> Result<()> {
     enum PoolEvent {
         Result(Box<PromptResult>),
         Command(AgentCommandResult),
+        ConfigReturn(AgentConfigReturn),
         Panic(tokio::task::JoinError),
         SteerAck(SteerAckEvent),
         Wake(u32, Result<AgentPool, String>),
@@ -3526,7 +3759,8 @@ async fn tokio_main() -> Result<()> {
 
         // Borrow result_rx and join_set simultaneously via split-borrow helper.
         let pool_event: Option<PoolEvent> = {
-            let (result_rx, command_rx, join_set) = pool.rx_command_and_join_set();
+            let (result_rx, command_rx, config_return_rx, join_set) =
+                pool.rx_command_and_join_set();
             tokio::select! {
                 biased;
                 // recv() returning None means all senders dropped (pool was torn down).
@@ -3540,6 +3774,12 @@ async fn tokio_main() -> Result<()> {
                 },
                 Some(result) = command_rx.recv(), if pool_ready => {
                     Some(PoolEvent::Command(result))
+                },
+                // A config write finished against a checked-out idle worker; the
+                // slot stays empty until this returns it, so the arm is what
+                // keeps the pool from leaking an agent per config write.
+                Some(returned) = config_return_rx.recv(), if pool_ready => {
+                    Some(PoolEvent::ConfigReturn(returned))
                 },
                 // Guard: join_next() returns None immediately when JoinSet is
                 // empty, which would cause a tight spin. Only poll when there
@@ -4124,6 +4364,12 @@ async fn tokio_main() -> Result<()> {
         };
 
         match pool_event {
+            Some(PoolEvent::ConfigReturn(returned)) => {
+                // Reinsert the worker whose config write completed. `return_agent`
+                // re-registers the scope mappings, and the caller's own oneshot
+                // already delivered the verdict, so nothing else is owed here.
+                pool.return_agent(returned.agent);
+            }
             Some(PoolEvent::Command(result)) => {
                 if !remember_command_result(
                     &result.request_id,
@@ -4985,6 +5231,13 @@ fn dispatch_pending(
         let (permission_tx, permission_rx) = tokio::sync::mpsc::channel::<PermissionAnswer>(1);
         agent.acp.install_permission_answer_rx(permission_rx);
         let permission_tx = Some(permission_tx);
+        // Exact-session config writes ride their own channel, not the steer one:
+        // a selector change must not be framed as a message, cancel the turn, or
+        // start a new one. Capacity 2 tolerates a model+thinking pair dispatched
+        // together; a third concurrent write to the same turn is refused.
+        let (config_tx, config_rx) = tokio::sync::mpsc::channel::<crate::acp::SessionConfigRequest>(2);
+        agent.acp.install_config_rx(config_rx);
+        let config_tx = Some(config_tx);
 
         // Prompt text is now built inside run_prompt_task (needs async for
         // context fetching). Pass None for prompt_text; batch carries the data.
@@ -5016,6 +5269,7 @@ fn dispatch_pending(
                 control_tx: Some(control_tx),
                 steer_tx,
                 permission_tx,
+                config_tx,
                 successful_steer_deliveries: HashSet::new(),
             },
         );
@@ -5691,6 +5945,7 @@ fn dispatch_heartbeat(
             control_tx: None,
             steer_tx: None,
             permission_tx: None,
+            config_tx: None,
             successful_steer_deliveries: HashSet::new(),
         },
     );
@@ -6366,6 +6621,326 @@ fn build_mcp_servers(config: &Config) -> Vec<McpServer> {
 }
 
 #[cfg(test)]
+mod set_session_config_tests {
+    use super::*;
+    use crate::acp::ConfigCategory;
+
+    /// A scripted ACP agent: answers `session/new` with `config_options`, then
+    /// replies to a `session/set_config_option` with `next_reply` (a JSON-RPC
+    /// result/error body, minus the id). Any further request is answered `{}`.
+    async fn spawn_config_acp(session_new_options: &str, set_reply: &str) -> crate::acp::AcpClient {
+        let script = format!(
+            r#"count=0
+while IFS= read -r line; do
+  count=$((count + 1))
+  id=$((count - 1))
+  if [ "$count" -eq 1 ]; then
+    printf '%s\n' '{{"jsonrpc":"2.0","id":0,"result":{{"sessionId":"sess-1","configOptions":{session_new_options}}}}}'
+  elif [ "$count" -eq 2 ]; then
+    printf '%s\n' '{{"jsonrpc":"2.0","id":'"$id"',{set_reply}}}'
+  else
+    printf '%s\n' '{{"jsonrpc":"2.0","id":'"$id"',"result":{{}}}}'
+  fi
+done"#
+        );
+        crate::acp::AcpClient::spawn("bash", &["-c".to_string(), script], &[], false)
+            .await
+            .expect("spawn scripted config ACP")
+    }
+
+    /// The three-category advertisement omp sends: the ids are the adapter's
+    /// (`thinking` for `thought_level`), which is exactly why the resolver must
+    /// go through the category and not a literal.
+    const OMP_OPTIONS: &str = r#"[{"configId":"mode","category":"mode","currentValue":"default","options":[{"value":"default"},{"value":"plan"}]},{"configId":"model","category":"model","currentValue":"lane-model","options":[{"value":"lane-model"},{"value":"other-model"}]},{"configId":"thinking","category":"thought_level","currentValue":"low","options":[{"value":"off"},{"value":"low"},{"value":"high"}]}]"#;
+
+    fn control_results(obs: &observer::ObserverHandle) -> Vec<serde_json::Value> {
+        obs.snapshot()
+            .into_iter()
+            .filter(|e| e.kind == "control_result")
+            .map(|e| e.payload)
+            .filter(|p| p.get("type").and_then(|v| v.as_str()) == Some("set_session_config"))
+            .collect()
+    }
+
+    /// Stand in for the main loop's `PoolEvent::ConfigReturn` arm.
+    ///
+    /// A config write applied against an idle worker checks that worker out, so
+    /// the slot stays empty until the main loop polls the return channel and
+    /// reinserts it. Tests must run that arm, or they assert against a pool the
+    /// loop has not yet had a chance to repair.
+    async fn settle_config_returns(pool: &mut AgentPool, observer: &observer::ObserverHandle) {
+        for _ in 0..200 {
+            tokio::task::yield_now().await;
+            pool.drain_config_returns_for_test();
+            if !control_results(observer).is_empty() {
+                // One more drain: the worker is handed back BEFORE the result
+                // frame is emitted, so the frame's arrival implies it is queued.
+                pool.drain_config_returns_for_test();
+                return;
+            }
+        }
+    }
+
+    fn frame(category: &str, value: &str, request_id: &str) -> serde_json::Value {
+        serde_json::json!({
+            "type": "set_session_config",
+            "sessionId": "sess-1",
+            "category": category,
+            "value": value,
+            "requestId": request_id,
+        })
+    }
+
+    /// A pool whose single idle worker owns `sess-1`, with the scripted agent
+    /// already having created a session (so the projection is populated).
+    async fn idle_pool(options: &str, set_reply: &str) -> (AgentPool, observer::ObserverHandle) {
+        let mut client = spawn_config_acp(options, set_reply).await;
+        // `session/new` is request #1: creating the session seeds the
+        // projection with the advertisement the resolver reads.
+        client
+            .session_new("/tmp", vec![], None, None)
+            .await
+            .expect("session/new");
+        let mut agent = OwnedAgent {
+            index: 0,
+            acp: client,
+            state: Default::default(),
+            model_capabilities: None,
+            desired_model: None,
+            model_overridden: false,
+            desired_model_request_id: None,
+            desired_model_pending_ack: false,
+            startup_effort: None,
+            startup_mode: None,
+            agent_name: "config-test-agent".into(),
+            goose_system_prompt_supported: None,
+            protocol_version: 2,
+        };
+        agent.state.sessions.insert(
+            scope::SessionScope::Conversation {
+                channel_id: Uuid::new_v4(),
+            },
+            "sess-1".into(),
+        );
+        // `from_slots` registers each slot agent's session→scope mapping, which
+        // is exactly the mapping the router resolves through.
+        let pool = AgentPool::from_slots(vec![Some(agent)]);
+        (pool, observer::ObserverHandle::in_process())
+    }
+
+    #[tokio::test]
+    async fn resolves_config_id_by_category_not_literal() {
+        let (pool, _) = idle_pool(OMP_OPTIONS, r#""result":{"ok":true}"#).await;
+        let agent = pool.agents_for_test()[0].as_ref().expect("idle agent");
+        assert_eq!(
+            agent.acp.resolve_category_config_id(ConfigCategory::ThoughtLevel),
+            Some("thinking".to_string()),
+            "thought_level must resolve to the adapter's own id (omp: `thinking`)"
+        );
+        assert_eq!(
+            agent.acp.resolve_category_config_id(ConfigCategory::Mode),
+            Some("mode".to_string())
+        );
+        assert_eq!(
+            agent.acp.resolve_category_config_id(ConfigCategory::Model),
+            Some("model".to_string())
+        );
+        assert_eq!(
+            agent
+                .acp
+                .category_option_values(ConfigCategory::ThoughtLevel),
+            vec!["off", "low", "high"],
+            "the offered list comes from the adapter, not a hardcoded enum"
+        );
+    }
+
+    #[tokio::test]
+    async fn applies_a_valid_selection_and_returns_the_worker() {
+        let (mut pool, observer) = idle_pool(OMP_OPTIONS, r#""result":{"ok":true}"#).await;
+        handle_set_session_config_control(
+            &frame("thought_level", "high", "req-1"),
+            &mut pool,
+            Some(&observer),
+        );
+        settle_config_returns(&mut pool, &observer).await;
+        let results = control_results(&observer);
+        assert_eq!(results.len(), 1, "exactly one result frame per request");
+        assert_eq!(results[0]["status"], "applied");
+        assert_eq!(results[0]["requestId"], "req-1");
+        assert_eq!(results[0]["sessionId"], "sess-1");
+        assert_eq!(results[0]["category"], "thought_level");
+        // The slot came back — the pool did not leak the checked-out worker.
+        assert!(
+            pool.agents_for_test()[0].is_some(),
+            "the worker must be returned to its slot after the write"
+        );
+    }
+
+    #[tokio::test]
+    async fn refuses_an_unadvertised_value_before_writing_anything() {
+        // The scripted agent answers ANY write with success, so a write that
+        // leaked past validation would report `applied`. The refusal therefore
+        // proves the check happened first, and that the session is untouched.
+        let (mut pool, observer) = idle_pool(OMP_OPTIONS, r#""result":{"ok":true}"#).await;
+        handle_set_session_config_control(
+            &frame("thought_level", "xhigh", "req-bad"),
+            &mut pool,
+            Some(&observer),
+        );
+        settle_config_returns(&mut pool, &observer).await;
+        let results = control_results(&observer);
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0]["status"], "rejected");
+        let error = results[0]["error"].as_str().unwrap_or_default();
+        assert!(
+            error.contains("xhigh") && error.contains("off, low, high"),
+            "the refusal names the rejected value and the offered list: {error}"
+        );
+        // No write can have happened: the agent is idle and the options it
+        // advertises still read `low`.
+        let agent = pool.agents_for_test()[0].as_ref().expect("idle agent");
+        assert_eq!(
+            agent
+                .acp
+                .category_option_values(ConfigCategory::ThoughtLevel),
+            vec!["off", "low", "high"]
+        );
+    }
+
+    #[tokio::test]
+    async fn unknown_category_and_stale_session_are_distinct_refusals() {
+        let (mut pool, observer) = idle_pool(OMP_OPTIONS, r#""result":{"ok":true}"#).await;
+        handle_set_session_config_control(
+            &frame("bogus", "high", "req-cat"),
+            &mut pool,
+            Some(&observer),
+        );
+        handle_set_session_config_control(
+            &serde_json::json!({
+                "type": "set_session_config",
+                "sessionId": "gone-session",
+                "category": "model",
+                "value": "other-model",
+                "requestId": "req-stale",
+            }),
+            &mut pool,
+            Some(&observer),
+        );
+        let results = control_results(&observer);
+        assert_eq!(results.len(), 2);
+        assert_eq!(results[0]["status"], "error");
+        assert!(
+            results[0]["error"]
+                .as_str()
+                .unwrap_or_default()
+                .contains("unknown category"),
+            "an unknown category is refused loudly, never read as a no-op"
+        );
+        assert_eq!(
+            results[1]["status"], "stale_session",
+            "an id that no longer resolves must not be retried"
+        );
+    }
+
+    #[tokio::test]
+    async fn adapter_rejection_is_reported_as_rejected() {
+        let (mut pool, observer) = idle_pool(
+            OMP_OPTIONS,
+            r#""error":{"code":-32603,"message":"Unknown ACP model: nope"}"#,
+        )
+        .await;
+        handle_set_session_config_control(
+            &frame("model", "other-model", "req-rej"),
+            &mut pool,
+            Some(&observer),
+        );
+        settle_config_returns(&mut pool, &observer).await;
+        let results = control_results(&observer);
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0]["status"], "rejected");
+        assert!(
+            results[0]["error"]
+                .as_str()
+                .unwrap_or_default()
+                .contains("Unknown ACP model"),
+            "the adapter's own words are surfaced"
+        );
+        assert_eq!(
+            results[0]["category"], "model",
+            "the result names the category that was addressed"
+        );
+    }
+
+    #[tokio::test]
+    async fn sibling_sessions_are_untouched() {
+        // Two workers, one session each. A write to sess-1 must leave the other
+        // worker — and its own projection — exactly as it was. This is the
+        // property `switch_model` does not have, which is why the picker cannot
+        // mount it.
+        let (mut pool, observer) = idle_pool(OMP_OPTIONS, r#""result":{"ok":true}"#).await;
+        let mut second = spawn_config_acp(OMP_OPTIONS, r#""result":{"ok":true}"#).await;
+        second
+            .session_new("/tmp", vec![], None, None)
+            .await
+            .expect("second session");
+        let mut second_agent = OwnedAgent {
+            index: 1,
+            acp: second,
+            state: Default::default(),
+            model_capabilities: None,
+            desired_model: None,
+            model_overridden: false,
+            desired_model_request_id: None,
+            desired_model_pending_ack: false,
+            startup_effort: None,
+            startup_mode: None,
+            agent_name: "config-test-agent".into(),
+            goose_system_prompt_supported: None,
+            protocol_version: 2,
+        };
+        second_agent.state.sessions.insert(
+            scope::SessionScope::Conversation {
+                channel_id: Uuid::new_v4(),
+            },
+            "sess-2".into(),
+        );
+        pool.push_agent_for_test(second_agent);
+
+        let before = pool.agents_for_test()[1]
+            .as_ref()
+            .unwrap()
+            .acp
+            .session_config_options_for_test();
+
+        handle_set_session_config_control(
+            &frame("thought_level", "high", "req-sib"),
+            &mut pool,
+            Some(&observer),
+        );
+        settle_config_returns(&mut pool, &observer).await;
+        let results = control_results(&observer);
+        assert_eq!(results[0]["status"], "applied");
+        assert_eq!(
+            pool.agents_for_test()[1]
+                .as_ref()
+                .unwrap()
+                .acp
+                .session_config_options_for_test(),
+            before,
+            "a write to sess-1 must not touch the sibling worker's projection"
+        );
+        assert!(
+            pool.agents_for_test()[1]
+                .as_ref()
+                .unwrap()
+                .desired_model
+                .is_none(),
+            "no agent-level model state is set by a session config write"
+        );
+    }
+}
+
+#[cfg(test)]
 mod heartbeat_base_prompt_tests {
     use super::*;
 
@@ -6511,6 +7086,7 @@ mod owner_control_command_tests {
                 control_tx: Some(control_tx),
                 steer_tx: None,
                 permission_tx: None,
+            config_tx: None,
                 successful_steer_deliveries: HashSet::new(),
             },
         );
@@ -6633,6 +7209,7 @@ mod owner_control_command_tests {
                 control_tx: Some(control_tx),
                 steer_tx: None,
                 permission_tx: None,
+            config_tx: None,
                 successful_steer_deliveries: HashSet::new(),
             },
         );
@@ -9942,6 +10519,7 @@ mod error_outcome_emission_tests {
                 control_tx: None,
                 steer_tx: None,
                 permission_tx: None,
+            config_tx: None,
                 successful_steer_deliveries: HashSet::from([
                     crate::pool::SuccessfulSteerDelivery {
                         event_id: steer_event_id.into(),
@@ -10018,6 +10596,7 @@ mod error_outcome_emission_tests {
                 control_tx: None,
                 steer_tx: None,
                 permission_tx: None,
+            config_tx: None,
                 successful_steer_deliveries: HashSet::from([
                     crate::pool::SuccessfulSteerDelivery {
                         event_id: "stale-event".into(),
@@ -10141,6 +10720,7 @@ mod error_outcome_emission_tests {
                 control_tx: None,
                 steer_tx: None,
                 permission_tx: None,
+            config_tx: None,
                 successful_steer_deliveries: HashSet::from([
                     crate::pool::SuccessfulSteerDelivery {
                         event_id: "stale-event".into(),
@@ -10211,6 +10791,7 @@ mod error_outcome_emission_tests {
                 control_tx: None,
                 steer_tx: None,
                 permission_tx: None,
+            config_tx: None,
                 successful_steer_deliveries: HashSet::new(),
             },
         );
@@ -10292,6 +10873,7 @@ mod error_outcome_emission_tests {
                 control_tx: None,
                 steer_tx: None,
                 permission_tx: None,
+            config_tx: None,
                 successful_steer_deliveries: HashSet::new(),
             },
         );
@@ -10385,6 +10967,7 @@ mod error_outcome_emission_tests {
                 control_tx: None,
                 steer_tx: None,
                 permission_tx: None,
+            config_tx: None,
                 successful_steer_deliveries: HashSet::new(),
             },
         );
@@ -10485,6 +11068,7 @@ mod error_outcome_emission_tests {
                     control_tx: None,
                     steer_tx: None,
                     permission_tx: None,
+            config_tx: None,
                     successful_steer_deliveries: HashSet::new(),
                 },
             );
@@ -10583,6 +11167,7 @@ mod error_outcome_emission_tests {
                     control_tx: None,
                     steer_tx: None,
                     permission_tx: None,
+            config_tx: None,
                     successful_steer_deliveries: HashSet::new(),
                 },
             );
@@ -10692,6 +11277,7 @@ mod error_outcome_emission_tests {
                     control_tx: None,
                     steer_tx: None,
                     permission_tx: None,
+            config_tx: None,
                     successful_steer_deliveries: HashSet::new(),
                 },
             );
@@ -10771,6 +11357,7 @@ mod error_outcome_emission_tests {
                 control_tx: None,
                 steer_tx: None,
                 permission_tx: None,
+            config_tx: None,
                 successful_steer_deliveries: HashSet::new(),
             },
         );
@@ -10869,6 +11456,7 @@ mod error_outcome_emission_tests {
                 control_tx: None,
                 steer_tx: None,
                 permission_tx: None,
+            config_tx: None,
                 successful_steer_deliveries: HashSet::new(),
             },
         );
@@ -10990,6 +11578,7 @@ mod error_outcome_emission_tests {
                 control_tx: None,
                 steer_tx: None,
                 permission_tx: None,
+            config_tx: None,
                 successful_steer_deliveries: HashSet::new(),
             },
         );
@@ -11133,6 +11722,7 @@ mod error_outcome_emission_tests {
                 control_tx: None,
                 steer_tx: None,
                 permission_tx: None,
+            config_tx: None,
                 successful_steer_deliveries: HashSet::new(),
             },
         );
@@ -11267,6 +11857,7 @@ mod error_outcome_emission_tests {
                 control_tx: None,
                 steer_tx: None,
                 permission_tx: None,
+            config_tx: None,
                 successful_steer_deliveries: HashSet::new(),
             },
         );
@@ -11423,6 +12014,7 @@ mod error_outcome_emission_tests {
                 control_tx: None,
                 steer_tx: None,
                 permission_tx: None,
+            config_tx: None,
                 successful_steer_deliveries: HashSet::new(),
             },
         );
@@ -11512,6 +12104,7 @@ mod error_outcome_emission_tests {
                 control_tx: None,
                 steer_tx: None,
                 permission_tx: None,
+            config_tx: None,
                 successful_steer_deliveries: HashSet::new(),
             },
         );

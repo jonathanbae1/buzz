@@ -292,6 +292,20 @@ pub struct RuntimeConfigSurface {
     /// are reflected correctly.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub effort_options: Vec<AcpConfigOptionValue>,
+    /// The real `configId` for the adapter's `model` ACP config option.
+    ///
+    /// Present once a session exists, so the picker can send
+    /// `session/set_config_option` without guessing the id. Additive: this struct
+    /// is not `deny_unknown_fields`, so no manifest or schema is affected.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub model_config_id: Option<String>,
+    /// The adapter-advertised model values for the `model` config option.
+    ///
+    /// These are the values `session/set_config_option` will accept, which is a
+    /// different set from the `omp models` catalog; the UI states that rather
+    /// than pretending they are the same list.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub model_options: Vec<AcpConfigOptionValue>,
     /// The real `configId` for the adapter's `mode` ACP config option.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub mode_config_id: Option<String>,

@@ -579,6 +579,17 @@ pub(crate) fn read_config_surface(
     // `effort_options` instead of hardcoded values (never hardcoded here).
     let effort_config_id = effort_option.map(|o| o.config_id.clone());
     let effort_options = effort_option.map(|o| o.options.clone()).unwrap_or_default();
+    // The model selector, exposed on the same footing as mode and effort so the
+    // per-conversation picker can resolve its write config id and render the
+    // adapter's own option list. `available_models` on the cache was previously
+    // read by nothing, so the picker had to discover the id itself; the three
+    // selectors now resolve identically, from one projection.
+    let model_option = session_cache.and_then(find_model_option);
+    let model_config_id = model_option.map(|o| o.config_id.clone());
+    let model_options = model_option
+        .map(|o| o.options.clone())
+        .filter(|options| !options.is_empty())
+        .unwrap_or_default();
     let mode_config_id = session_cache
         .and_then(|cache| cache.mode_config_id.clone())
         .or_else(|| mode_option.map(|option| option.config_id.clone()));
@@ -605,6 +616,8 @@ pub(crate) fn read_config_surface(
         claude_config_dir_custom: claude_config_dir.is_some(),
         effort_config_id,
         effort_options,
+        model_config_id,
+        model_options,
         mode_config_id,
         mode_options,
         current_mode,
@@ -1198,6 +1211,19 @@ fn find_mode_option(cache: &SessionConfigCache) -> Option<&AcpConfigOptionEntry>
 }
 
 // ── ACP cache helpers ────────────────────────────────────────────────────────
+
+/// Selects the adapter-advertised model selector from the session cache.
+///
+/// Resolved by category like the effort and mode selectors — the config id is
+/// the adapter's (`model` on omp, and never assumed here) and the option list is
+/// what the UI must render instead of a global catalog, since only values the
+/// adapter advertised are accepted by `session/set_config_option`.
+fn find_model_option(cache: &SessionConfigCache) -> Option<&AcpConfigOptionEntry> {
+    cache
+        .config_options
+        .iter()
+        .find(|o| o.category.as_deref() == Some("model"))
+}
 
 fn find_config_option_value(cache: &SessionConfigCache, category: &str) -> Option<String> {
     cache
