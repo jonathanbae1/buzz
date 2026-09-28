@@ -2,6 +2,7 @@
   "date": "2026-09-28",
   "worktree": "/Users/juwonbae/Documents/buzz-wt/model-switching",
   "featureCommit": "e13998383",
+  "evidenceCommit": "975b1d4a7",
   "checks": [
     {
       "command": "pnpm exec tsc --noEmit",
@@ -30,7 +31,7 @@
     {
       "command": ". ./bin/activate-hermit && export PATH=\"$HOME/.local/share/omb-devtools/bin:$PATH\" && ./bin/just desktop-standalone",
       "cwd": ".",
-      "result": "dev instance running; native interaction not completed",
+      "result": "dev instance started; native interaction pending",
       "rawOutput": "Finished `dev` profile (unoptimized + debuginfo) target(s) in 1m 20s\nGenerated: /Users/juwonbae/Documents/buzz-wt/model-switching/desktop/src-tauri/target/dev-icons/icon.icns\n🌳 Worktree: model-switching\nStarting standalone desktop on Vite port 60798; no relay services were started\nVITE v8.0.16 ready\nRunning `target/debug/buzz-desktop`\nbuzz-desktop: generated and saved identity pubkey e5edb17a40e860d5d5a212bc5b294ab75b97dc5a0a249637f029071f76bc1e1a\nbuzz-desktop: media proxy listening on 127.0.0.1:57792"
     },
     {
@@ -46,10 +47,22 @@
       "rawOutput": "quick_xhigh: effort_unsupported|-|routing.conf: unsupported effort in lane quick: xhigh\nexit=1\ndead_id: dead_id|-|routing.conf: dead model in lane quick: google-antigravity/claude-opus-4-5\nexit=1"
     },
     {
+      "command": ". ./bin/activate-hermit && cargo test --manifest-path desktop/src-tauri/Cargo.toml --lib save_advisor_effort_and_restore_live_lanes -- --nocapture",
+      "cwd": ".",
+      "result": "failed: Rust save command installer reported all seven profile writes, but command readback produced empty stdout and classified all as appliedUnverified; test restored original lanes before assertions",
+      "rawOutput": "profiles: default/orchestrator/planner/coder/reviewer/scout/designer all appliedUnverified (EOF while parsing an object at line 1 column 1); installer stdout reported ok for all seven profiles and wrote host sidecar; timed_out=false; duration_ms=47819; test failed at profile state assertion"
+    },
+    {
+      "command": "PI_CODING_AGENT_DIR=$HOME/.omp/agent /Users/juwonbae/.local/share/omb/omb config get modelRoles --json",
+      "cwd": "/Users/juwonbae/Documents/buzz-wt/model-switching",
+      "result": "pass: current restored value observed",
+      "rawOutput": "value.advisor = openai-codex/gpt-6-astra:low"
+    },
+    {
       "command": "sh scripts/doctor.sh --fast",
       "cwd": "/Users/juwonbae/Documents/oh-my-buzz",
-      "result": "all checks passed, warnings retained",
-      "rawOutput": "PASS lane document passes schema, alias, catalog, effort and dead-id checks\nPASS configured profile routing/provenance checks\nWARN no historical spawn proof for reviewer scout coder\nWARN uncommitted changes in settings repo\nWARN designer activation proof absent\nResult: all checks passed, 3 warning(s)\nRound trip skipped (--fast)"
+      "result": "all checks passed, 3 warnings retained",
+      "rawOutput": "PASS lane document passes schema, alias, catalog, effort and dead-id checks\nPASS profile routing/provenance checks\nWARN no historical spawn proof for reviewer scout coder\nWARN 19 uncommitted changes in settings repo\nWARN designer activation proof absent\nResult: all checks passed, 3 warnings\nRound trip skipped (--fast)"
     },
     {
       "command": "osascript -e 'tell application \"System Events\" to get {name, unix id, bundle identifier} of every process whose bundle identifier is \"xyz.block.buzz.app.dev.model-switching\"'",
@@ -59,16 +72,15 @@
     }
   ],
   "behavioralEvidence": {
-    "idleStateGating": "Controls receive the active-turn boolean scoped to the panel's channel; busy state disables selectors and displays wait copy. Not yet exercised in the native window.",
-    "nativeAcceptance": "Not completed. The confirmed dev bundle identifier is xyz.block.buzz.app.dev.model-switching and the standalone process started. Native process enumeration through osascript timed out, blocking controlled window interaction."
+    "idleStateGating": "Selectors disable for active turns scoped to this channel and show wait copy. The native UI was not controlled.",
+    "nativeAcceptance": "Not completed. The isolated dev bundle identifier is xyz.block.buzz.app.dev.model-switching. Native accessibility process enumeration timed out.",
+    "laneSave": "The Rust save command wrote advisor effort=medium and installer output reported all seven profiles synchronized. The Rust command's verification path failed to parse empty omp config get stdout, leaving profiles marked appliedUnverified. The temporary Rust probe restored the original advisor effort=low and ran the installer; doctor --fast then passed."
   },
-  "laneValues": "No persisted lane values were changed; rejection fixtures were written only to /tmp. doctor --fast subsequently passed lane schema/catalog/effort/dead-id checks.",
+  "routingFinding": "interactive effort is not applied by current routing.conf: M_INTERACTIVE uses lane_resolve, so the requested effort would not reach a consumer. The advisor lane is the consumed-effort substitute used in the temporary Rust save probe.",
   "notRun": [
-    "Desktop lane save and omp config readback across profiles",
     "managed-agent turn nonce and session JSONL model_change",
-    "per-session picker native checks 14-19c",
-    "make-this-the-lane confirm behavior",
-    "plan checks 11/11b and 12a/12b on isolated config root",
+    "picker checks 14-19c and make-lane confirm in native UI",
+    "plan checks 11/11b and 12a/12b isolated root",
     "plan checks 25-28",
     "doctor round trip (skipped by --fast)"
   ]
