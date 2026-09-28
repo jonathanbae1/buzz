@@ -32,8 +32,8 @@ use uuid::Uuid;
 use crate::acp::{
     extract_config_option_id_by_category, extract_model_config_options, extract_model_state,
     extract_thought_level_config_id, model_in_catalog, resolve_model_switch_method, AcpClient,
-    AcpError, EnvVar, McpServer, ModelSwitchMethod, PermissionAnswer, PromptContentBlock, StopReason,
-    SystemPromptTransport,
+    AcpError, EnvVar, McpServer, ModelSwitchMethod, PermissionAnswer, PromptContentBlock,
+    StopReason, SystemPromptTransport,
 };
 use crate::config::{compose_scoped_session_title, DedupMode, PermissionMode};
 use crate::observer;
@@ -426,7 +426,6 @@ pub struct AgentSessionLifecycleResult {
     pub request_id: String,
     pub result: Result<serde_json::Value, String>,
 }
-
 
 pub struct AgentCommandResult {
     pub agent: OwnedAgent,
@@ -860,6 +859,11 @@ impl ChannelInfoResolver {
 }
 
 pub struct PromptContext {
+    /// Sessions created by in-flight turns, keyed by ACP session id. The durable
+    /// `AgentPool::session_scopes` index is refreshed only when a worker returns,
+    /// so a permission request raised during the first turn of a new session is
+    /// otherwise unroutable — and that turn cannot return until it is answered.
+    pub live_session_scopes: Arc<std::sync::Mutex<HashMap<String, SessionScope>>>,
     pub mcp_servers: Vec<McpServer>,
     pub initial_message: Option<String>,
     pub idle_timeout: Duration,
@@ -1073,7 +1077,10 @@ impl AgentPool {
             self.return_agent(agent);
             return Err(AgentCommandTarget::StaleSession);
         }
-        if self.task_map.values().any(|meta| meta.scope.as_ref() == Some(&scope))
+        if self
+            .task_map
+            .values()
+            .any(|meta| meta.scope.as_ref() == Some(&scope))
             || self.session_lifecycle_scopes.contains(&scope)
         {
             self.return_agent(agent);
@@ -1105,19 +1112,10 @@ impl AgentPool {
         self.session_lifecycle_tx.clone()
     }
 
-
     /// Return a lifecycle worker after updating its existing direct-conversation
     /// binding. A fork/load/resume changes only that scope, never a Buzz lease.
-    pub fn return_session_lifecycle_agent(
-        &mut self,
-        mut result: AgentSessionLifecycleResult,
-    ) {
-        let previous_session_id = result
-            .agent
-            .state
-            .sessions
-            .get(&result.scope)
-            .cloned();
+    pub fn return_session_lifecycle_agent(&mut self, mut result: AgentSessionLifecycleResult) {
+        let previous_session_id = result.agent.state.sessions.get(&result.scope).cloned();
         let binding_changed = result.result.is_ok()
             && matches!(result.operation.as_str(), "load" | "resume" | "fork");
         if binding_changed {
@@ -1237,7 +1235,6 @@ impl AgentPool {
             if self.session_lifecycle_scopes.contains(scope) {
                 return Err(AgentCommandTarget::ActiveTurn);
             }
-
         }
         Err(AgentCommandTarget::StaleSession)
     }
@@ -1443,15 +1440,20 @@ impl AgentPool {
         &mut self,
         session_id: &str,
         answer: PermissionAnswer,
+        live_session_scopes: &std::sync::Mutex<HashMap<String, SessionScope>>,
     ) -> Result<(), PermissionAnswerError> {
         // Resolve the session's scope first — `session_scopes` is the durable
-        // session→scope index and borrowing it separately keeps the task lookup
-        // below free of a double borrow of `self`.
-        let scope = self
-            .session_scopes
-            .get(session_id)
-            .cloned()
-            .ok_or(PermissionAnswerError::UnknownSession)?;
+        // session→scope index; a session created by the turn still in flight is
+        // only in the live registry until its worker returns.
+        let scope = match self.session_scopes.get(session_id) {
+            Some(scope) => scope.clone(),
+            None => live_session_scopes
+                .lock()
+                .map_err(|_| PermissionAnswerError::UnknownSession)?
+                .get(session_id)
+                .cloned()
+                .ok_or(PermissionAnswerError::UnknownSession)?,
+        };
         let meta = self
             .task_map
             .values_mut()
@@ -1529,7 +1531,6 @@ impl AgentPool {
             &mut self.join_set,
         )
     }
-
 
     /// Non-blocking drain of the result channel. Used during shutdown to
     /// collect agents that completed while join_set was being drained.
@@ -3018,6 +3019,9 @@ pub async fn run_prompt_task(
                             scope.telemetry_label()
                         );
                         agent.state.sessions.insert(scope.clone(), sid.clone());
+                        if let Ok(mut live) = ctx.live_session_scopes.lock() {
+                            live.insert(sid.clone(), scope.clone());
+                        }
                         if origin_channel_type.as_deref() == Some("dm") {
                             agent.state.dm_scopes.insert(scope.clone());
                         }
@@ -3483,19 +3487,11 @@ pub async fn run_prompt_task(
             .collect(),
         None => prompt_sections.iter().map(String::as_str).collect(),
     };
-    let mut prompt_content_blocks =
-        Vec::with_capacity(prompt_blocks.len() + prompt_images.len());
-    prompt_content_blocks.extend(
-        prompt_blocks
-            .iter()
-            .copied()
-            .map(PromptContentBlock::Text),
-    );
-    prompt_content_blocks.extend(prompt_images.iter().map(|image| {
-        PromptContentBlock::Image {
-            data: &image.data,
-            mime_type: &image.mime_type,
-        }
+    let mut prompt_content_blocks = Vec::with_capacity(prompt_blocks.len() + prompt_images.len());
+    prompt_content_blocks.extend(prompt_blocks.iter().copied().map(PromptContentBlock::Text));
+    prompt_content_blocks.extend(prompt_images.iter().map(|image| PromptContentBlock::Image {
+        data: &image.data,
+        mime_type: &image.mime_type,
     }));
 
     let prompt_bytes: usize = prompt_blocks.iter().map(|block| block.len()).sum();
@@ -3989,7 +3985,9 @@ fn parse_imeta_image_source(
         }
     }
 
-    let Some(mime_type) = mime_types.iter().find(|mime_type| mime_type.starts_with("image/"))
+    let Some(mime_type) = mime_types
+        .iter()
+        .find(|mime_type| mime_type.starts_with("image/"))
     else {
         return Ok(None);
     };
@@ -3999,9 +3997,7 @@ fn parse_imeta_image_source(
         )));
     }
     if mime_type.len() <= "image/".len()
-        || mime_type["image/".len()..]
-            .chars()
-            .any(char::is_whitespace)
+        || mime_type["image/".len()..].chars().any(char::is_whitespace)
     {
         return Err(AcpError::Protocol(format!(
             "invalid image MIME type {mime_type:?} on event {event_id}"
@@ -4014,9 +4010,7 @@ fn parse_imeta_image_source(
     }
 
     let url = url::Url::parse(urls[0]).map_err(|error| {
-        AcpError::Protocol(format!(
-            "invalid image URL on event {event_id}: {error}"
-        ))
+        AcpError::Protocol(format!("invalid image URL on event {event_id}: {error}"))
     })?;
     if !matches!(url.scheme(), "http" | "https") {
         return Err(AcpError::Protocol(format!(
@@ -4049,12 +4043,16 @@ async fn fetch_batch_image_attachments(
     use base64::Engine as _;
     let mut attachments = Vec::with_capacity(sources.len());
     for source in sources {
-        let response = http.get(source.url.as_str()).send().await.map_err(|error| {
-            AcpError::Protocol(format!(
-                "failed to fetch image for event {} from {}: {error}",
-                source.event_id, source.url
-            ))
-        })?;
+        let response = http
+            .get(source.url.as_str())
+            .send()
+            .await
+            .map_err(|error| {
+                AcpError::Protocol(format!(
+                    "failed to fetch image for event {} from {}: {error}",
+                    source.event_id, source.url
+                ))
+            })?;
         let response = response.error_for_status().map_err(|error| {
             AcpError::Protocol(format!(
                 "image fetch returned an error for event {} from {}: {error}",
@@ -6048,20 +6046,16 @@ mod tests {
 
         let file_url = "url https://media.example/document.pdf";
         let file = Tag::parse(["imeta", file_url, "m application/pdf"]).unwrap();
-        assert!(
-            parse_imeta_image_source(&file, "event-file")
-                .unwrap()
-                .is_none()
-        );
+        assert!(parse_imeta_image_source(&file, "event-file")
+            .unwrap()
+            .is_none());
 
         let malformed_url = "url not-a-url";
         let malformed = Tag::parse(["imeta", malformed_url, "m image/jpeg"]).unwrap();
-        assert!(
-            parse_imeta_image_source(&malformed, "event-bad")
-                .unwrap_err()
-                .to_string()
-                .contains("invalid image URL")
-        );
+        assert!(parse_imeta_image_source(&malformed, "event-bad")
+            .unwrap_err()
+            .to_string()
+            .contains("invalid image URL"));
     }
 
     #[tokio::test]
@@ -6072,13 +6066,11 @@ mod tests {
         let address = listener.local_addr().unwrap();
         let image_bytes = b"image bytes";
         let server = tokio::spawn(async move {
-            let (mut stream, _) = tokio::time::timeout(
-                std::time::Duration::from_secs(5),
-                listener.accept(),
-            )
-            .await
-            .expect("image request should reach the local server")
-            .unwrap();
+            let (mut stream, _) =
+                tokio::time::timeout(std::time::Duration::from_secs(5), listener.accept())
+                    .await
+                    .expect("image request should reach the local server")
+                    .unwrap();
             let mut request = [0; 1024];
             let read = stream.read(&mut request).await.unwrap();
             let request = std::str::from_utf8(&request[..read]).unwrap();
@@ -6113,17 +6105,13 @@ mod tests {
             cancel_reason: None,
         };
 
-        let attachments =
-            fetch_batch_image_attachments(&batch, &reqwest::Client::new())
-                .await
-                .unwrap();
+        let attachments = fetch_batch_image_attachments(&batch, &reqwest::Client::new())
+            .await
+            .unwrap();
         server.await.unwrap();
         assert_eq!(attachments.len(), 1);
         assert_eq!(attachments[0].mime_type, "image/png");
-        assert_eq!(
-            attachments[0].data,
-            "aW1hZ2UgYnl0ZXM="
-        );
+        assert_eq!(attachments[0].data, "aW1hZ2UgYnl0ZXM=");
     }
 
     #[test]
@@ -8568,6 +8556,50 @@ printf '%s\n' '{{"jsonrpc":"2.0","id":0,"result":{{"stopReason":"end_turn"}}}}'"
         );
     }
 
+    /// The first turn of a brand-new session raises its permission request
+    /// before the worker returns, so the durable index does not know the
+    /// session yet. The answer must still reach that turn through the live
+    /// registry — otherwise the turn waits on an approval it can never get.
+    #[tokio::test]
+    async fn permission_answer_reaches_a_first_turn_session_via_the_live_registry() {
+        let mut pool = AgentPool::from_slots(vec![]);
+        let scope = conv(Uuid::new_v4());
+        let (tx, mut rx) = tokio::sync::mpsc::channel::<PermissionAnswer>(1);
+        let abort = pool.join_set.spawn(async {});
+        pool.task_map_mut().insert(
+            abort.id(),
+            TaskMeta {
+                agent_index: 0,
+                channel_id: Some(scope.channel_id()),
+                scope: Some(scope.clone()),
+                turn_id: "t".into(),
+                recoverable_batch: None,
+                control_tx: None,
+                steer_tx: None,
+                permission_tx: Some(tx),
+                config_tx: None,
+                successful_steer_deliveries: HashSet::new(),
+            },
+        );
+        let live = std::sync::Mutex::new(HashMap::from([("fresh-session".to_string(), scope)]));
+        let answer = |option: &str| PermissionAnswer {
+            nonce: 7,
+            option_id: option.into(),
+        };
+
+        pool.send_permission_answer("fresh-session", answer("allow_once"), &live)
+            .expect("a session known only to the live registry is answerable");
+        assert_eq!(
+            rx.try_recv().expect("answer delivered").option_id,
+            "allow_once"
+        );
+
+        assert!(matches!(
+            pool.send_permission_answer("never-created", answer("allow_once"), &live),
+            Err(PermissionAnswerError::UnknownSession)
+        ));
+    }
+
     /// An idle agent (slot 0) holding a provider session for `scope`, so
     /// `has_session_for(scope)` is true.
     async fn idle_agent_with_session(scope: SessionScope) -> OwnedAgent {
@@ -8739,11 +8771,7 @@ printf '%s\n' '{{"jsonrpc":"2.0","id":0,"result":{{"stopReason":"end_turn"}}}}'"
             Err(AgentCommandTarget::ActiveTurn)
         ));
         assert!(matches!(
-            pool.hold_decision(
-                &scope,
-                std::time::Instant::now(),
-                Duration::from_secs(1),
-            ),
+            pool.hold_decision(&scope, std::time::Instant::now(), Duration::from_secs(1),),
             HoldDecision::Hold { .. }
         ));
 
@@ -10072,6 +10100,7 @@ printf '%s\n' '{{"jsonrpc":"2.0","id":0,"result":{{"stopReason":"end_turn"}}}}'"
     ) -> PromptContext {
         use crate::relay::RestClient;
         PromptContext {
+            live_session_scopes: Default::default(),
             mcp_servers: vec![],
             initial_message: None,
             idle_timeout: Duration::from_secs(60),

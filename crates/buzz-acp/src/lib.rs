@@ -1625,7 +1625,7 @@ fn handle_relay_observer_control_event(
             handle_dispatch_command_control(&payload, pool, observer, &config);
         }
         Some("permission_response") => {
-            handle_permission_response_control(&payload, pool, observer);
+            handle_permission_response_control(&payload, pool, observer, prompt_context);
         }
         Some("set_session_config") => {
             handle_set_session_config_control(&payload, pool, observer);
@@ -1661,6 +1661,7 @@ fn handle_permission_response_control(
     payload: &serde_json::Value,
     pool: &mut AgentPool,
     observer: Option<&observer::ObserverHandle>,
+    prompt_context: &PromptContext,
 ) {
     let request_id = payload
         .get("requestId")
@@ -1695,14 +1696,10 @@ fn handle_permission_response_control(
     };
 
     let answer = PermissionAnswer { nonce, option_id };
-    match pool.send_permission_answer(&session_id, answer) {
-        Ok(()) => emit_permission_response_result(
-            observer,
-            &request_id,
-            Some(&session_id),
-            "sent",
-            None,
-        ),
+    match pool.send_permission_answer(&session_id, answer, &prompt_context.live_session_scopes) {
+        Ok(()) => {
+            emit_permission_response_result(observer, &request_id, Some(&session_id), "sent", None)
+        }
         Err(error) => {
             let status = match error {
                 crate::pool::PermissionAnswerError::UnknownSession => "unknown_session",
@@ -2102,8 +2099,10 @@ fn handle_session_lifecycle_control(
         );
         return;
     };
-    if !matches!(operation.as_str(), "list" | "load" | "resume" | "fork" | "close")
-        || (operation != "list" && target_session_id.is_none())
+    if !matches!(
+        operation.as_str(),
+        "list" | "load" | "resume" | "fork" | "close"
+    ) || (operation != "list" && target_session_id.is_none())
     {
         emit_session_lifecycle_result(
             observer,
@@ -2192,10 +2191,12 @@ fn handle_session_lifecycle_control(
             let owner_session_exists = sessions
                 .get("sessions")
                 .and_then(serde_json::Value::as_array)
-                .is_some_and(|sessions| sessions.iter().any(|session| {
-                    session.get("sessionId").and_then(serde_json::Value::as_str)
-                        == Some(&source_session_id)
-                }));
+                .is_some_and(|sessions| {
+                    sessions.iter().any(|session| {
+                        session.get("sessionId").and_then(serde_json::Value::as_str)
+                            == Some(&source_session_id)
+                    })
+                });
             if !owner_session_exists {
                 return Err("owner session is not available in this workspace".to_string());
             }
@@ -2208,8 +2209,7 @@ fn handle_session_lifecycle_control(
                 .and_then(serde_json::Value::as_array)
                 .is_some_and(|sessions| {
                     sessions.iter().any(|session| {
-                        session.get("sessionId").and_then(serde_json::Value::as_str)
-                            == Some(target)
+                        session.get("sessionId").and_then(serde_json::Value::as_str) == Some(target)
                     })
                 });
             if !target_in_scope {
@@ -2328,7 +2328,6 @@ fn emit_session_lifecycle_result(
     );
 }
 
-
 fn filter_sessions_by_cwd(value: &serde_json::Value, cwd: &str) -> serde_json::Value {
     let sessions = value
         .get("sessions")
@@ -2436,13 +2435,7 @@ fn emit_dispatch_command_result(
     status: &str,
 ) {
     emit_dispatch_command_result_with_details(
-        observer,
-        request_id,
-        session_id,
-        status,
-        None,
-        None,
-        None,
+        observer, request_id, session_id, status, None, None, None,
     );
 }
 
@@ -2544,7 +2537,6 @@ fn remember_command_result(
     current.insert(request_id.to_string())
 }
 
-
 fn command_output_disposition(
     output: &str,
     tool_call_seen: bool,
@@ -2561,7 +2553,6 @@ fn command_output_disposition(
     }
     Ok(None)
 }
-
 
 #[derive(serde::Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -3737,6 +3728,7 @@ async fn tokio_main() -> Result<()> {
     }
 
     let ctx = Arc::new(PromptContext {
+        live_session_scopes: Default::default(),
         mcp_servers: build_mcp_servers(&config),
         initial_message: config.initial_message.clone(),
         idle_timeout: Duration::from_secs(config.idle_timeout_secs),
@@ -5617,7 +5609,8 @@ fn dispatch_pending(
         // a selector change must not be framed as a message, cancel the turn, or
         // start a new one. Capacity 2 tolerates a model+thinking pair dispatched
         // together; a third concurrent write to the same turn is refused.
-        let (config_tx, config_rx) = tokio::sync::mpsc::channel::<crate::acp::SessionConfigRequest>(2);
+        let (config_tx, config_rx) =
+            tokio::sync::mpsc::channel::<crate::acp::SessionConfigRequest>(2);
         agent.acp.install_config_rx(config_rx);
         let config_tx = Some(config_tx);
 
@@ -7115,7 +7108,9 @@ done"#
         let (pool, _) = idle_pool(OMP_OPTIONS, r#""result":{"ok":true}"#).await;
         let agent = pool.agents_for_test()[0].as_ref().expect("idle agent");
         assert_eq!(
-            agent.acp.resolve_category_config_id(ConfigCategory::ThoughtLevel),
+            agent
+                .acp
+                .resolve_category_config_id(ConfigCategory::ThoughtLevel),
             Some("thinking".to_string()),
             "thought_level must resolve to the adapter's own id (omp: `thinking`)"
         );
@@ -7468,7 +7463,7 @@ mod owner_control_command_tests {
                 control_tx: Some(control_tx),
                 steer_tx: None,
                 permission_tx: None,
-            config_tx: None,
+                config_tx: None,
                 successful_steer_deliveries: HashSet::new(),
             },
         );
@@ -7500,10 +7495,7 @@ mod owner_control_command_tests {
 
     #[test]
     fn command_output_disposition_blocks_tool_and_empty_publication() {
-        assert_eq!(
-            command_output_disposition("answer", false, false),
-            Ok(None)
-        );
+        assert_eq!(command_output_disposition("answer", false, false), Ok(None));
         assert_eq!(
             command_output_disposition("answer", true, false),
             Ok(Some("tool_handled"))
@@ -7569,9 +7561,11 @@ mod owner_control_command_tests {
         assert!(tags.contains(&vec!["h".into(), channel_id.to_string()]));
         assert!(tags.contains(&vec!["p".into(), owner_keys.public_key().to_hex()]));
         assert!(tags.contains(&vec!["e".into(), root, String::new(), "reply".into()]));
-        assert!(published.try_recv().is_err(), "one command result means one event");
+        assert!(
+            published.try_recv().is_err(),
+            "one command result means one event"
+        );
     }
-
 
     fn insert_task_meta(
         pool: &mut AgentPool,
@@ -7591,7 +7585,7 @@ mod owner_control_command_tests {
                 control_tx: Some(control_tx),
                 steer_tx: None,
                 permission_tx: None,
-            config_tx: None,
+                config_tx: None,
                 successful_steer_deliveries: HashSet::new(),
             },
         );
@@ -10901,7 +10895,7 @@ mod error_outcome_emission_tests {
                 control_tx: None,
                 steer_tx: None,
                 permission_tx: None,
-            config_tx: None,
+                config_tx: None,
                 successful_steer_deliveries: HashSet::from([
                     crate::pool::SuccessfulSteerDelivery {
                         event_id: steer_event_id.into(),
@@ -10978,7 +10972,7 @@ mod error_outcome_emission_tests {
                 control_tx: None,
                 steer_tx: None,
                 permission_tx: None,
-            config_tx: None,
+                config_tx: None,
                 successful_steer_deliveries: HashSet::from([
                     crate::pool::SuccessfulSteerDelivery {
                         event_id: "stale-event".into(),
@@ -11102,7 +11096,7 @@ mod error_outcome_emission_tests {
                 control_tx: None,
                 steer_tx: None,
                 permission_tx: None,
-            config_tx: None,
+                config_tx: None,
                 successful_steer_deliveries: HashSet::from([
                     crate::pool::SuccessfulSteerDelivery {
                         event_id: "stale-event".into(),
@@ -11173,7 +11167,7 @@ mod error_outcome_emission_tests {
                 control_tx: None,
                 steer_tx: None,
                 permission_tx: None,
-            config_tx: None,
+                config_tx: None,
                 successful_steer_deliveries: HashSet::new(),
             },
         );
@@ -11255,7 +11249,7 @@ mod error_outcome_emission_tests {
                 control_tx: None,
                 steer_tx: None,
                 permission_tx: None,
-            config_tx: None,
+                config_tx: None,
                 successful_steer_deliveries: HashSet::new(),
             },
         );
@@ -11349,7 +11343,7 @@ mod error_outcome_emission_tests {
                 control_tx: None,
                 steer_tx: None,
                 permission_tx: None,
-            config_tx: None,
+                config_tx: None,
                 successful_steer_deliveries: HashSet::new(),
             },
         );
@@ -11450,7 +11444,7 @@ mod error_outcome_emission_tests {
                     control_tx: None,
                     steer_tx: None,
                     permission_tx: None,
-            config_tx: None,
+                    config_tx: None,
                     successful_steer_deliveries: HashSet::new(),
                 },
             );
@@ -11549,7 +11543,7 @@ mod error_outcome_emission_tests {
                     control_tx: None,
                     steer_tx: None,
                     permission_tx: None,
-            config_tx: None,
+                    config_tx: None,
                     successful_steer_deliveries: HashSet::new(),
                 },
             );
@@ -11659,7 +11653,7 @@ mod error_outcome_emission_tests {
                     control_tx: None,
                     steer_tx: None,
                     permission_tx: None,
-            config_tx: None,
+                    config_tx: None,
                     successful_steer_deliveries: HashSet::new(),
                 },
             );
@@ -11739,7 +11733,7 @@ mod error_outcome_emission_tests {
                 control_tx: None,
                 steer_tx: None,
                 permission_tx: None,
-            config_tx: None,
+                config_tx: None,
                 successful_steer_deliveries: HashSet::new(),
             },
         );
@@ -11838,7 +11832,7 @@ mod error_outcome_emission_tests {
                 control_tx: None,
                 steer_tx: None,
                 permission_tx: None,
-            config_tx: None,
+                config_tx: None,
                 successful_steer_deliveries: HashSet::new(),
             },
         );
@@ -11960,7 +11954,7 @@ mod error_outcome_emission_tests {
                 control_tx: None,
                 steer_tx: None,
                 permission_tx: None,
-            config_tx: None,
+                config_tx: None,
                 successful_steer_deliveries: HashSet::new(),
             },
         );
@@ -12104,7 +12098,7 @@ mod error_outcome_emission_tests {
                 control_tx: None,
                 steer_tx: None,
                 permission_tx: None,
-            config_tx: None,
+                config_tx: None,
                 successful_steer_deliveries: HashSet::new(),
             },
         );
@@ -12239,7 +12233,7 @@ mod error_outcome_emission_tests {
                 control_tx: None,
                 steer_tx: None,
                 permission_tx: None,
-            config_tx: None,
+                config_tx: None,
                 successful_steer_deliveries: HashSet::new(),
             },
         );
@@ -12396,7 +12390,7 @@ mod error_outcome_emission_tests {
                 control_tx: None,
                 steer_tx: None,
                 permission_tx: None,
-            config_tx: None,
+                config_tx: None,
                 successful_steer_deliveries: HashSet::new(),
             },
         );
@@ -12486,7 +12480,7 @@ mod error_outcome_emission_tests {
                 control_tx: None,
                 steer_tx: None,
                 permission_tx: None,
-            config_tx: None,
+                config_tx: None,
                 successful_steer_deliveries: HashSet::new(),
             },
         );
