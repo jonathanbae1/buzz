@@ -1,0 +1,8 @@
+{
+  "id": "omb",
+  "label": "omb (managed omp)",
+  "command": "/Users/juwonbae/.local/share/omb/omb",
+  "args": ["acp"],
+  "env": {},
+  "installHint": "Managed launcher for upstream omp v18.3.5; see oh-my-buzz docs/auto-routing-plan.md §2.6–2.7."
+}
