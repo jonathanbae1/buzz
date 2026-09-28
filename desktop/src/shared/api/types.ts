@@ -469,7 +469,11 @@ export type AgentSessionCommandOutputDisposition =
   | "tool_handled";
 
 export type ControlResultFrame = {
-  type: "cancel_turn" | "switch_model" | "dispatch_command";
+  type:
+    | "cancel_turn"
+    | "switch_model"
+    | "dispatch_command"
+    | "set_session_config";
   status: string;
   modelId?: string;
   commandName?: string;
@@ -482,7 +486,21 @@ export type ControlResultFrame = {
   outputDisposition?: AgentSessionCommandOutputDisposition;
   /** Runtime refusal detail, when the harness has one. */
   error?: string;
+  /**
+   * Selector category for `set_session_config` results — the *category*, never a
+   * config id, because the adapter defines the id (omp advertises `thinking` for
+   * `thought_level`).
+   */
+  category?: ConfigSelectorCategory;
 };
+
+/**
+ * The three selectors the exact-session config path serves.
+ *
+ * One category vocabulary is shared by the request and its result so a frame's
+ * provenance can never disagree with what was written.
+ */
+export type ConfigSelectorCategory = "mode" | "model" | "thought_level";
 
 export type AgentSessionCommandSubcommand = {
   name: string;
