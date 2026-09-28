@@ -1035,7 +1035,7 @@ fn omp_manifest_validation_rejects_unknown_fields_and_path_bearing_values() {
         "schemaVersion": 1,
         "profiles": [{
             "name": "coder",
-            "modelLane": "openai-codex/gpt-5.6-luna",
+            "modelLane": "commandcode/deepseek/deepseek-v4.1-flash",
             "rulePaths": ["profiles/rules/global.md"],
             "pluginNames": ["agentmemory@agentmemory"]
         }, {
@@ -1047,6 +1047,10 @@ fn omp_manifest_validation_rejects_unknown_fields_and_path_bearing_values() {
     }))
     .unwrap();
     assert!(valid_manifest(&valid));
+
+    let mut invalid_namespace = valid.clone();
+    invalid_namespace.profiles[0].model_lane = "commandcode/deepseek/../private".into();
+    assert!(!valid_manifest(&invalid_namespace));
 
     let path_bearing = OmpProfileManifest {
         profiles: vec![OmpProfileDeclaration {

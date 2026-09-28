@@ -35,10 +35,13 @@ fn valid_lane(value: &str) -> bool {
     let Some(model_id) = model_parts.next() else {
         return false;
     };
-    if model_id.is_empty()
-        || !model_id
-            .chars()
-            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '-'))
+    if !model_id.split('/').all(|part| {
+        !part.is_empty()
+            && !matches!(part, "." | "..")
+            && part
+                .chars()
+                .all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '-'))
+    })
     {
         return false;
     }
