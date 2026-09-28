@@ -15,6 +15,7 @@ import {
   type OmpLanePreview,
   type OmpModelCatalog,
 } from "@/shared/api/ompLanes";
+import { resolveLaneModel } from "../lib/laneAlias";
 
 export function RoutingLanesSettingsCard() {
   const { lane: handoffLane, model: handoffModel, profile } = Route.useSearch();
@@ -153,7 +154,13 @@ export function RoutingLanesSettingsCard() {
         {sidecarStale ? <p className="text-sm text-muted-foreground" role="status">The lane file differs from the last applied host snapshot. Review the preview before saving.</p> : null}
         {error ? <p className="text-sm text-destructive" role="alert">{error}</p> : null}
         {catalog ? <p className="text-xs text-muted-foreground">Host: {catalog.host.executable} · {catalog.host.version}</p> : null}
-        {lanes.map((lane) => (
+        {lanes.map((lane) => {
+          const resolved = resolveLaneModel(lane.model, lanes);
+          const resolvedModel = catalog?.models.find((model) => model.selector === resolved);
+          const efforts = resolvedModel?.efforts ?? [];
+          // A saved effort the catalog does not list must still be shown, never masked as "No effort".
+          const effortChoices = lane.effort && !efforts.includes(lane.effort) ? [lane.effort, ...efforts] : efforts;
+          return (
           <div className="grid gap-2 border-b border-border/50 pb-3 sm:grid-cols-[10rem_minmax(0,1fr)_9rem]" key={lane.key}>
             <div className="min-w-0">
               <p className="font-medium">{lane.label}</p>
@@ -168,7 +175,11 @@ export function RoutingLanesSettingsCard() {
               onChange={(event) => updateLane(lane.key, { model: event.target.value, aliasOf: null })}
               value={lane.model.startsWith("@") ? lane.model : lane.model}
             >
-              {lane.model.startsWith("@") ? <option value={lane.model}>{lane.model} (lane alias)</option> : null}
+              {lane.model.startsWith("@") ? (
+                <option value={lane.model}>
+                  {lane.model} → {resolvedModel?.name ?? resolved ?? "unresolved"} (lane alias)
+                </option>
+              ) : null}
               {catalog?.models.map((model) => (
                 <option disabled={model.dead} key={model.selector} value={model.selector}>
                   {model.name}{model.dead ? " (unavailable on this account)" : ""}
@@ -178,16 +189,17 @@ export function RoutingLanesSettingsCard() {
             <label className="sr-only" htmlFor={`lane-effort-${lane.key}`}>{lane.label} effort</label>
             <select
               className="h-9 rounded-md border border-input bg-background px-2 text-sm"
-              disabled={!catalog || busy || (catalog.models.find((model) => model.selector === lane.model)?.efforts.length ?? 0) === 0}
+              disabled={!catalog || busy || effortChoices.length === 0}
               id={`lane-effort-${lane.key}`}
               onChange={(event) => updateLane(lane.key, { effort: event.target.value || null })}
               value={lane.effort ?? ""}
             >
               <option value="">No effort</option>
-              {catalog?.models.find((model) => model.selector === lane.model)?.efforts.map((effort) => <option key={effort} value={effort}>{effort}</option>)}
+              {effortChoices.map((effort) => <option key={effort} value={effort}>{effort}</option>)}
             </select>
           </div>
-        ))}
+          );
+        })}
         {preview ? (
           <section className="space-y-2 rounded-md border p-3" aria-label="Lane change preview">
             <h3 className="font-medium">Preview</h3>
@@ -214,3 +226,4 @@ export function RoutingLanesSettingsCard() {
     </SettingsOptionGroup>
   );
 }
+
