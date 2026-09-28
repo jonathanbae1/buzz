@@ -64,6 +64,7 @@ export function useMentionSendFlow({
   onAddressedAgentsComposerCleared,
   onAddressedAgentsSendFailed,
   onAddressedAgentsSendSucceeded,
+  onPromptSent,
   onSendRef,
   richText,
   setContent,
@@ -581,6 +582,7 @@ export function useMentionSendFlow({
             draft.capturedThreadContext,
             draft.preparedLinkPreviews != null,
           );
+          onPromptSent?.(draft.trimmed);
           // The relay accepted the publish: flush the queued wakes now,
           // before the post-send cancellation check — a cancellation racing
           // a successful publish must not drop the wake for a message that
@@ -709,6 +711,7 @@ export function useMentionSendFlow({
       onAddressedAgentsComposerCleared,
       onAddressedAgentsSendFailed,
       onAddressedAgentsSendSucceeded,
+      onPromptSent,
       onPrepareSendChannel,
       onSendRef,
       richText.setContent,

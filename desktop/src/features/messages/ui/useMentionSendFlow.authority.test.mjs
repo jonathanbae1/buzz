@@ -24,6 +24,35 @@ async function ordinary(s, gate) {
   return { promise };
 }
 
+test("prompt history callback runs only after the publish succeeds", async () => {
+  const s = await setup();
+  s.dismiss();
+  s.options.mentions.memberPubkeys = new Set([KEY]);
+  const publish = deferred();
+  s.control.publish = publish;
+  const recordedPrompts = [];
+  s.options.onPromptSent = (prompt) => {
+    assert.equal(s.events("SEND").length, 1);
+    recordedPrompts.push(prompt);
+  };
+  s.rerender();
+
+  let sending;
+  await s.act(async () => {
+    sending = s.result.current.sendMessageWithMentionFlow({
+      capturedChannelId: "general",
+      pendingImeta: [],
+      trimmed: TEXT,
+    });
+  });
+  assert.deepEqual(recordedPrompts, []);
+
+  await s.act(async () => {
+    publish.resolve();
+    await sending;
+  });
+  assert.deepEqual(recordedPrompts, [TEXT]);
+});
 // Bound the transition product, not just one reporter sequence. Same snapshot
 // authorship must supersede cleanup too; equality of content/refs is not intent.
 for (const outcome of ["failure", "success"]) {
