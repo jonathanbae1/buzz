@@ -162,13 +162,14 @@ async function seedWikiCheckout(
 
 async function openWiki(page: import("@playwright/test").Page) {
   await page.goto("/");
-  // The app shell boots slowly under the E2E bundle; wait for the sidebar
-  // before clicking, so a slow boot is not read as a missing entry point.
-  await expect(page.getByTestId("sidebar-primary-menu")).toBeVisible({
+  // Wait on the entry point itself, not a neighbour: the app shell boots slowly
+  // and unevenly under the E2E bundle, and a boot overlay can hold the sidebar
+  // visible while the click is still blocked.
+  await expect(page.getByTestId("open-wiki-view")).toBeVisible({
     timeout: 30_000,
   });
   await page.getByTestId("open-wiki-view").click();
-  await expect(page.getByTestId("wiki-screen")).toBeVisible();
+  await expect(page.getByTestId("wiki-screen")).toBeVisible({ timeout: 15_000 });
 }
 
 test.describe.configure({ timeout: 60_000 });
