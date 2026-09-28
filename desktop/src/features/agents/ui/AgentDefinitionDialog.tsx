@@ -70,6 +70,7 @@ import {
 import {
   useBakedBuildEnvKeysQuery,
   useOmpProfileCatalogQuery,
+  useRosterDeployPreviewQuery,
   useRuntimeFileConfigQuery,
 } from "../hooks";
 import { useAgentDialogDefaults } from "./useAgentDialogDefaults";
@@ -180,6 +181,9 @@ export function AgentDefinitionDialog({
     enabled:
       open &&
       (runtime.trim() === "omp" || initialValues?.runtime?.trim() === "omp"),
+  });
+  const rosterDeployPlanQuery = useRosterDeployPreviewQuery({
+    enabled: open && (runtime.trim() === "omp" || initialValues?.runtime?.trim() === "omp"),
   });
   const [isAvatarUploadPending, setIsAvatarUploadPending] =
     React.useState(false);
@@ -521,19 +525,23 @@ export function AgentDefinitionDialog({
     ompProfileSelection.length > 0 &&
     ompProfileCatalogQuery.data?.state === "configured" &&
     !ompProfileNames.has(ompProfileSelection);
+  const profileActivationUnavailable =
+    rosterDeployPlanQuery.isLoading ||
+    rosterDeployPlanQuery.isError ||
+    !rosterDeployPlanQuery.data;
+  const gatedProfileNames = new Set(
+    rosterDeployPlanQuery.data?.entries
+      .filter((entry) => entry.verdict === "unavailable")
+      .map((entry) => entry.name) ?? [],
+  );
   const ompProfileOptions = React.useMemo(() => {
-    const options: PersonaDropdownOption[] = [
-      { label: "Default (inherit)", value: "" },
-    ];
+    const options: PersonaDropdownOption[] = [{ label: "Default (inherit)", value: "" }];
     if (ompProfileCatalogQuery.data?.state === "configured") {
       options.push(
         ...ompProfileCatalogQuery.data.entries.map((entry) => ({
-          label:
-            entry.name === "default"
-              ? "default (machine fallback)"
-              : entry.name,
+          label: entry.name === "default" ? "default (machine fallback)" : entry.name,
           value: entry.name,
-          disabled: entry.name === "designer",
+          disabled: profileActivationUnavailable || gatedProfileNames.has(entry.name),
         })),
       );
     } else if (ompProfileSelection.length > 0) {
@@ -555,7 +563,7 @@ export function AgentDefinitionDialog({
       });
     }
     return options;
-  }, [ompProfileCatalogQuery.data, ompProfileNames, ompProfileSelection]);
+  }, [ompProfileCatalogQuery.data, ompProfileNames, ompProfileSelection, profileActivationUnavailable, gatedProfileNames]);
   const canSubmit =
     canSubmitPersonaDialog({ displayName, isPending }) &&
     (!isCreateMode || runtime.trim().length > 0) &&
@@ -919,6 +927,13 @@ export function AgentDefinitionDialog({
                 <p className="text-xs text-warning">
                   The omp profile catalogue is invalid. Repair it before
                   choosing a different profile.
+                </p>
+              ) : null}
+              {profileActivationUnavailable ? (
+                <p className="text-xs text-warning">
+                  {rosterDeployPlanQuery.isLoading
+                    ? "Checking profile activation status…"
+                    : "Profile activation status is unavailable. Profile selection is disabled until it can be checked."}
                 </p>
               ) : null}
             </div>

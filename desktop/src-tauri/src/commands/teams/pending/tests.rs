@@ -28,6 +28,7 @@ fn member(id: &str, display_name: &str) -> AgentDefinition {
         source_team_persona_slug: None,
         catalog_source: None,
         team_catalog_source: None,
+        deployment_identity: None,
         env_vars: BTreeMap::new(),
         respond_to: None,
         respond_to_allowlist: Vec::new(),
@@ -47,6 +48,7 @@ fn team() -> TeamRecord {
         is_builtin: false,
         shared: false,
         catalog_source: None,
+        preset_source: None,
         source_dir: Some(PathBuf::from("/local/only/path")),
         is_symlink: false,
         symlink_target: None,
@@ -497,7 +499,10 @@ fn team_with_members(id: &str, name: &str, persona_ids: Vec<String>) -> TeamReco
         version: None,
         created_at: "2026-07-30T00:00:00Z".to_string(),
         updated_at: "2026-07-30T00:00:00Z".to_string(),
-    }
+    
+preset_source: None,
+}
+
 }
 
 #[test]

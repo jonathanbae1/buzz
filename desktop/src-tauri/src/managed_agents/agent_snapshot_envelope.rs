@@ -425,6 +425,7 @@ mod tests {
             workspace_path: None,
             provider: None,
             team_catalog_source: None,
+            deployment_identity: None,
         }
     }
 

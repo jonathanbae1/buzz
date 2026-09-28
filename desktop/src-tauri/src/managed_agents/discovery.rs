@@ -713,6 +713,28 @@ pub(crate) fn is_npm_global_install(cmd: &str) -> bool {
         || t.starts_with("npm uninstall -g ")
 }
 
+/// Run `command --version` under a bounded deadline and return its first
+/// non-empty stdout line.
+///
+/// Same deadline discipline as [`probe_auth_status`]: a wedged binary must not
+/// stall a command boundary. Returns `None` on spawn failure, timeout, or empty
+/// output — callers treat that as "unknown", never as a version.
+pub(crate) fn probe_version(command: &str) -> Option<String> {
+    let augmented_path = crate::managed_agents::readiness::cli_probe::augmented_path();
+    let mut probe = Command::new(command);
+    probe.arg("--version");
+    if let Some(path) = augmented_path.as_deref() {
+        probe.env("PATH", path);
+    }
+    let output = bounded_command::output_with_timeout(probe, Duration::from_secs(10))?;
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    stdout
+        .lines()
+        .map(str::trim)
+        .find(|line| !line.is_empty())
+        .map(str::to_string)
+}
+
 /// Run a CLI auth probe with a 10-second process-level timeout.
 ///
 /// On timeout or spawn failure the child is killed and `Unknown` is returned;

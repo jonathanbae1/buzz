@@ -250,7 +250,6 @@ export function AgentsView() {
                 void agents.handleStartPersona(persona);
               }}
               // Persona props
-              allPersonas={personas.personasQuery.data ?? []}
               ompProfileCatalog={personas.ompProfileCatalogQuery.data}
               ompProfileCatalogError={
                 personas.ompProfileCatalogQuery.error instanceof Error
@@ -260,9 +259,12 @@ export function AgentsView() {
               isOmpProfileCatalogLoading={
                 personas.ompProfileCatalogQuery.isLoading
               }
-              onAddMissingOmpProfiles={() => {
-                void personas.addMissingOmpProfiles();
-              }}
+              rosterDeployPlan={personas.rosterDeployPlan}
+              onPreviewRosterDeploy={() => void personas.previewRosterDeploy()}
+              onApplyRosterDeploy={() => void personas.applyRosterDeploy()}
+              onMapRosterProfile={personas.mapRosterProfile}
+              onCreateRosterProfile={personas.createRosterProfile}
+              onDismissRosterDeployPlan={personas.dismissRosterDeployPlan}
               personas={personas.libraryPersonas}
               personasError={
                 personas.personasQuery.error instanceof Error

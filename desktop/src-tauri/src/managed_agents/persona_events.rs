@@ -250,6 +250,7 @@ pub fn persona_from_event(event: &nostr::Event) -> Result<AgentDefinition, Strin
         source_team_persona_slug: Some(d_tag),
         catalog_source: None,
         team_catalog_source: None,
+        deployment_identity: None,
         env_vars: BTreeMap::new(),
         respond_to: content.respond_to,
         respond_to_allowlist: content.respond_to_allowlist,

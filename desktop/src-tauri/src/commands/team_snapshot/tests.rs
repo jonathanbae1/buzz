@@ -71,6 +71,7 @@ fn team_export_round_trip_preserves_team_and_excludes_member_memory() {
             source_team_persona_slug: None,
             catalog_source: None,
             team_catalog_source: None,
+            deployment_identity: None,
             env_vars: Default::default(),
             respond_to: None,
             respond_to_allowlist: vec![],
@@ -95,6 +96,7 @@ fn team_export_round_trip_preserves_team_and_excludes_member_memory() {
             source_team_persona_slug: None,
             catalog_source: None,
             team_catalog_source: None,
+            deployment_identity: None,
             env_vars: Default::default(),
             respond_to: None,
             respond_to_allowlist: vec![],
@@ -112,6 +114,7 @@ fn team_export_round_trip_preserves_team_and_excludes_member_memory() {
         is_builtin: false,
         shared: false,
         catalog_source: None,
+        preset_source: None,
         source_dir: None,
         is_symlink: false,
         symlink_target: None,
@@ -167,6 +170,7 @@ fn team_export_with_instance_and_memory_level_uses_supplied_entries() {
         source_team_persona_slug: None,
         catalog_source: None,
         team_catalog_source: None,
+        deployment_identity: None,
         env_vars: Default::default(),
         respond_to: None,
         respond_to_allowlist: vec![],
@@ -189,7 +193,9 @@ fn team_export_with_instance_and_memory_level_uses_supplied_entries() {
         version: None,
         created_at: "now".to_string(),
         updated_at: "now".to_string(),
-    };
+    
+preset_source: None,
+};
 
     // Build a fake instance record tied to this team+persona.
     let instance = ManagedAgentRecord {
@@ -244,6 +250,7 @@ fn team_export_with_instance_and_memory_level_uses_supplied_entries() {
         source_team_persona_slug: None,
         catalog_source: None,
         team_catalog_source: None,
+        deployment_identity: None,
         definition_respond_to: None,
         definition_respond_to_allowlist: vec![],
         definition_parallelism: None,
@@ -711,6 +718,7 @@ fn full_rollback_at_teams_boundary_absent_agents_store() {
         is_builtin: false,
         shared: false,
         catalog_source: None,
+        preset_source: None,
         source_dir: None,
         is_symlink: false,
         symlink_target: None,

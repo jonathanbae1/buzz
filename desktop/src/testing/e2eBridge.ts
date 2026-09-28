@@ -34,9 +34,13 @@ import { mockSearchHitMatches } from "./e2eBridgeSearch.ts";
 export { mockSearchHitMatches };
 import type { ConnectionState } from "@/shared/api/relayClientShared";
 import type {
+  ApplyRosterDeployResult,
   ChannelTemplate,
   FeedItemCategory,
+  OmpProfileCatalog,
   RelayEvent,
+  RosterDeployPlan,
+  TeamPreset,
 } from "@/shared/api/types";
 import { getMarkdownParseCount } from "@/shared/ui/markdown/nodeCache";
 import { syncAgentTurnsFromEvents } from "@/features/agents/activeAgentTurnsStore";
@@ -1044,6 +1048,7 @@ type RawTeam = {
   is_builtin: boolean;
   shared?: boolean;
   catalog_source?: { owner_pubkey: string; team_d_tag: string } | null;
+  preset_source?: { slug: string; version: string } | null;
   source_dir: string | null;
   is_symlink: boolean;
   symlink_target: string | null;
@@ -9172,6 +9177,155 @@ function ensureMockPersonaIdsAreActive(personaIds: string[]) {
   }
 }
 
+function createMockRosterDeployPlan(): RosterDeployPlan {
+  const entry = (
+    name: string,
+    verdict: RosterDeployPlan["entries"][number]["verdict"],
+    message: string,
+  ): RosterDeployPlan["entries"][number] => ({
+    name,
+    verdict,
+    kind: verdict === "unmapped" ? "unmapped-unaccounted" : null,
+    via: null,
+    personaId: null,
+    personaDisplayName: null,
+    currentSelector: null,
+    message,
+    detail: null,
+    candidates: [],
+    rulePaths: [`profiles/roles/${name}.md`],
+    pluginNames: [],
+    modelLane: "anthropic/claude-opus-5-5:high",
+    expectedDigest: null,
+  });
+
+  const candidates = mockPersonas
+    .filter((persona) => !persona.is_builtin && persona.runtime === "omp")
+    .map((persona) => ({
+      personaId: persona.id,
+      displayName: persona.display_name,
+      expectedDigest: `digest-${persona.id}`,
+    }));
+  const entries = [
+    entry("coder", "create", "A new agent can be created for this profile."),
+    {
+      ...entry("reviewer", "unmapped", "Choose an agent or deploy a new one."),
+      candidates,
+    },
+    {
+      ...entry("scout", "unmapped", "Choose an agent or deploy a new one."),
+      candidates,
+    },
+    entry("designer", "unavailable", "Profile activation proof is unavailable."),
+  ].map((rosterEntry) => {
+    if (rosterEntry.verdict === "unavailable") return rosterEntry;
+    const selectorHolders = mockPersonas.filter(
+      (persona) => persona.env_vars?.OMP_PROFILE === rosterEntry.name,
+    );
+    const eligibleHolders = selectorHolders.filter(
+      (persona) => persona.runtime === "omp",
+    );
+    if (
+      selectorHolders.length > 0 &&
+      (selectorHolders.length > 1 ||
+        eligibleHolders.length !== selectorHolders.length)
+    ) {
+      return {
+        ...rosterEntry,
+        verdict: "unmapped" as const,
+        kind: "unmapped-claimants" as const,
+        candidates: eligibleHolders.map((persona) => ({
+          personaId: persona.id,
+          displayName: persona.display_name,
+          expectedDigest: `digest-${persona.id}`,
+        })),
+        message: "Existing agents claim this profile; resolve them first.",
+      };
+    }
+    const persona = selectorHolders[0];
+    if (!persona) return rosterEntry;
+    return {
+      ...rosterEntry,
+      verdict: "unchanged" as const,
+      personaId: persona.id,
+      personaDisplayName: persona.display_name,
+      currentSelector: rosterEntry.name,
+      expectedDigest: `digest-${persona.id}`,
+      candidates: [],
+      message: "The agent is already deployed for this profile.",
+    };
+  });
+  const counts = {
+    create: 0,
+    adopt: 0,
+    unchanged: 0,
+    diverged: 0,
+    unmapped: 0,
+    conflict: 0,
+    unavailable: 0,
+    applyable: 0,
+  };
+  for (const rosterEntry of entries) {
+    counts[rosterEntry.verdict] += 1;
+    if (
+      rosterEntry.verdict === "create" ||
+      rosterEntry.verdict === "adopt"
+    ) {
+      counts.applyable += 1;
+    }
+  }
+  const buildTeam = mockTeams.find(
+    (team) => team.preset_source?.slug === "build",
+  );
+  const buildMembers = ["coder", "reviewer", "scout"];
+  const buildReady = buildMembers.every((profile) => {
+    const entry = entries.find((candidate) => candidate.name === profile);
+    return (
+      entry &&
+      ["create", "adopt", "unchanged", "diverged"].includes(entry.verdict)
+    );
+  });
+  return {
+    ambient: "default",
+    entries,
+    notInstalled: [],
+    manualValue: [],
+    teams: [
+      {
+        slug: "build",
+        name: "Build",
+        version: "1",
+        verdict: buildTeam
+          ? "unchanged"
+          : buildReady
+            ? "create"
+            : "blocked",
+        teamId: buildTeam?.id ?? null,
+        members: buildMembers.map((profile) => {
+          const entry = entries.find((candidate) => candidate.name === profile);
+          return {
+            profile,
+            personaId: entry?.verdict === "create" ? null : (entry?.personaId ?? null),
+            displayName: entry?.personaDisplayName ?? null,
+            message: entry?.message ?? "Profile is unavailable.",
+          };
+        }),
+        message: buildTeam
+          ? "The Build preset is already deployed."
+          : buildReady
+            ? "The Build preset can be created."
+            : "The Build preset needs resolved profiles.",
+        expectedDigest: null,
+        memberProfiles: buildMembers,
+      },
+    ],
+    sharedMembers: [],
+    counts,
+    applyBlocked: counts.unmapped > 0 || counts.conflict > 0,
+  };
+}
+
+
 function cloneMockTeam(team: RawTeam): RawTeam {
   return { ...team, persona_ids: [...team.persona_ids] };
 }
@@ -13698,6 +13852,137 @@ export function maybeInstallE2eTauriMocks() {
         );
       case "list_teams":
         return handleListTeams();
+
+      case "get_omp_profile_catalog":
+        return {
+          state: "configured",
+          entries: ["default", "coder", "reviewer", "scout", "designer"].map(
+            (name) => ({
+              name,
+              modelLane: "anthropic/claude-opus-5-5:high",
+              rulePaths: [
+                "profiles/rules/global.md",
+                ...(name === "default" ? [] : [`profiles/roles/${name}.md`]),
+              ],
+              pluginNames: [],
+            }),
+          ),
+          unavailableReason: null,
+        } satisfies OmpProfileCatalog;
+
+      case "preview_roster_deploy":
+        return createMockRosterDeployPlan();
+      case "apply_roster_deploy": {
+        const defaultPlan = createMockRosterDeployPlan();
+        // The bridge dispatches by command name, outside the generic type.
+        // The frontend command wrapper supplies the `input` envelope.
+        const commandInput = payload as {
+          input?: { plan?: RosterDeployPlan };
+        };
+        const submittedPlan = commandInput.input?.plan ?? defaultPlan;
+        const requested = submittedPlan.entries.filter(
+          (entry) =>
+            entry.verdict === "create" ||
+            (entry.verdict === "adopt" && entry.via === "userMap"),
+        );
+        const now = new Date().toISOString();
+        for (const entry of requested) {
+          if (entry.verdict === "create") {
+            mockPersonas.push({
+              id: `roster:${entry.name}`,
+              display_name: entry.name,
+              avatar_url: null,
+              description: null,
+              system_prompt: "",
+              runtime: "omp",
+              model: null,
+              provider: null,
+              name_pool: [],
+              is_builtin: false,
+              is_active: true,
+              shared: false,
+              source_team: null,
+              env_vars: { OMP_PROFILE: entry.name },
+              created_at: now,
+              updated_at: now,
+            });
+          } else {
+            const persona = mockPersonas.find(
+              (candidate) => candidate.id === entry.personaId,
+            );
+            if (persona) {
+              persona.env_vars = {
+                ...(persona.env_vars ?? {}),
+                OMP_PROFILE: entry.name,
+              };
+              persona.updated_at = now;
+            }
+          }
+        }
+        const applied = requested.map((entry) => ({
+          name: entry.name,
+          outcome: entry.verdict === "create" ? "created" : "adopted",
+          reason: null,
+        }));
+        for (const submittedTeam of submittedPlan.teams) {
+          if (
+            submittedTeam.verdict !== "create" ||
+            mockTeams.some(
+              (team) => team.preset_source?.slug === submittedTeam.slug,
+            )
+          ) {
+            continue;
+          }
+          const team: RawTeam = {
+            id: `roster-team:${submittedTeam.slug}`,
+            name: submittedTeam.name,
+            description: null,
+            persona_ids: submittedTeam.memberProfiles.flatMap((profile) => {
+              const persona = mockPersonas.find(
+                (candidate) => candidate.env_vars?.OMP_PROFILE === profile,
+              );
+              return persona ? [persona.id] : [];
+            }),
+            is_builtin: false,
+            preset_source: {
+              slug: submittedTeam.slug,
+              version: submittedTeam.version,
+            },
+            source_dir: null,
+            is_symlink: false,
+            symlink_target: null,
+            version: null,
+            created_at: now,
+            updated_at: now,
+          };
+          mockTeams.push(team);
+          applied.push({
+            name: submittedTeam.slug,
+            outcome: "teamCreated",
+            reason: null,
+          });
+        }
+        return {
+          applied,
+          refreshed: createMockRosterDeployPlan(),
+          stale: false,
+        } satisfies ApplyRosterDeployResult;
+      }
+      case "list_team_presets":
+        return [
+          {
+            slug: "build",
+            name: "Build",
+            description: "Implementation, review and reconnaissance for shipping work.",
+            members: ["coder", "reviewer", "scout"],
+          },
+          {
+            slug: "design-review",
+            name: "Design review",
+            description: "Bursty design and image review on the Google bucket.",
+            members: ["designer", "reviewer"],
+          },
+        ] satisfies TeamPreset[];
       case "set_team_shared":
         return handleSetTeamShared(
           payload as Parameters<typeof handleSetTeamShared>[0],

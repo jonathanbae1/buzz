@@ -63,9 +63,12 @@ export {
   useRetryBootWarm,
 } from "@/features/agents/acpRuntimesQuery";
 import {
+  applyRosterDeploy,
   createPersona,
   deletePersona,
   listPersonas,
+  listTeamPresets,
+  previewRosterDeploy,
   setPersonaActive,
   updatePersona,
 } from "@/shared/api/tauriPersonas";
@@ -77,7 +80,10 @@ import type {
   CreateManagedAgentInput,
   CreatePersonaInput,
   ManagedAgent,
+  ApplyRosterDeployResult,
   OmpProfileCatalog,
+  RosterDeployPlan,
+  TeamPreset,
   UpdateManagedAgentInput,
   UpdatePersonaInput,
 } from "@/shared/api/types";
@@ -141,6 +147,41 @@ export const managedAgentPrereqsQueryKey = ["managed-agent-prereqs"] as const;
 export const backendProvidersQueryKey = ["backend-providers"] as const;
 export const gitBashPrerequisiteQueryKey = ["git-bash-prerequisite"] as const;
 export const ompProfileCatalogQueryKey = ["omp-profile-catalog"] as const;
+
+export const rosterDeployQueryKey = ["roster-deploy-preview"] as const;
+export const teamPresetsQueryKey = ["team-presets"] as const;
+
+export function useRosterDeployPreviewQuery(options?: { enabled?: boolean }) {
+  return useQuery<RosterDeployPlan>({
+    enabled: options?.enabled ?? true,
+    queryKey: rosterDeployQueryKey,
+    queryFn: previewRosterDeploy,
+    staleTime: 0,
+    retry: false,
+  });
+}
+
+export function useTeamPresetsQuery() {
+  return useQuery<TeamPreset[]>({
+    queryKey: teamPresetsQueryKey,
+    queryFn: listTeamPresets,
+    staleTime: 5 * 60_000,
+  });
+}
+
+export function useApplyRosterDeployMutation() {
+  const queryClient = useQueryClient();
+  return useMutation<ApplyRosterDeployResult, Error, RosterDeployPlan>({
+    mutationFn: applyRosterDeploy,
+    onSettled: async () => {
+      await Promise.all([
+        queryClient.invalidateQueries({ queryKey: personasQueryKey }),
+        queryClient.invalidateQueries({ queryKey: teamsQueryKey }),
+        queryClient.invalidateQueries({ queryKey: rosterDeployQueryKey }),
+      ]);
+    },
+  });
+}
 
 type InvalidateAgentQueriesOptions = {
   refetchChannels?: boolean;

@@ -114,6 +114,7 @@ mod tests {
             is_builtin: false,
             shared: false,
             catalog_source: None,
+            preset_source: None,
             source_dir: Some(PathBuf::from("/local/only/path")),
             is_symlink: true,
             symlink_target: Some("/somewhere".to_string()),

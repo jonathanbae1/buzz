@@ -38,10 +38,18 @@ fn validate_persona_env_assignments(
             "OMP_PROFILE `{raw_profile}` is not an installed profile"
         ));
     }
-    if raw_profile == "designer" {
-        return Err(
-            "the designer profile remains catalogue-only until activation is proven".to_string(),
-        );
+    // The one gate: a machine-local proof record, read here so it applies to
+    // every caller — the edit dialog, the roster apply, an imported payload.
+    // A UI flag alone is never a control.
+    let gate = crate::managed_agents::deployment::activation::ActivationGates::load();
+    if !gate.state(raw_profile).is_authorized() {
+        return Err(format!(
+            "the `{raw_profile}` profile is not authorized for deployment on this machine: {}. Its proof record belongs at {}.",
+            gate.state(raw_profile)
+                .reason()
+                .unwrap_or("activation is not proved"),
+            gate.path().display()
+        ));
     }
 
     if existing.iter().any(|persona| {

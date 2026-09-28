@@ -1,11 +1,13 @@
 import { invokeTauri } from "@/shared/api/tauri";
 import type {
   AgentPersona,
+  ApplyRosterDeployResult,
   CreatePersonaInput,
   RespondToMode,
+  RosterDeployPlan,
+  TeamPreset,
   UpdatePersonaInput,
 } from "@/shared/api/types";
-
 export type RawPersona = {
   id: string;
   display_name: string;
@@ -227,6 +229,22 @@ export async function exportAgentSnapshot(
     format,
     avatarPngDataUrl: avatarPngDataUrl ?? null,
   });
+}
+
+export function previewRosterDeploy(): Promise<RosterDeployPlan> {
+  return invokeTauri<RosterDeployPlan>("preview_roster_deploy");
+}
+
+export function applyRosterDeploy(
+  plan: RosterDeployPlan,
+): Promise<ApplyRosterDeployResult> {
+  return invokeTauri<ApplyRosterDeployResult>("apply_roster_deploy", {
+    input: { plan },
+  });
+}
+
+export function listTeamPresets(): Promise<TeamPreset[]> {
+  return invokeTauri<TeamPreset[]>("list_team_presets");
 }
 
 /** The byte payload returned by `encode_agent_snapshot_for_send`. */

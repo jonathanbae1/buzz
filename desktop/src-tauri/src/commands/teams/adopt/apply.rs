@@ -296,6 +296,7 @@ pub(super) fn plan_add(
         // its new owner, at their own coordinate.
         shared: false,
         catalog_source: Some(source.clone()),
+        preset_source: None,
         source_dir: None,
         is_symlink: false,
         symlink_target: None,
@@ -458,6 +459,7 @@ fn member_copy(
             member_key: member.member_key.clone(),
             projection_hash: member_version_hash(member),
         }),
+        deployment_identity: None,
         env_vars: Default::default(),
         // Validated at the boundary rather than copied opaquely: an
         // unrecognized mode from a foreign publisher must not become a local

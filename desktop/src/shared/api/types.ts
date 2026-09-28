@@ -794,6 +794,112 @@ export type OmpProfileCatalog = {
   entries: OmpProfileCatalogEntry[];
   unavailableReason: OmpProfileUnavailableReason | null;
 };
+export type RosterVerdict =
+  | "create"
+  | "adopt"
+  | "unchanged"
+  | "diverged"
+  | "unmapped"
+  | "conflict"
+  | "unavailable";
+
+export type RosterVerdictKind =
+  | "name-taken"
+  | "name-taken-non-omp"
+  | "profile-claimed"
+  | "unmapped-claimants"
+  | "unmapped-unaccounted"
+  | "manual-value"
+  | "diverged-cleared"
+  | "diverged-reassigned"
+  | "duplicate-deployment"
+  | "not-installed";
+
+export type RosterCandidate = {
+  personaId: string;
+  displayName: string;
+  expectedDigest: string;
+};
+
+export type RosterPlanEntry = {
+  name: string;
+  verdict: RosterVerdict;
+  kind: RosterVerdictKind | null;
+  via: "provenance" | "userMap" | null;
+  personaId: string | null;
+  personaDisplayName: string | null;
+  currentSelector: string | null;
+  message: string;
+  detail: string | null;
+  candidates: RosterCandidate[];
+  rulePaths: string[];
+  pluginNames: string[];
+  modelLane: string;
+  expectedDigest: string | null;
+};
+
+export type TeamPresetVerdict = "create" | "unchanged" | "edited" | "blocked";
+export type TeamMemberResolution = {
+  profile: string;
+  personaId: string | null;
+  displayName: string | null;
+  message: string;
+};
+export type TeamPlanEntry = {
+  slug: string;
+  name: string;
+  version: string;
+  verdict: TeamPresetVerdict;
+  teamId: string | null;
+  members: TeamMemberResolution[];
+  message: string;
+  expectedDigest: string | null;
+  memberProfiles: string[];
+};
+export type RosterDeployPlan = {
+  ambient: string | null;
+  entries: RosterPlanEntry[];
+  notInstalled: Array<{
+    personaId: string;
+    displayName: string;
+    selector: string;
+    message: string;
+  }>;
+  manualValue: Array<{
+    personaId: string;
+    displayName: string;
+    selector: string;
+    message: string;
+  }>;
+  teams: TeamPlanEntry[];
+  sharedMembers: Array<{
+    personaId: string;
+    displayName: string;
+    presetSlugs: string[];
+  }>;
+  counts: {
+    create: number;
+    adopt: number;
+    unchanged: number;
+    diverged: number;
+    unmapped: number;
+    conflict: number;
+    unavailable: number;
+    applyable: number;
+  };
+  applyBlocked: boolean;
+};
+export type ApplyRosterDeployResult = {
+  applied: Array<{ name: string; outcome: string; reason: string | null }>;
+  refreshed: RosterDeployPlan;
+  stale: boolean;
+};
+export type TeamPreset = {
+  slug: string;
+  name: string;
+  description: string;
+  members: string[];
+};
 
 export type RuntimeConfigSurface = {
   runtimeId: string | null;

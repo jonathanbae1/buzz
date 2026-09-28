@@ -82,6 +82,16 @@ pub struct AgentDefinition {
     /// coordinate — see [`TeamMemberCatalogSource`].
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub team_catalog_source: Option<TeamMemberCatalogSource>,
+    /// Immutable deployment provenance: which installed omp profile the roster
+    /// deploy created this persona for.
+    ///
+    /// Distinct from the mutable `env_vars.OMP_PROFILE` selector — "already
+    /// deployed?" is answered here, "what runs?" is answered there. Written
+    /// once at first claim and never rewritten, so clearing or repointing the
+    /// selector is reported as `diverged` rather than repaired. Not part of the
+    /// published projection, so it does not move `persona_content_hash`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub deployment_identity: Option<DeploymentIdentity>,
     /// Harness-level configuration passed to the agent subprocess as environment variables.
     /// Opaque to Buzz — keys and values are runtime-specific.
     ///
@@ -164,6 +174,7 @@ impl AgentDefinition {
             source_team_persona_slug: self.source_team_persona_slug,
             catalog_source: self.catalog_source,
             team_catalog_source: self.team_catalog_source,
+            deployment_identity: self.deployment_identity,
             definition_respond_to: self.respond_to,
             definition_respond_to_allowlist: self.respond_to_allowlist,
             definition_parallelism: self.parallelism,
@@ -202,6 +213,7 @@ impl ManagedAgentRecord {
             source_team_persona_slug: self.source_team_persona_slug.clone(),
             catalog_source: self.catalog_source.clone(),
             team_catalog_source: self.team_catalog_source.clone(),
+            deployment_identity: self.deployment_identity.clone(),
             env_vars: self.env_vars.clone(),
             respond_to: self.definition_respond_to.clone(),
             respond_to_allowlist: self.definition_respond_to_allowlist.clone(),
@@ -444,6 +456,12 @@ pub struct ManagedAgentRecord {
     /// publication and member this definition was copied out of.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub team_catalog_source: Option<TeamMemberCatalogSource>,
+    /// Absorbed from `AgentDefinition.deployment_identity` — which installed
+    /// omp profile the roster deploy created this definition for. Immutable
+    /// deployment provenance, distinct from the `env_vars.OMP_PROFILE`
+    /// selector that answers what the agent runs as.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub deployment_identity: Option<DeploymentIdentity>,
     /// NIP-AP definition-level behavioral defaults, absorbed from
     /// `AgentDefinition` in WIRE shape (kebab-case string / optional u32),
     /// distinct from the instance-side `respond_to`/`respond_to_allowlist`/
@@ -999,6 +1017,8 @@ pub fn resolve_mint_behavioral_defaults(
 
 mod catalog_source;
 pub use catalog_source::CatalogSource;
+mod deployment;
+pub use deployment::{DeploymentIdentity, TeamPresetSource};
 mod relay_mesh;
 pub use relay_mesh::RelayMeshConfig;
 mod requests;
