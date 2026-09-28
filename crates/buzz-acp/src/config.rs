@@ -1158,6 +1158,14 @@ impl Config {
                 false
             };
 
+        // The M1 `/work` extension claims actions for the agent it runs as. Buzz assigns tasks to
+        // `buzz:<pubkey hex>`, so the worker must claim under that exact identity; without this
+        // the extension falls back to a generic id and every claim of an assigned action fails.
+        persona_env_vars.push((
+            "M1_WORK_AGENT_ID".to_string(),
+            format!("buzz:{}", keys.public_key().to_hex()),
+        ));
+
         validate_multiple_event_handling(args.multiple_event_handling, args.dedup)?;
 
         let config = Config {
@@ -2991,6 +2999,21 @@ channels = "ALL"
         .expect("clap should parse session mode");
         let config = Config::from_args(args).expect("session mode should be valid");
         assert_eq!(config.session_mode.as_deref(), Some("plan"));
+    }
+
+    #[test]
+    fn agent_child_env_carries_the_task_assignment_identity() {
+        let args = CliArgs::try_parse_from(["buzz-acp", "--private-key", TEST_PRIVATE_KEY])
+            .expect("clap should parse minimal args");
+        let config = Config::from_args(args).expect("minimal config should be valid");
+        let expected = format!("buzz:{}", config.keys.public_key().to_hex());
+        assert!(
+            config
+                .persona_env_vars
+                .iter()
+                .any(|(name, value)| name == "M1_WORK_AGENT_ID" && *value == expected),
+            "the worker must claim tasks as the identity Buzz assigns them to"
+        );
     }
 
     #[test]
