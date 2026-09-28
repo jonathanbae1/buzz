@@ -8,6 +8,8 @@
 //! under the lock, so reusing it with preview-era values would overwrite an
 //! edit made while the dialog was open (M2 plan, "Apply-time revalidation").
 
+use std::collections::HashSet;
+
 use tauri::AppHandle;
 use uuid::Uuid;
 
@@ -20,7 +22,8 @@ use crate::{
         deployment::presets::{member_ids, new_preset_team, TEAM_PRESETS},
         deployment::roster::{
             apply_adoption, new_deployed_persona, plan_roster_deploy, AdoptVia, ProfileMapping,
-            RosterDeployPlan, RosterPlanEntry, RosterVerdict, TeamPresetVerdict,
+            RosterDeployPlan, RosterPlanEntry, RosterVerdict, RosterVerdictKind, TeamPlanEntry,
+            TeamPresetVerdict,
         },
         ensure_persona_ids_are_active, load_personas, load_teams, save_personas, save_teams,
         TeamRecord,
@@ -96,7 +99,13 @@ fn recompute(
     // The user's answers ride on the submitted plan: an `adopt` with
     // `via: userMap` IS the mapping. Recomputing with them is what makes the
     // revalidation a recompute rather than a field-by-field diff.
-    let mappings: Vec<ProfileMapping> = submissions
+    let mappings = profile_mappings(submissions)?;
+    let plan = plan_roster_deploy(&declarations, &personas, &teams, &gates, &mappings);
+    Ok((plan, personas, teams))
+}
+
+fn profile_mappings(plan: Option<&RosterDeployPlan>) -> Result<Vec<ProfileMapping>, String> {
+    let mappings: Vec<ProfileMapping> = plan
         .map(|plan| {
             plan.entries
                 .iter()
@@ -112,16 +121,24 @@ fn recompute(
                 .collect()
         })
         .unwrap_or_default();
+    ensure_unique_mapping_targets(&mappings)?;
+    Ok(mappings)
+}
 
-    let plan = plan_roster_deploy(&declarations, &personas, &teams, &gates, &mappings);
-    Ok((plan, personas, teams))
+fn ensure_unique_mapping_targets(mappings: &[ProfileMapping]) -> Result<(), String> {
+    let mut persona_ids = HashSet::with_capacity(mappings.len());
+    if mappings
+        .iter()
+        .any(|mapping| !persona_ids.insert(mapping.persona_id.as_str()))
+    {
+        return Err("an agent can be mapped to only one omp profile".to_string());
+    }
+    Ok(())
 }
 
 /// Read-only: what a deploy would do right now. Writes nothing.
 #[tauri::command]
-pub async fn preview_roster_deploy(
-    app: AppHandle,
-) -> Result<RosterDeployPlan, String> {
+pub async fn preview_roster_deploy(app: AppHandle) -> Result<RosterDeployPlan, String> {
     tokio::task::spawn_blocking(move || recompute(&app, None).map(|(plan, _, _)| plan))
         .await
         .map_err(|e| format!("spawn_blocking failed: {e}"))?
@@ -146,13 +163,14 @@ pub fn list_team_presets() -> Vec<serde_json::Value> {
 
 /// Compare a submitted entry against its recomputed counterpart.
 ///
-/// Returns `Ok(())` when the entry may be applied, or `Err(reason)` naming what
-/// moved. Every input that could have changed — the verdict, the adoption
-/// route, the target row, and that row's content hash — is compared, because
-/// any one of them changing means the user is no longer looking at the state
-/// apply would write to.
+/// An explicit create choice may resolve only an `unmapped-unaccounted` entry:
+/// selector claimants must be mapped or repaired before deployment.
 fn admit(submitted: &RosterPlanEntry, current: &RosterPlanEntry) -> Result<(), String> {
-    if submitted.verdict != current.verdict {
+    let create_from_unmapped = submitted.verdict == RosterVerdict::Create
+        && current.verdict == RosterVerdict::Unmapped
+        && submitted.kind == Some(RosterVerdictKind::UnmappedUnaccounted)
+        && current.kind == Some(RosterVerdictKind::UnmappedUnaccounted);
+    if submitted.verdict != current.verdict && !create_from_unmapped {
         return Err(format!(
             "the entry is no longer `{}` (it is now `{}`)",
             verb(submitted.verdict),
@@ -168,7 +186,50 @@ fn admit(submitted: &RosterPlanEntry, current: &RosterPlanEntry) -> Result<(), S
     if submitted.expected_digest != current.expected_digest {
         return Err("this agent changed while you were looking".to_string());
     }
+    if create_from_unmapped && submitted.candidates != current.candidates {
+        return Err("the candidate agents changed while you were looking".to_string());
+    }
     Ok(())
+}
+
+fn admit_team_create(
+    submitted: &TeamPlanEntry,
+    current: &TeamPlanEntry,
+) -> Result<(), String> {
+    if submitted.verdict != TeamPresetVerdict::Create
+        || current.verdict != TeamPresetVerdict::Create
+    {
+        return Err("the team preset is no longer available for creation".to_string());
+    }
+    if submitted.name != current.name
+        || submitted.version != current.version
+        || submitted.member_profiles != current.member_profiles
+        || submitted.expected_digest != current.expected_digest
+    {
+        return Err("the team preset changed while you were looking".to_string());
+    }
+    Ok(())
+}
+
+fn persist_adoption(
+    personas: &mut [crate::managed_agents::AgentDefinition],
+    index: usize,
+    profile_name: &str,
+    now: &str,
+    save: impl FnOnce(&[crate::managed_agents::AgentDefinition]) -> Result<(), String>,
+) -> Result<crate::managed_agents::AgentDefinition, String> {
+    let Some(original) = personas.get(index).cloned() else {
+        return Err("the adoption target is gone".to_string());
+    };
+    apply_adoption(&mut personas[index], profile_name, now);
+    personas[index].updated_at = now.to_string();
+    let snapshot = personas[index].clone();
+
+    if let Err(error) = save(personas) {
+        personas[index] = original;
+        return Err(error);
+    }
+    Ok(snapshot)
 }
 
 fn verb(verdict: RosterVerdict) -> &'static str {
@@ -202,6 +263,7 @@ pub async fn apply_roster_deploy(
     tokio::task::spawn_blocking(move || {
         let state = app.state::<AppState>();
         let submitted = input.plan;
+        let mappings = profile_mappings(Some(&submitted))?;
         let mut applied: Vec<AppliedEntry> = Vec::new();
         let mut stale = false;
 
@@ -220,19 +282,6 @@ pub async fn apply_roster_deploy(
 
         let mut personas = load_personas(&app)?;
         let mut teams = load_teams(&app)?;
-        let mappings: Vec<ProfileMapping> = submitted
-            .entries
-            .iter()
-            .filter(|entry| {
-                entry.verdict == RosterVerdict::Adopt && entry.via == Some(AdoptVia::UserMap)
-            })
-            .filter_map(|entry| {
-                entry.persona_id.as_ref().map(|persona_id| ProfileMapping {
-                    name: entry.name.clone(),
-                    persona_id: persona_id.clone(),
-                })
-            })
-            .collect();
         let current = plan_roster_deploy(&declarations, &personas, &teams, &gates, &mappings);
 
         // ── Personas ─────────────────────────────────────────────────────────
@@ -314,9 +363,9 @@ pub async fn apply_roster_deploy(
                         });
                         continue;
                     };
-                    let Some(persona) = personas
-                        .iter_mut()
-                        .find(|persona| persona.id == persona_id)
+                    let Some(persona_index) = personas
+                        .iter()
+                        .position(|persona| persona.id == persona_id)
                     else {
                         stale = true;
                         applied.push(AppliedEntry {
@@ -326,14 +375,14 @@ pub async fn apply_roster_deploy(
                         });
                         continue;
                     };
-                    // Only the identity keys move: provenance, and the selector
-                    // when the row has none. Everything else on the current row
-                    // is left byte-identical.
-                    apply_adoption(persona, &submitted_entry.name, &now);
-                    persona.updated_at = now.clone();
-                    let snapshot = persona.clone();
-                    match save_personas(&app, &personas) {
-                        Ok(()) => {
+                    match persist_adoption(
+                        &mut personas,
+                        persona_index,
+                        &submitted_entry.name,
+                        &now,
+                        |records| save_personas(&app, records),
+                    ) {
+                        Ok(snapshot) => {
                             retain_persona_pending(&app, &state, &snapshot);
                             applied.push(AppliedEntry {
                                 name: submitted_entry.name.clone(),
@@ -364,8 +413,40 @@ pub async fn apply_roster_deploy(
         // from a plan recomputed over the *post-persona* store, so a member
         // created moments ago has an id to bind.
         let mid = plan_roster_deploy(&declarations, &personas, &teams, &gates, &mappings);
+        let mut attempted_team_slugs = HashSet::new();
         for submitted_team in &submitted.teams {
             if submitted_team.verdict != TeamPresetVerdict::Create {
+                continue;
+            }
+            if !attempted_team_slugs.insert(submitted_team.slug.as_str()) {
+                stale = true;
+                applied.push(AppliedEntry {
+                    name: submitted_team.slug.clone(),
+                    outcome: "refused".to_string(),
+                    reason: Some("the team preset appears more than once in the plan".to_string()),
+                });
+                continue;
+            }
+            let Some(current_team) = mid
+                .teams
+                .iter()
+                .find(|team| team.slug == submitted_team.slug)
+            else {
+                stale = true;
+                applied.push(AppliedEntry {
+                    name: submitted_team.slug.clone(),
+                    outcome: "refused".to_string(),
+                    reason: Some("the team preset is no longer declared".to_string()),
+                });
+                continue;
+            };
+            if let Err(reason) = admit_team_create(submitted_team, current_team) {
+                stale = true;
+                applied.push(AppliedEntry {
+                    name: submitted_team.slug.clone(),
+                    outcome: "refused".to_string(),
+                    reason: Some(reason),
+                });
                 continue;
             }
             let Some(preset) = TEAM_PRESETS
@@ -401,12 +482,7 @@ pub async fn apply_roster_deploy(
                 });
                 continue;
             }
-            let team = new_preset_team(
-                preset,
-                Uuid::new_v4().to_string(),
-                persona_ids,
-                &now,
-            );
+            let team = new_preset_team(preset, Uuid::new_v4().to_string(), persona_ids, &now);
             teams.push(team.clone());
             match save_teams(&app, &teams) {
                 Ok(()) => {
@@ -437,5 +513,194 @@ pub async fn apply_roster_deploy(
     })
     .await
     .map_err(|e| format!("spawn_blocking failed: {e}"))?
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    use crate::managed_agents::AgentDefinition;
+    use crate::managed_agents::deployment::roster::RosterCandidate;
+
+    fn roster_candidate(persona_id: &str, expected_digest: &str) -> RosterCandidate {
+        RosterCandidate {
+            persona_id: persona_id.to_string(),
+            display_name: format!("Agent {persona_id}"),
+            expected_digest: expected_digest.to_string(),
+        }
+    }
+
+    fn roster_entry(
+        name: &str,
+        verdict: RosterVerdict,
+        candidates: Vec<RosterCandidate>,
+    ) -> RosterPlanEntry {
+        RosterPlanEntry {
+            name: name.to_string(),
+            verdict,
+            kind: (verdict == RosterVerdict::Unmapped)
+                .then_some(RosterVerdictKind::UnmappedUnaccounted),
+            via: None,
+            persona_id: None,
+            persona_display_name: None,
+            current_selector: None,
+            message: String::new(),
+            detail: None,
+            candidates,
+            rule_paths: Vec::new(),
+            plugin_names: Vec::new(),
+            model_lane: String::new(),
+            expected_digest: None,
+        }
+    }
+
+    fn team_entry(slug: &str, verdict: TeamPresetVerdict) -> TeamPlanEntry {
+        TeamPlanEntry {
+            slug: slug.to_string(),
+            name: "Build".to_string(),
+            version: "1".to_string(),
+            verdict,
+            team_id: None,
+            members: Vec::new(),
+            message: String::new(),
+            expected_digest: None,
+            member_profiles: vec![
+                "coder".to_string(),
+                "reviewer".to_string(),
+                "scout".to_string(),
+            ],
+        }
+    }
+
+    fn persona() -> AgentDefinition {
+        AgentDefinition {
+            id: "persona-1".to_string(),
+            display_name: "Existing omp agent".to_string(),
+            avatar_url: None,
+            description: None,
+            system_prompt: "Preserve this prompt.".to_string(),
+            runtime: Some("omp".to_string()),
+            model: None,
+            provider: None,
+            name_pool: Vec::new(),
+            is_builtin: false,
+            is_active: true,
+            shared: false,
+            source_team: None,
+            source_team_persona_slug: None,
+            catalog_source: None,
+            team_catalog_source: None,
+            deployment_identity: None,
+            env_vars: Default::default(),
+            respond_to: None,
+            respond_to_allowlist: Vec::new(),
+            parallelism: None,
+            created_at: "2026-09-01T00:00:00Z".to_string(),
+            updated_at: "2026-09-01T00:00:00Z".to_string(),
+        }
+    }
+
+    fn mapping(name: &str, persona_id: &str) -> ProfileMapping {
+        ProfileMapping {
+            name: name.to_string(),
+            persona_id: persona_id.to_string(),
+        }
+    }
+
+    #[test]
+    fn profile_mapping_rejects_one_agent_assigned_to_multiple_profiles() {
+        let result = ensure_unique_mapping_targets(&[
+            mapping("coder", "persona-1"),
+            mapping("reviewer", "persona-1"),
+        ]);
+
+        assert_eq!(
+            result,
+            Err("an agent can be mapped to only one omp profile".to_string())
+        );
+    }
+
+    #[test]
+    fn profile_mapping_accepts_distinct_agents() {
+        assert_eq!(
+            ensure_unique_mapping_targets(&[
+                mapping("coder", "persona-1"),
+                mapping("reviewer", "persona-2"),
+            ]),
+            Ok(())
+        );
+    }
+
+    #[test]
+    fn explicit_create_resolves_unmapped_only_while_candidate_set_is_unchanged() {
+        let candidate = roster_candidate("persona-1", "digest-a");
+        let current = roster_entry(
+            "scout",
+            RosterVerdict::Unmapped,
+            vec![candidate.clone()],
+        );
+        let mut submitted =
+            roster_entry("scout", RosterVerdict::Create, vec![candidate.clone()]);
+        submitted.kind = Some(RosterVerdictKind::UnmappedUnaccounted);
+        assert_eq!(admit(&submitted, &current), Ok(()));
+
+        let changed_current = roster_entry(
+            "scout",
+            RosterVerdict::Unmapped,
+            vec![roster_candidate("persona-1", "digest-b")],
+        );
+        assert_eq!(
+            admit(&submitted, &changed_current),
+            Err("the candidate agents changed while you were looking".to_string())
+        );
+    }
+
+    #[test]
+    fn explicit_create_is_refused_when_an_existing_agent_claims_the_selector() {
+        let candidate = roster_candidate("persona-1", "digest-a");
+        let mut current = roster_entry(
+            "scout",
+            RosterVerdict::Unmapped,
+            vec![candidate.clone()],
+        );
+        current.kind = Some(RosterVerdictKind::UnmappedClaimants);
+        let mut submitted = roster_entry("scout", RosterVerdict::Create, vec![candidate]);
+        submitted.kind = Some(RosterVerdictKind::UnmappedClaimants);
+
+        assert_eq!(
+            admit(&submitted, &current),
+            Err("the entry is no longer `create` (it is now `unmapped`)".to_string())
+        );
+    }
+
+    #[test]
+    fn preset_apply_refuses_a_team_created_since_preview() {
+        let submitted = team_entry("build", TeamPresetVerdict::Create);
+        let current = team_entry("build", TeamPresetVerdict::Unchanged);
+
+        assert_eq!(
+            admit_team_create(&submitted, &current),
+            Err("the team preset is no longer available for creation".to_string())
+        );
+    }
+
+    #[test]
+    fn failed_adoption_save_restores_the_in_memory_persona() {
+        let mut personas = vec![persona()];
+        let before = personas[0].clone();
+
+        let result = persist_adoption(
+            &mut personas,
+            0,
+            "coder",
+            "2026-09-28T00:00:00Z",
+            |_| Err("disk full".to_string()),
+        );
+
+        assert_eq!(result.unwrap_err(), "disk full");
+        assert_eq!(personas[0].deployment_identity, before.deployment_identity);
+        assert_eq!(personas[0].env_vars, before.env_vars);
+        assert_eq!(personas[0].updated_at, before.updated_at);
+    }
 }
 

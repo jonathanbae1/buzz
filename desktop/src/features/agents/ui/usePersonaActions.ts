@@ -5,6 +5,7 @@ import {
   managedAgentsQueryKey,
   personasQueryKey,
   useAcpRuntimesQuery,
+  useApplyRosterDeployMutation,
   useCreateManagedAgentMutation,
   useCreatePersonaMutation,
   useDeletePersonaMutation,
@@ -13,6 +14,7 @@ import {
   usePersonasQuery,
   usePreviewAgentSnapshotImportMutation,
   useConfirmAgentSnapshotImportMutation,
+  useRosterDeployPreviewQuery,
   useSetPersonaActiveMutation,
   useUpdatePersonaMutation,
   type AgentSnapshotImportPreview,
@@ -48,6 +50,8 @@ import type {
   Channel,
   CreatePersonaInput,
   ManagedAgent,
+  RosterDeployPlan,
+  RosterCandidate,
   UpdatePersonaInput,
 } from "@/shared/api/types";
 import {
@@ -64,6 +68,10 @@ import {
   buildInstanceInputForDefinition,
   type BackendIntent,
 } from "../lib/instanceInputForDefinition";
+import {
+  resolveRosterProfileAsNew,
+  updateRosterMapping,
+} from "./rosterDeployUi";
 
 type PersonaFeedbackSurface = "catalog" | "library";
 
@@ -93,6 +101,13 @@ export function usePersonaActions() {
   const exportAgentSnapshotMutation = useExportAgentSnapshotMutation();
   const previewSnapshotImportMutation = usePreviewAgentSnapshotImportMutation();
   const confirmSnapshotImportMutation = useConfirmAgentSnapshotImportMutation();
+
+  const rosterDeployPreviewQuery = useRosterDeployPreviewQuery({
+    enabled: false,
+  });
+  const applyRosterDeployMutation = useApplyRosterDeployMutation();
+  const [rosterDeployPlan, setRosterDeployPlan] =
+    React.useState<RosterDeployPlan | null>(null);
 
   const [personaDialogState, setPersonaDialogState] =
     React.useState<PersonaDialogState | null>(null);
@@ -127,8 +142,6 @@ export function usePersonaActions() {
     React.useState<PersonaFeedbackSurface>("library");
   const createdAgentAttachment = useCreatedAgentChannelAttachment();
   const [isPersonaSubmitPending, setIsPersonaSubmitPending] =
-    React.useState(false);
-  const [isOmpProfileAddPending, setIsOmpProfileAddPending] =
     React.useState(false);
 
   const personas = personasQuery.data ?? [];
@@ -426,72 +439,99 @@ export function usePersonaActions() {
     setSnapshotImportConfirmError(null);
   }
 
-  async function addMissingOmpProfiles() {
-    if (isOmpProfileAddPending) return;
-
+  async function previewRosterDeploy() {
     clearFeedback("library");
-    setIsOmpProfileAddPending(true);
     try {
-      const catalogResult = await ompProfileCatalogQuery.refetch();
-      const catalog = catalogResult.data;
-      if (!catalog) {
-        throw new Error("The omp profile catalogue is unavailable.");
-      }
-      if (catalog.state !== "configured") {
+      const result = await rosterDeployPreviewQuery.refetch();
+      if (result.isError || !result.data) {
+        setRosterDeployPlan(null);
         setPersonaErrorMessage(
-          "The omp profile catalogue is unavailable; no personas were added.",
+          result.error instanceof Error
+            ? result.error.message
+            : "Could not preview omp profile deployment.",
         );
         return;
       }
+      setRosterDeployPlan(result.data);
+    } catch (error) {
+      setRosterDeployPlan(null);
+      setPersonaErrorMessage(
+        error instanceof Error
+          ? error.message
+          : "Could not preview omp profile deployment.",
+      );
+    }
+  }
 
-      const personaResult = await personasQuery.refetch();
-      if (!personaResult.data) {
-        throw new Error("Could not refresh the existing persona roster.");
-      }
-      const existingProfiles = new Set(
-        personaResult.data
-          .filter(
-            (persona) =>
-              persona.runtime === "omp" &&
-              typeof persona.envVars.OMP_PROFILE === "string",
-          )
-          .map((persona) => persona.envVars.OMP_PROFILE),
+  async function applyRosterDeploy() {
+    if (!rosterDeployPlan || applyRosterDeployMutation.isPending) return;
+    clearFeedback("library");
+    try {
+      const result = await applyRosterDeployMutation.mutateAsync(
+        rosterDeployPlan,
       );
-      const existingDisplayNames = new Set(
-        personaResult.data.map((persona) => persona.displayName),
+      setRosterDeployPlan(result.refreshed);
+      const successes = result.applied.filter((entry) =>
+        entry.outcome === "created" ||
+        entry.outcome === "adopted" ||
+        entry.outcome === "teamCreated",
       );
-      const missingProfiles = catalog.entries.filter(
-        (profile) =>
-          profile.name !== "default" &&
-          profile.name !== "designer" &&
-          !existingProfiles.has(profile.name) &&
-          !existingDisplayNames.has(profile.name),
+      const changeLabel =
+        successes.length === 1
+          ? "deployment change"
+          : "deployment changes";
+      const issues = result.applied.filter(
+        (entry) =>
+          entry.outcome !== "created" &&
+          entry.outcome !== "adopted" &&
+          entry.outcome !== "teamCreated",
       );
-
-      for (const profile of missingProfiles) {
-        await createPersonaMutation.mutateAsync({
-          displayName: profile.name,
-          systemPrompt: "",
-          runtime: "omp",
-          envVars: { OMP_PROFILE: profile.name },
-        });
+      if (result.stale || issues.length > 0) {
+        if (successes.length > 0) {
+          setPersonaNoticeMessage(
+            `Applied ${successes.length} ${changeLabel}. ` +
+              "Some entries were not applied; review the refreshed plan.",
+          );
+        }
+        setPersonaErrorMessage(
+          issues.length > 0
+            ? issues
+                .map((entry) => `${entry.name}: ${entry.reason ?? entry.outcome}`)
+                .join(" ")
+            : "The plan changed before apply. Review the refreshed plan.",
+        );
+      } else if (successes.length > 0) {
+        setPersonaNoticeMessage(
+          `Applied ${successes.length} ${changeLabel}.`,
+        );
+      } else {
+        setPersonaNoticeMessage("The deployment plan is up to date.");
       }
       await personasQuery.refetch();
-      setPersonaNoticeMessage(
-        missingProfiles.length > 0
-          ? `Added ${missingProfiles.length} omp profile ${missingProfiles.length === 1 ? "persona" : "personas"}.`
-          : "All addable omp profile personas are already present.",
-      );
     } catch (error) {
       setPersonaErrorMessage(
         error instanceof Error
           ? error.message
-          : "Failed to add omp profile personas.",
+          : "Failed to apply the deployment plan.",
       );
-    } finally {
-      setIsOmpProfileAddPending(false);
     }
   }
+
+  function dismissRosterDeployPlan() {
+    setRosterDeployPlan(null);
+  }
+  function mapRosterProfile(name: string, candidate: RosterCandidate | null) {
+    setRosterDeployPlan((current) =>
+      updateRosterMapping(current, name, candidate),
+    );
+  }
+
+  function createRosterProfile(name: string) {
+    setRosterDeployPlan((current) =>
+      resolveRosterProfileAsNew(current, name),
+    );
+  }
+
   function prepareCreate() {
     clearFeedback("library");
     setShouldLoadAcpRuntimes(true);
@@ -620,7 +660,8 @@ export function usePersonaActions() {
 
   const isPending =
     isPersonaSubmitPending ||
-    isOmpProfileAddPending ||
+    rosterDeployPreviewQuery.isFetching ||
+    applyRosterDeployMutation.isPending ||
     createPersonaMutation.isPending ||
     createAgentMutation.isPending ||
     updatePersonaMutation.isPending ||
@@ -657,7 +698,12 @@ export function usePersonaActions() {
     handleSubmit,
     handleDelete,
     handleSetActive,
-    addMissingOmpProfiles,
+    rosterDeployPlan,
+    previewRosterDeploy,
+    applyRosterDeploy,
+    mapRosterProfile,
+    createRosterProfile,
+    dismissRosterDeployPlan,
     prepareCreate,
     openEdit,
     openDuplicate,

@@ -396,6 +396,10 @@ fn g1_ambiguous_fixture_stays_unmapped() {
     let plan = plan(&personas);
     let coder = entry(&plan, "coder");
     assert_eq!(coder.verdict, RosterVerdict::Unmapped, "{coder:?}");
+    assert_eq!(
+        coder.kind,
+        Some(RosterVerdictKind::UnmappedClaimants)
+    );
     assert_eq!(coder.candidates.len(), 2, "both holders are offered");
     assert!(plan.apply_blocked);
 }
@@ -411,7 +415,11 @@ fn g1_non_omp_holder_is_unmapped_not_adopted() {
     let plan = plan(&personas);
     let coder = entry(&plan, "coder");
     assert_eq!(coder.verdict, RosterVerdict::Unmapped);
-    assert_eq!(coder.candidates.len(), 1);
+    assert_eq!(
+        coder.kind,
+        Some(RosterVerdictKind::UnmappedClaimants)
+    );
+    assert!(coder.candidates.is_empty());
     assert_eq!(plan.counts.adopt, 4);
 }
 

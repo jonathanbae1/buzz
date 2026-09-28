@@ -74,6 +74,10 @@ pub enum RosterVerdictKind {
     NameTakenNonOmp,
     /// Informational: the profile is already bound under another display name.
     ProfileClaimed,
+    /// Existing selector holders make a new persona with this profile unsafe.
+    UnmappedClaimants,
+    /// The candidate rows do not hold the profile's selector.
+    UnmappedUnaccounted,
     /// An `omp` persona carries a present selector that fails the profile-name
     /// grammar, so no manifest could ever declare it.
     ManualValue,
@@ -656,17 +660,21 @@ pub fn plan_roster_deploy(
             let mut entry = entry_for(
                 declaration,
                 RosterVerdict::Unmapped,
-                None,
+                Some(RosterVerdictKind::UnmappedClaimants),
                 format!(
-                    "Could not tell whether {} is the deployed `{name}`. Choose the agent to adopt, or deploy a new one.",
-                    claimants
-                        .iter()
-                        .map(|persona| format!("`{}`", display_of(persona)))
-                        .collect::<Vec<_>>()
-                        .join(" or ")
+                    concat!(
+                        "Could not identify which existing agent owns `{}`. ",
+                        "Map an eligible omp agent if possible, or resolve the ",
+                        "existing selector assignments before deployment."
+                    ),
+                    name
                 ),
             );
-            entry.candidates = claimants.iter().map(|persona| candidate(persona)).collect();
+            entry.candidates = claimants
+                .iter()
+                .filter(|persona| is_eligible_target(persona))
+                .map(|persona| candidate(persona))
+                .collect();
             entries.push(entry);
             continue;
         }
@@ -681,9 +689,9 @@ pub fn plan_roster_deploy(
             let mut entry = entry_for(
                 declaration,
                 RosterVerdict::Unmapped,
-                None,
+                Some(RosterVerdictKind::UnmappedUnaccounted),
                 format!(
-                    "Could not tell whether {} is the deployed `{name}`. Choose the agent to adopt, or deploy a new one.",
+                    "Could not tell whether {} is the deployed `{name}`. Map an existing agent or create a new agent for this profile.",
                     unaccounted
                         .iter()
                         .map(|persona| format!("`{}`", display_of(persona)))

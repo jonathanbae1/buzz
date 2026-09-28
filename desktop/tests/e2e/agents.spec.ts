@@ -228,6 +228,62 @@ async function countCommandInvocations(
   );
 }
 
+test("omp roster requires unique mappings and supports explicit creation", async ({
+  page,
+}) => {
+  await installMockBridge(page, {
+    personas: [
+      {
+        id: "existing-omp-a",
+        displayName: "Existing omp Agent A",
+        systemPrompt: "You are an existing omp agent.",
+        runtime: "omp",
+      },
+    ],
+  });
+  await gotoApp(page);
+  await page.getByTestId("open-agents-view").click();
+
+  const roster = page.getByTestId("omp-profile-roster");
+  await expect(roster).toBeVisible();
+  await expect(roster).toContainText("Build");
+  await expect(roster).toContainText("Design review");
+  await roster.getByRole("button", { name: "Preview deployment" }).click();
+
+  const plan = page.getByTestId("roster-deploy-plan");
+  await expect(plan).toBeVisible();
+  await expect(page.getByTestId("roster-plan-designer")).toContainText(
+    "unavailable",
+  );
+  await expect(page.getByTestId("roster-plan-designer")).toContainText(
+    "Profile activation proof is unavailable.",
+  );
+
+  const reviewer = plan.getByTestId("roster-map-reviewer");
+  const scout = plan.getByTestId("roster-map-scout");
+  const apply = plan.getByRole("button", { name: "Apply deployment plan" });
+  await expect(apply).toBeDisabled();
+  await reviewer.selectOption("existing-omp-a");
+  await expect(
+    scout.locator('option[value="existing-omp-a"]'),
+  ).toHaveCount(0);
+  const createScout = plan.getByTestId("roster-create-scout");
+  await expect(createScout).toBeVisible();
+  await reviewer.selectOption("");
+  await expect(apply).toBeDisabled();
+  await reviewer.selectOption("existing-omp-a");
+  await createScout.click();
+  await expect(page.getByTestId("roster-plan-scout")).toContainText(
+    "A new agent will be created for this profile.",
+  );
+  await expect(apply).toBeEnabled();
+  await apply.click();
+
+  await expect(page.getByText("Applied 4 deployment changes.")).toBeVisible();
+  expect(await countCommandInvocations(page, "preview_roster_deploy")).toBe(1);
+  expect(await countCommandInvocations(page, "apply_roster_deploy")).toBe(1);
+});
+
 test("catalog hides built-ins and shows the shared-agent empty state", async ({
   page,
 }) => {
@@ -2796,4 +2852,147 @@ test("duplicate instances move from the agents gallery into the agent profile", 
   await expect(
     page.getByTestId(`user-profile-agent-delete-${additionalPubkey}`),
   ).toHaveCount(0);
+});
+
+test("ambiguous selector claimants cannot create a duplicate profile", async ({
+  page,
+}) => {
+  await installMockBridge(page, {
+    personas: [
+      {
+        id: "coder-one",
+        displayName: "Coder one",
+        systemPrompt: "Coder one.",
+        runtime: "omp",
+        envVars: { OMP_PROFILE: "coder" },
+      },
+      {
+        id: "coder-two",
+        displayName: "Coder two",
+        systemPrompt: "Coder two.",
+        runtime: "omp",
+        envVars: { OMP_PROFILE: "coder" },
+      },
+    ],
+  });
+  await gotoApp(page);
+  await page.getByTestId("open-agents-view").click();
+  const roster = page.getByTestId("omp-profile-roster");
+  await roster.getByRole("button", { name: "Preview deployment" }).click();
+  const coder = page.getByTestId("roster-plan-coder");
+  await expect(coder).toContainText("unmapped");
+  await expect(coder.getByTestId("roster-create-coder")).toHaveCount(0);
+  const choices = coder.getByTestId("roster-map-coder").locator("option");
+  await expect(choices).toHaveCount(3);
+  await expect(choices.nth(1)).toHaveText("Coder one");
+  await expect(choices.nth(2)).toHaveText("Coder two");
+});
+
+test("non-omp selector claimants are not offered as profile mappings", async ({
+  page,
+}) => {
+  await installMockBridge(page, {
+    personas: [
+      {
+        id: "goose-coder",
+        displayName: "Goose Coder",
+        systemPrompt: "You are Goose Coder.",
+        runtime: "goose",
+        envVars: { OMP_PROFILE: "coder" },
+      },
+    ],
+  });
+  await gotoApp(page);
+  await page.getByTestId("open-agents-view").click();
+  const roster = page.getByTestId("omp-profile-roster");
+  await roster.getByRole("button", { name: "Preview deployment" }).click();
+  const coder = page.getByTestId("roster-plan-coder");
+  await expect(coder).toContainText("unmapped");
+  await expect(coder.getByTestId("roster-create-coder")).toHaveCount(0);
+  await expect(
+    coder.getByTestId("roster-map-coder").locator("option"),
+  ).toHaveCount(1);
+});
+
+test("omp roster deployment repeats without duplicates or overwriting edits", async ({
+  page,
+}) => {
+  await installMockBridge(page, {
+    personas: [
+      {
+        id: "existing-omp-a",
+        displayName: "Existing omp Agent A",
+        systemPrompt: "Original prompt.",
+        runtime: "omp",
+      },
+    ],
+  });
+  await gotoApp(page);
+  await page.getByTestId("open-agents-view").click();
+  const roster = page.getByTestId("omp-profile-roster");
+  await roster.getByRole("button", { name: "Preview deployment" }).click();
+  const firstPlan = page.getByTestId("roster-deploy-plan");
+  await firstPlan.getByTestId("roster-map-reviewer").selectOption("existing-omp-a");
+  await firstPlan.getByTestId("roster-create-scout").click();
+  await firstPlan.getByRole("button", { name: "Apply deployment plan" }).click();
+  await expect(page.getByText("Applied 4 deployment changes.")).toBeVisible();
+
+  const afterFirstApply = await invokeTauri<
+    Array<{
+      id: string;
+      display_name: string;
+      system_prompt: string;
+      env_vars?: Record<string, string>;
+    }>
+  >(page, "list_personas");
+  const deployedIds = afterFirstApply.map((persona) => persona.id).sort();
+  expect(deployedIds).toHaveLength(6);
+  expect(
+    afterFirstApply.filter((persona) => persona.env_vars?.OMP_PROFILE),
+  ).toHaveLength(3);
+
+  const secondPlan = await invokeTauri<{
+    entries: Array<{ name: string; verdict: string }>;
+  }>(page, "preview_roster_deploy");
+  expect(secondPlan.entries.filter((entry) => ["coder", "reviewer", "scout"].includes(entry.name))).toEqual(
+    expect.arrayContaining([
+      expect.objectContaining({ name: "coder", verdict: "unchanged" }),
+      expect.objectContaining({ name: "reviewer", verdict: "unchanged" }),
+      expect.objectContaining({ name: "scout", verdict: "unchanged" }),
+    ]),
+  );
+  const repeatApply = await invokeTauri<{
+    applied: Array<{ name: string }>;
+  }>(page, "apply_roster_deploy", { input: { plan: secondPlan } });
+  expect(repeatApply.applied).toEqual([]);
+
+  await invokeTauri(page, "update_persona", {
+    input: {
+      id: "existing-omp-a",
+      displayName: "Edited reviewer",
+      systemPrompt: "User-edited prompt must survive redeployment.",
+      runtime: "omp",
+      envVars: { OMP_PROFILE: "reviewer" },
+    },
+  });
+  const editedPlan = await invokeTauri<{
+    entries: Array<{ name: string; verdict: string }>;
+  }>(page, "preview_roster_deploy");
+  expect(editedPlan.entries.find((entry) => entry.name === "reviewer")?.verdict).toBe(
+    "unchanged",
+  );
+  const editRedeploy = await invokeTauri<{
+    applied: Array<{ name: string }>;
+  }>(page, "apply_roster_deploy", { input: { plan: editedPlan } });
+  expect(editRedeploy.applied).toEqual([]);
+
+  const afterEditRedeploy = await invokeTauri<
+    Array<{ id: string; display_name: string; system_prompt: string; env_vars?: Record<string, string> }>
+  >(page, "list_personas");
+  expect(afterEditRedeploy.map((persona) => persona.id).sort()).toEqual(deployedIds);
+  expect(afterEditRedeploy.find((persona) => persona.id === "existing-omp-a")).toMatchObject({
+    display_name: "Edited reviewer",
+    system_prompt: "User-edited prompt must survive redeployment.",
+    env_vars: { OMP_PROFILE: "reviewer" },
+  });
 });

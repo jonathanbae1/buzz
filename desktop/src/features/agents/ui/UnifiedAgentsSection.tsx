@@ -1,5 +1,5 @@
 import * as React from "react";
-import { AlertTriangle, ChevronDown, ChevronRight, Plus } from "lucide-react";
+import { AlertTriangle, ChevronDown, ChevronRight } from "lucide-react";
 
 import {
   isAgentCardAvatarLoading,
@@ -17,6 +17,9 @@ import type {
   AgentPersona,
   ManagedAgent,
   OmpProfileCatalog,
+  RosterCandidate,
+  RosterDeployPlan,
+  TeamPreset,
 } from "@/shared/api/types";
 import type { ProfilePanelOpenOptions } from "@/shared/context/ProfilePanelContext";
 import { useFeedbackToasts } from "@/shared/hooks/useToastEffect";
@@ -30,8 +33,14 @@ import { IdentityCardSkeleton } from "@/shared/ui/identity-card-skeleton";
 import { AgentIdentityCard } from "./AgentIdentityCard";
 import { AgentRuntimeAvatarControl } from "./AgentRuntimeAvatarControl";
 import { CreateIdentityCard } from "./CreateIdentityCard";
+import { useTeamPresetsQuery } from "@/features/agents/hooks";
 import { PersonaActionsMenu } from "./PersonaActionsMenu";
 import { buildUnifiedGroups } from "./unifiedAgentGroups";
+import {
+  canPreviewRosterDeployment,
+  isRosterApplyDisabled,
+  rosterCandidatesAvailableToEntry,
+} from "./rosterDeployUi";
 
 type UnifiedAgentsSectionProps = {
   defaultModel: string;
@@ -54,11 +63,18 @@ type UnifiedAgentsSectionProps = {
   onStartAgent: (pubkey: string) => void;
   onStartPersona: (persona: AgentPersona) => void;
   personas: AgentPersona[];
-  allPersonas: AgentPersona[];
   ompProfileCatalog?: OmpProfileCatalog;
   ompProfileCatalogError: Error | null;
   isOmpProfileCatalogLoading: boolean;
-  onAddMissingOmpProfiles: () => void;
+  rosterDeployPlan: RosterDeployPlan | null;
+  onPreviewRosterDeploy: () => void;
+  onApplyRosterDeploy: () => void;
+  onMapRosterProfile: (
+    name: string,
+    candidate: RosterCandidate | null,
+  ) => void;
+  onCreateRosterProfile: (name: string) => void;
+  onDismissRosterDeployPlan: () => void;
   personasError: Error | null;
   personaFeedbackErrorMessage: string | null;
   personaFeedbackNoticeMessage: string | null;
@@ -84,7 +100,6 @@ export const IDENTITY_CARD_GRID_CLASS = `${AGENT_CARD_COLUMN_CLASS} ${AGENT_CARD
 export function UnifiedAgentsSection(props: UnifiedAgentsSectionProps) {
   const {
     actionErrorMessage,
-    allPersonas = [],
     actionNoticeMessage,
     defaultModel,
     getAvailability,
@@ -106,7 +121,6 @@ export function UnifiedAgentsSection(props: UnifiedAgentsSectionProps) {
     personasError,
     personaFeedbackErrorMessage,
     isOmpProfileCatalogLoading = false,
-    onAddMissingOmpProfiles = () => {},
     personaFeedbackNoticeMessage,
     isPersonasLoading,
     isPersonasPending,
@@ -118,6 +132,8 @@ export function UnifiedAgentsSection(props: UnifiedAgentsSectionProps) {
     onDeletePersona,
   } = props;
 
+  const teamPresetsQuery = useTeamPresetsQuery();
+  const teamPresets = teamPresetsQuery.data ?? [];
   const isArchived = useIsArchivedPredicate();
   const bestiePubkey = useProtectedBestiePubkey(agents)?.toLowerCase() ?? null;
   const { groups, ungrouped, unknown } = React.useMemo(
@@ -232,12 +248,19 @@ export function UnifiedAgentsSection(props: UnifiedAgentsSectionProps) {
       ) : null}
 
       <OmpProfileRoster
-        allPersonas={allPersonas}
         catalog={ompProfileCatalog}
         catalogError={ompProfileCatalogError}
         isCatalogLoading={isOmpProfileCatalogLoading}
         isPending={isPersonasPending}
-        onAddMissing={onAddMissingOmpProfiles}
+        plan={props.rosterDeployPlan}
+        teamPresets={teamPresets}
+        teamPresetsLoading={teamPresetsQuery.isPending}
+        teamPresetsError={teamPresetsQuery.error}
+        onPreview={props.onPreviewRosterDeploy}
+        onApply={props.onApplyRosterDeploy}
+        onMap={props.onMapRosterProfile}
+        onCreate={props.onCreateRosterProfile}
+        onDismiss={props.onDismissRosterDeployPlan}
       />
       {agentsError ? (
         <p
@@ -258,67 +281,58 @@ export function UnifiedAgentsSection(props: UnifiedAgentsSectionProps) {
 }
 
 function OmpProfileRoster({
-  allPersonas,
   catalog,
   catalogError,
   isCatalogLoading,
   isPending,
-  onAddMissing,
+  plan,
+  teamPresets,
+  teamPresetsLoading,
+  teamPresetsError,
+  onPreview,
+  onApply,
+  onMap,
+  onCreate,
+  onDismiss,
 }: {
-  allPersonas: AgentPersona[];
   catalog?: OmpProfileCatalog;
   catalogError: Error | null;
   isCatalogLoading: boolean;
   isPending: boolean;
-  onAddMissing: () => void;
+  plan: RosterDeployPlan | null;
+  teamPresets: TeamPreset[];
+  teamPresetsLoading: boolean;
+  teamPresetsError: Error | null;
+  onPreview: () => void;
+  onApply: () => void;
+  onMap: (name: string, candidate: RosterCandidate | null) => void;
+  onCreate: (name: string) => void;
+  onDismiss: () => void;
 }) {
-  const configuredEntries =
-    catalog?.state === "configured" ? catalog.entries : [];
-  const defaultEntry = configuredEntries.find(
-    (entry) => entry.name === "default",
-  );
-  const specialistEntries = configuredEntries.filter(
-    (entry) => entry.name !== "default",
-  );
-  const missingAddableCount = specialistEntries.filter(
-    (entry) =>
-      entry.name !== "designer" &&
-      !allPersonas.some(
-        (persona) =>
-          persona.runtime === "omp" &&
-          persona.envVars.OMP_PROFILE === entry.name,
-      ) &&
-      !allPersonas.some((persona) => persona.displayName === entry.name),
-  ).length;
-
   return (
     <section
       className="space-y-3 rounded-2xl border border-border/70 bg-card/50 p-4"
       data-testid="omp-profile-roster"
     >
       <div className="flex flex-wrap items-start justify-between gap-3">
-        <div className="min-w-0">
-          <h2 className="text-sm font-semibold text-foreground">
-            omp profiles
-          </h2>
+        <div>
+          <h2 className="text-sm font-semibold text-foreground">omp profiles</h2>
           <p className="text-xs text-muted-foreground">
             Installed profiles are separate from personas and running instances.
           </p>
         </div>
-        {catalog?.state === "configured" ? (
-          <Button
-            disabled={isPending || missingAddableCount === 0}
-            onClick={onAddMissing}
-            size="sm"
-            type="button"
-            variant="outline"
-          >
-            <Plus />
-            Add missing profiles
-          </Button>
-        ) : null}
+        <Button
+          disabled={
+            !canPreviewRosterDeployment(catalog, isCatalogLoading, isPending)
+          }
+          onClick={onPreview}
+          size="sm"
+          type="button"
+          variant="outline"
+        >
+          Preview deployment
+        </Button>
       </div>
-
       {isCatalogLoading ? (
         <p className="text-sm text-muted-foreground">
           Reading installed profiles…
@@ -332,86 +346,210 @@ function OmpProfileRoster({
       {!isCatalogLoading && !catalogError && catalog?.state !== "configured" ? (
         <p className="text-sm text-warning">
           {catalog?.state === "invalid"
-            ? "The installed omp profile catalogue is invalid. Repair it before adding profile personas."
-            : "The installed omp profile catalogue is unavailable. No profile personas were added."}
+            ? "The installed omp profile catalogue is invalid. Repair it before deployment."
+            : "The installed omp profile catalogue is unavailable. No deployment can be planned."}
         </p>
       ) : null}
-
-      {catalog?.state === "configured" ? (
-        <div className="space-y-2">
-          {defaultEntry ? (
-            <div
-              className="flex flex-wrap items-baseline justify-between gap-x-3 gap-y-1 rounded-lg border border-border/60 bg-muted/20 px-3 py-2"
-              data-testid="omp-profile-row-default"
-            >
-              <div className="min-w-0">
-                <div className="flex items-center gap-2">
-                  <span className="font-medium text-foreground">default</span>
-                  <Badge variant="secondary">Fallback</Badge>
-                </div>
-                <p className="truncate text-xs text-muted-foreground">
-                  {defaultEntry.modelLane}
-                </p>
-              </div>
-              <span className="text-xs text-muted-foreground">
-                Used when no profile is selected
-              </span>
-            </div>
-          ) : null}
-
-          <div className="divide-y divide-border/50 rounded-lg border border-border/60">
-            {specialistEntries.map((entry) => {
-              const matchingPersona = allPersonas.find(
-                (persona) =>
-                  persona.runtime === "omp" &&
-                  persona.envVars.OMP_PROFILE === entry.name,
+      <section
+        className="space-y-2"
+        aria-label="Team presets"
+        data-testid="omp-team-presets"
+      >
+        <h3 className="text-xs font-semibold uppercase tracking-wide text-muted-foreground">
+          Team presets
+        </h3>
+        {teamPresetsLoading ? (
+          <p className="text-sm text-muted-foreground">
+            Loading team presets…
+          </p>
+        ) : null}
+        {teamPresetsError ? (
+          <p className="text-sm text-destructive">
+            Team presets could not be loaded.
+          </p>
+        ) : null}
+        {!teamPresetsLoading && !teamPresetsError && teamPresets.length === 0 ? (
+          <p className="text-sm text-muted-foreground">
+            No team presets are available.
+          </p>
+        ) : null}
+        {!teamPresetsLoading && !teamPresetsError
+          ? teamPresets.map((preset) => {
+              const team = plan?.teams.find(
+                (entry) => entry.slug === preset.slug,
               );
-              const nameConflict =
-                matchingPersona === undefined &&
-                allPersonas.some(
-                  (persona) => persona.displayName === entry.name,
-                );
-              const isDesigner = entry.name === "designer";
               return (
                 <div
-                  className="flex flex-wrap items-center justify-between gap-3 px-3 py-2.5"
-                  data-testid={`omp-profile-row-${entry.name}`}
-                  key={entry.name}
+                  className="rounded-lg border border-border/60 px-3 py-2"
+                  key={preset.slug}
                 >
-                  <div className="min-w-0">
-                    <div className="flex flex-wrap items-center gap-2">
-                      <span className="font-medium text-foreground">
-                        {entry.name}
-                      </span>
-                      {matchingPersona ? (
-                        <Badge variant="secondary">Persona present</Badge>
-                      ) : nameConflict ? (
-                        <Badge variant="warning">Name conflict</Badge>
-                      ) : isDesigner ? (
-                        <Badge variant="warning">Catalogue only</Badge>
-                      ) : (
-                        <Badge variant="outline">Not added</Badge>
-                      )}
-                    </div>
-                    <p className="truncate text-xs text-muted-foreground">
-                      {entry.modelLane}
-                    </p>
+                  <div className="flex flex-wrap items-center gap-2">
+                    <span className="text-sm font-medium">{preset.name}</span>
+                    <Badge
+                      variant={
+                        team?.verdict === "blocked" ? "warning" : "secondary"
+                      }
+                    >
+                      {team?.verdict ?? "Preset"}
+                    </Badge>
                   </div>
-                  <span className="max-w-full text-right text-xs text-muted-foreground">
-                    {matchingPersona
-                      ? isDesigner
-                        ? `${matchingPersona.displayName} · existing assignment; new designer personas are gated`
-                        : matchingPersona.displayName
-                      : nameConflict
-                        ? "Existing persona is unchanged"
-                        : isDesigner
-                          ? "Pending activation gate; add is disabled"
-                          : "Available to add"}
-                  </span>
+                  <p className="text-xs text-muted-foreground">
+                    {preset.description}
+                  </p>
+                  <p className="text-xs text-muted-foreground">
+                    Members: {preset.members.join(", ")}
+                  </p>
+                  {team ? (
+                    <p className="text-xs text-muted-foreground">
+                      {team.message}
+                    </p>
+                  ) : null}
                 </div>
               );
-            })}
+            })
+          : null}
+      </section>
+      {plan ? (
+        <div className="space-y-2" data-testid="roster-deploy-plan">
+          <div className="flex items-center justify-between gap-2">
+            <h3 className="text-xs font-semibold uppercase tracking-wide text-muted-foreground">
+              Deployment preview
+            </h3>
+            <Button
+              onClick={onDismiss}
+              size="sm"
+              type="button"
+              variant="ghost"
+            >
+              Close
+            </Button>
           </div>
+          {plan.entries.map((entry) => {
+            const candidates = rosterCandidatesAvailableToEntry(
+              plan,
+              entry.name,
+            );
+            const canResolveMapping =
+              entry.verdict === "unmapped" ||
+              entry.via === "userMap" ||
+              (entry.verdict === "create" && entry.candidates.length > 0);
+            const canCreateNew =
+              entry.kind === "unmapped-unaccounted" &&
+              entry.verdict !== "create";
+            return (
+              <div
+                className="space-y-1 rounded-lg border border-border/60 px-3 py-2"
+                key={entry.name}
+                data-testid={`roster-plan-${entry.name}`}
+              >
+                <div className="flex flex-wrap items-center gap-2">
+                  <span className="text-sm font-medium">{entry.name}</span>
+                  <Badge
+                    variant={
+                      entry.verdict === "conflict" ||
+                      entry.verdict === "unavailable"
+                        ? "warning"
+                        : entry.verdict === "create" ||
+                            entry.verdict === "adopt"
+                          ? "outline"
+                          : "secondary"
+                    }
+                  >
+                    {entry.verdict}
+                  </Badge>
+                  {entry.personaDisplayName ? (
+                    <span className="text-xs text-muted-foreground">
+                      {entry.personaDisplayName}
+                    </span>
+                  ) : null}
+                </div>
+                <p className="text-xs text-muted-foreground">
+                  {entry.message}
+                </p>
+                {canResolveMapping ? (
+                  <div className="flex flex-wrap items-center gap-2">
+                    <label className="block text-xs">
+                      Map existing agent
+                      <select
+                        className="ml-2 rounded border border-border bg-background p-1"
+                        data-testid={`roster-map-${entry.name}`}
+                        value={
+                          entry.via === "userMap"
+                            ? entry.personaId ?? ""
+                            : ""
+                        }
+                        onChange={(event) => {
+                          const candidate = candidates.find(
+                            (item) =>
+                              item.personaId === event.currentTarget.value,
+                          );
+                          onMap(entry.name, candidate ?? null);
+                        }}
+                      >
+                        <option value="">
+                          {entry.verdict === "create"
+                            ? "Choose an existing agent instead…"
+                            : "Choose an omp agent…"}
+                        </option>
+                        {candidates.map((candidate) => (
+                          <option
+                            key={candidate.personaId}
+                            value={candidate.personaId}
+                          >
+                            {candidate.displayName}
+                          </option>
+                        ))}
+                      </select>
+                    </label>
+                    {canCreateNew ? (
+                      <Button
+                        data-testid={`roster-create-${entry.name}`}
+                        onClick={() => onCreate(entry.name)}
+                        size="sm"
+                        type="button"
+                        variant="outline"
+                      >
+                        Create new agent
+                      </Button>
+                    ) : null}
+                  </div>
+                ) : null}
+              </div>
+            );
+          })}
+          {plan.notInstalled.map((entry) => (
+            <p className="text-xs text-warning" key={entry.personaId}>
+              {entry.message}
+            </p>
+          ))}
+          {plan.manualValue.map((entry) => (
+            <p className="text-xs text-warning" key={entry.personaId}>
+              {entry.message}
+            </p>
+          ))}
+          {plan.teams.map((team) => (
+            <p className="text-xs text-muted-foreground" key={team.slug}>
+              {team.name}: {team.message}
+            </p>
+          ))}
+          {plan.sharedMembers.map((member) => (
+            <p className="text-xs text-muted-foreground" key={member.personaId}>
+              {member.displayName} is shared by {member.presetSlugs.join(" and ")}.
+            </p>
+          ))}
+          {plan.applyBlocked ? (
+            <p className="text-sm text-destructive">
+              Resolve every conflict and unmapped profile before applying.
+            </p>
+          ) : null}
+          <Button
+            disabled={isRosterApplyDisabled(plan, isPending)}
+            onClick={onApply}
+            size="sm"
+            type="button"
+          >
+            Apply deployment plan
+          </Button>
         </div>
       ) : null}
     </section>
