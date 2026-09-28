@@ -360,6 +360,10 @@ pub struct AgentPool {
     /// [`AgentPool::route_session_config`]), so the pool must be told when the
     /// slot can be reclaimed or the agent leaks out of the pool.
     config_return_tx: mpsc::UnboundedSender<AgentConfigReturn>,
+    session_lifecycle_tx: mpsc::UnboundedSender<AgentSessionLifecycleResult>,
+    session_lifecycle_rx: mpsc::UnboundedReceiver<AgentSessionLifecycleResult>,
+    /// Direct conversation scopes temporarily checked out for ACP lifecycle work.
+    session_lifecycle_scopes: HashSet<SessionScope>,
     config_return_rx: mpsc::UnboundedReceiver<AgentConfigReturn>,
     pub join_set: JoinSet<()>,
     task_map: HashMap<tokio::task::Id, TaskMeta>,
@@ -409,6 +413,16 @@ pub enum PermissionAnswerError {
 pub struct AgentConfigReturn {
     pub agent: OwnedAgent,
 }
+pub struct AgentSessionLifecycleResult {
+    pub agent: OwnedAgent,
+    pub scope: SessionScope,
+    pub source_session_id: String,
+    pub operation: String,
+    pub target_session_id: Option<String>,
+    pub request_id: String,
+    pub result: Result<serde_json::Value, String>,
+}
+
 
 pub struct AgentCommandResult {
     pub agent: OwnedAgent,
@@ -904,6 +918,7 @@ impl AgentPool {
     pub fn from_slots(slots: Vec<Option<OwnedAgent>>) -> Self {
         let (result_tx, result_rx) = mpsc::unbounded_channel();
         let (command_result_tx, command_result_rx) = mpsc::unbounded_channel();
+        let (session_lifecycle_tx, session_lifecycle_rx) = mpsc::unbounded_channel();
         let (config_return_tx, config_return_rx) = mpsc::unbounded_channel();
         let mut session_scopes = HashMap::new();
         for agent in slots.iter().flatten() {
@@ -918,6 +933,9 @@ impl AgentPool {
             command_result_tx,
             command_result_rx,
             config_return_tx,
+            session_lifecycle_tx,
+            session_lifecycle_rx,
+            session_lifecycle_scopes: HashSet::new(),
             config_return_rx,
             join_set: JoinSet::new(),
             task_map: HashMap::new(),
@@ -969,6 +987,14 @@ impl AgentPool {
         now: std::time::Instant,
         timeout: Duration,
     ) -> HoldDecision {
+        if let Some(owner_index) = self.session_owners.get(scope).copied() {
+            if self.session_lifecycle_scopes.contains(scope) {
+                return HoldDecision::Hold {
+                    held_for: Duration::ZERO,
+                    owner_index,
+                };
+            }
+        }
         if !scope.is_thread() || !self.should_hold_for_busy_owner(scope) {
             self.held_since.remove(scope);
             return HoldDecision::Dispatch;
@@ -1017,7 +1043,87 @@ impl AgentPool {
         idx.map(|i| self.agents[i].take().unwrap())
     }
 
-    /// Return an agent to its slot after a task completes.
+    /// Check out the idle worker that owns an exact session for lifecycle work.
+    /// Session ids are lookup keys only; the destination scope is resolved from
+    /// the pool's own ownership map.
+    pub fn take_session_lifecycle_agent(
+        &mut self,
+        session_id: &str,
+    ) -> Result<(OwnedAgent, SessionScope), AgentCommandTarget> {
+        let agent = self.take_command_agent(session_id)?;
+        let Some(scope) = agent
+            .state
+            .sessions
+            .iter()
+            .find_map(|(scope, id)| (id == session_id).then(|| scope.clone()))
+        else {
+            self.return_agent(agent);
+            return Err(AgentCommandTarget::StaleSession);
+        };
+        if !matches!(scope, SessionScope::Conversation { .. }) {
+            self.return_agent(agent);
+            return Err(AgentCommandTarget::StaleSession);
+        }
+        if self.task_map.values().any(|meta| meta.scope.as_ref() == Some(&scope)) {
+            self.return_agent(agent);
+            return Err(AgentCommandTarget::ActiveTurn);
+        }
+        self.session_lifecycle_scopes.insert(scope.clone());
+        Ok((agent, scope))
+    }
+
+    pub fn session_lifecycle_result_tx(
+        &self,
+    ) -> mpsc::UnboundedSender<AgentSessionLifecycleResult> {
+        self.session_lifecycle_tx.clone()
+    }
+
+
+    /// Return a lifecycle worker after updating its existing direct-conversation
+    /// binding. A fork/load/resume changes only that scope, never a Buzz lease.
+    pub fn return_session_lifecycle_agent(
+        &mut self,
+        mut result: AgentSessionLifecycleResult,
+    ) {
+        let previous_session_id = result
+            .agent
+            .state
+            .sessions
+            .get(&result.scope)
+            .cloned();
+        let binding_changed = result.result.is_ok()
+            && matches!(result.operation.as_str(), "load" | "resume" | "fork");
+        if binding_changed {
+            if let Some(target_session_id) = result.target_session_id.take() {
+                if result.operation != "fork"
+                    && previous_session_id.as_deref() != Some(target_session_id.as_str())
+                {
+                    result.agent.state.invalidate_scope(&result.scope);
+                }
+                result
+                    .agent
+                    .state
+                    .sessions
+                    .insert(result.scope.clone(), target_session_id.clone());
+                if let Some(previous) = previous_session_id.filter(|id| id != &target_session_id) {
+                    self.session_scopes.remove(&previous);
+                }
+                self.session_owners
+                    .insert(result.scope.clone(), result.agent.index);
+                self.session_scopes
+                    .insert(target_session_id, result.scope.clone());
+            }
+        } else if result.result.is_ok()
+            && result.operation == "close"
+            && result.target_session_id.as_deref() == Some(&result.source_session_id)
+        {
+            result.agent.state.invalidate_scope(&result.scope);
+            self.session_scopes.remove(&result.source_session_id);
+            self.session_owners.remove(&result.scope);
+        }
+        self.session_lifecycle_scopes.remove(&result.scope);
+        self.return_agent(result.agent);
+    }
     pub fn return_agent(&mut self, agent: OwnedAgent) {
         let idx = agent.index;
         for (scope, session_id) in &agent.state.sessions {
@@ -1078,6 +1184,10 @@ impl AgentPool {
             {
                 return Err(AgentCommandTarget::ActiveTurn);
             }
+            if self.session_lifecycle_scopes.contains(scope) {
+                return Err(AgentCommandTarget::ActiveTurn);
+            }
+
         }
         Err(AgentCommandTarget::StaleSession)
     }
@@ -1183,13 +1293,13 @@ impl AgentPool {
         self.config_return_tx.clone()
     }
 
-    /// Count of agents that are alive: idle OR checked out (have a task_map entry).
+    /// Count agents that are idle, running a task, or serving a lifecycle request.
     ///
     /// Used to detect when all agents have exited so the caller can respawn.
     pub fn live_count(&self) -> usize {
         let idle = self.agents.iter().filter(|s| s.is_some()).count();
         let checked_out = self.task_map.len();
-        idle + checked_out
+        idle + checked_out + self.session_lifecycle_scopes.len()
     }
 
     /// Test seam: the agent slots, so tests can assert a worker was returned
@@ -1358,15 +1468,18 @@ impl AgentPool {
         &mut mpsc::UnboundedReceiver<PromptResult>,
         &mut mpsc::UnboundedReceiver<AgentCommandResult>,
         &mut mpsc::UnboundedReceiver<AgentConfigReturn>,
+        &mut mpsc::UnboundedReceiver<AgentSessionLifecycleResult>,
         &mut JoinSet<()>,
     ) {
         (
             &mut self.result_rx,
             &mut self.command_result_rx,
             &mut self.config_return_rx,
+            &mut self.session_lifecycle_rx,
             &mut self.join_set,
         )
     }
+
 
     /// Non-blocking drain of the result channel. Used during shutdown to
     /// collect agents that completed while join_set was being drained.
@@ -1379,7 +1492,11 @@ impl AgentPool {
     /// empty and available for refill.
     pub fn slot_alive(&self, index: usize) -> bool {
         let idle = self.agents.get(index).is_some_and(|s| s.is_some());
-        if idle {
+        let lifecycle = self
+            .session_owners
+            .iter()
+            .any(|(scope, owner)| *owner == index && self.session_lifecycle_scopes.contains(scope));
+        if idle || lifecycle {
             return true;
         }
         // Check if the agent is checked out (in-flight on a task).
@@ -1951,7 +2068,7 @@ async fn create_session_and_apply_model(
     Ok(resp.session_id)
 }
 
-fn mcp_servers_with_git_origin(
+pub(crate) fn mcp_servers_with_git_origin(
     servers: &[McpServer],
     channel_id: Option<Uuid>,
     channel_type: Option<&str>,
@@ -8550,6 +8667,56 @@ printf '%s\n' '{{"jsonrpc":"2.0","id":0,"result":{{"stopReason":"end_turn"}}}}'"
                 );
             }
         }
+    }
+    #[tokio::test]
+    async fn direct_session_lifecycle_refuses_overlap_and_rebinds_exact_scope() {
+        let channel_id = Uuid::new_v4();
+        let scope = conv(channel_id);
+        let mut pool = AgentPool::from_slots(vec![Some(
+            idle_agent_with_session(scope.clone()).await,
+        )]);
+        pool.record_scope_owner(scope.clone(), 0);
+
+        let (agent, resolved_scope) = pool
+            .take_session_lifecycle_agent("sess")
+            .unwrap_or_else(|_| panic!("idle direct session should be routed"));
+        assert_eq!(resolved_scope, scope);
+        assert!(pool.slot_alive(0));
+        assert!(matches!(
+            pool.take_session_lifecycle_agent("sess"),
+            Err(AgentCommandTarget::ActiveTurn)
+        ));
+        assert!(matches!(
+            pool.hold_decision(
+                &scope,
+                std::time::Instant::now(),
+                Duration::from_secs(1),
+            ),
+            HoldDecision::Hold { .. }
+        ));
+
+        pool.return_session_lifecycle_agent(AgentSessionLifecycleResult {
+            agent,
+            scope: scope.clone(),
+            source_session_id: "sess".into(),
+            operation: "fork".into(),
+            target_session_id: Some("forked-sess".into()),
+            request_id: "req-1".into(),
+            result: Ok(serde_json::json!({ "sessionId": "forked-sess" })),
+        });
+
+        assert!(matches!(
+            pool.take_command_agent("sess"),
+            Err(AgentCommandTarget::StaleSession)
+        ));
+        let agent = pool
+            .take_command_agent("forked-sess")
+            .unwrap_or_else(|_| panic!("fork must own the direct conversation session"));
+        assert_eq!(
+            agent.state.sessions.get(&scope).map(String::as_str),
+            Some("forked-sess"),
+        );
+        pool.return_agent(agent);
     }
 
     #[test]

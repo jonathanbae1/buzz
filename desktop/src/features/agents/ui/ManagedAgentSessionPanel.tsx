@@ -1,6 +1,7 @@
 import * as React from "react";
 
 import { SessionConfigControls } from "./SessionConfigControls";
+import { SessionLifecycleControls } from "./SessionLifecycleControls";
 
 import { useActiveAgentTurns } from "@/features/agents/activeAgentTurnsStore";
 import { awaitCancelTurnOutcome } from "@/features/agents/lib/cancelTurnOutcome";
@@ -72,6 +73,7 @@ type ManagedAgentSessionPanelProps = {
   transcriptVariant?: AgentSessionTranscriptVariant;
   profiles?: UserProfileLookup;
   rawEventsOverride?: ObserverEvent[];
+  sessionLifecycleEnabled?: boolean;
   transcriptOverride?: TranscriptItem[];
 };
 
@@ -89,6 +91,7 @@ export function ManagedAgentSessionPanel({
   transcriptContentClassName,
   transcriptVariant = "default",
   profiles,
+  sessionLifecycleEnabled = false,
   rawEventsOverride,
   transcriptOverride,
 }: ManagedAgentSessionPanelProps) {
@@ -237,6 +240,13 @@ export function ManagedAgentSessionPanel({
       {latestSessionId ? (
         <SessionConfigControls
           agentPubkey={agent.pubkey}
+          sessionId={latestSessionId}
+        />
+      ) : null}
+      {sessionLifecycleEnabled && latestSessionId ? (
+        <SessionLifecycleControls
+          agentPubkey={agent.pubkey}
+          enabled={sessionLifecycleEnabled}
           sessionId={latestSessionId}
         />
       ) : null}

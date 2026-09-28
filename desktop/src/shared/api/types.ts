@@ -474,10 +474,13 @@ export type ControlResultFrame = {
     | "switch_model"
     | "dispatch_command"
     | "permission_response"
-    | "set_session_config";
+    | "set_session_config"
+    | "session_lifecycle";
   status: string;
   modelId?: string;
   commandName?: string;
+  operation?: "list" | "load" | "resume" | "fork" | "close";
+  sessions?: AgentSessionLifecycleEntry[];
   sessionId?: string;
   /** Opaque per-pick id echoed from the request; correlates late frames. */
   requestId?: string;
@@ -493,6 +496,12 @@ export type ControlResultFrame = {
    * `thought_level`).
    */
   category?: ConfigSelectorCategory;
+};
+
+export type AgentSessionLifecycleEntry = {
+  sessionId: string;
+  title?: string;
+  updatedAt?: string;
 };
 
 /**

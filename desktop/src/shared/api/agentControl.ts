@@ -86,3 +86,20 @@ export async function setSessionConfigOption(
     requestId,
   });
 }
+
+/** Manage ACP sessions within the managed agent's existing profile/workspace. */
+export async function controlManagedAgentSession(
+  pubkey: string,
+  sessionId: string,
+  operation: "list" | "load" | "resume" | "fork" | "close",
+  requestId: string,
+  targetSessionId?: string,
+): Promise<void> {
+  await sendAgentObserverControl(pubkey, {
+    type: "session_lifecycle",
+    sessionId,
+    operation,
+    requestId,
+    ...(targetSessionId ? { targetSessionId } : {}),
+  });
+}

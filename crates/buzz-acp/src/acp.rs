@@ -955,8 +955,114 @@ impl AcpClient {
             .await?
             .session_id)
     }
+    /// List resumable sessions visible to this managed agent process.
+    ///
+    /// The process already owns the selected profile and cwd. Do not accept
+    /// either value from an observer control frame.
+    pub async fn session_list(&mut self) -> Result<serde_json::Value, AcpError> {
+        let mut sessions = Vec::new();
+        let mut cursor: Option<String> = None;
+        loop {
+            let mut params = serde_json::json!({});
+            if let Some(cursor) = cursor.as_deref() {
+                params["cursor"] = serde_json::Value::String(cursor.to_string());
+            }
+            let page = self.send_request("session/list", params).await?;
+            if let Some(items) = page.get("sessions").and_then(serde_json::Value::as_array) {
+                sessions.extend(items.iter().cloned());
+            }
+            cursor = page
+                .get("nextCursor")
+                .and_then(serde_json::Value::as_str)
+                .map(str::to_string);
+            if cursor.is_none() {
+                return Ok(serde_json::json!({ "sessions": sessions }));
+            }
+        }
+    }
 
-    /// Replace Goose's native system prompt after `session/new`.
+    /// Load a session into this process, replaying its transcript through the
+    /// existing ACP notification path.
+    pub async fn session_load(
+        &mut self,
+        session_id: &str,
+        cwd: &str,
+        mcp_servers: Vec<McpServer>,
+    ) -> Result<serde_json::Value, AcpError> {
+        let result = self
+            .send_request(
+                "session/load",
+                serde_json::json!({
+                    "sessionId": session_id,
+                    "cwd": cwd,
+                    "mcpServers": mcp_servers,
+                }),
+            )
+            .await?;
+        if let Some(options) = result.get("configOptions") {
+            self.session_config_options = Some(options.clone());
+        }
+        Ok(result)
+    }
+
+    /// Resume a session using the managed agent's configured cwd and MCP
+    /// servers. ACP session identity remains the session id returned by omp.
+    pub async fn session_resume(
+        &mut self,
+        session_id: &str,
+        cwd: &str,
+        mcp_servers: Vec<McpServer>,
+    ) -> Result<serde_json::Value, AcpError> {
+        let result = self
+            .send_request(
+                "session/resume",
+                serde_json::json!({
+                    "sessionId": session_id,
+                    "cwd": cwd,
+                    "mcpServers": mcp_servers,
+                }),
+            )
+            .await?;
+        if let Some(options) = result.get("configOptions") {
+            self.session_config_options = Some(options.clone());
+        }
+        Ok(result)
+    }
+
+    /// Fork a session while preserving the source transcript.
+    pub async fn session_fork(
+        &mut self,
+        session_id: &str,
+        cwd: &str,
+        mcp_servers: Vec<McpServer>,
+    ) -> Result<serde_json::Value, AcpError> {
+        let result = self
+            .send_request(
+                "session/fork",
+                serde_json::json!({
+                    "sessionId": session_id,
+                    "cwd": cwd,
+                    "mcpServers": mcp_servers,
+                }),
+            )
+            .await?;
+        if let Some(options) = result.get("configOptions") {
+            self.session_config_options = Some(options.clone());
+        }
+        Ok(result)
+    }
+
+    /// Close a session without changing the owner process or its profile.
+    pub async fn session_close(&mut self, session_id: &str) -> Result<(), AcpError> {
+        self.send_request(
+            "session/close",
+            serde_json::json!({ "sessionId": session_id }),
+        )
+        .await?;
+        Ok(())
+    }
+
+    /// Replace Goose's native system prompt after session/new.
     pub async fn session_set_goose_system_prompt(
         &mut self,
         session_id: &str,

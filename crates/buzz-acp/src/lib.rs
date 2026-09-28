@@ -41,8 +41,8 @@ use filter::SubscriptionRule;
 use futures_util::FutureExt;
 use nostr::{PublicKey, ToBech32};
 use pool::{
-    AgentCommandResult, AgentCommandTarget, AgentConfigReturn, AgentPool, ConfigRouteOutcome,
-    ControlSignal, IdleSwitchResult, OwnedAgent,
+    AgentCommandResult, AgentCommandTarget, AgentConfigReturn, AgentPool,
+    AgentSessionLifecycleResult, ConfigRouteOutcome, ControlSignal, IdleSwitchResult, OwnedAgent,
     PromptContext, PromptOutcome, PromptResult, PromptSource, SessionState, TimeoutKind,
 };
 use pool_lifecycle::PoolLifecycle;
@@ -1617,6 +1617,9 @@ fn handle_relay_observer_control_event(
         Some("switch_model") => {
             handle_switch_model_control(&payload, pool, observer);
         }
+        Some("session_lifecycle") => {
+            handle_session_lifecycle_control(&payload, pool, observer);
+        }
         Some("dispatch_command") => {
             handle_dispatch_command_control(&payload, pool, observer, &config);
         }
@@ -2052,6 +2055,324 @@ fn handle_set_session_config_control(
                 );
             });
         }
+    }
+}
+
+/// Route list/load/resume/fork/close through the ACP process already owned by
+/// the direct conversation. Profile selection comes from that process
+/// (`OMP_PROFILE`); the target session's cwd comes from ACP's own session list.
+/// No caller-supplied profile or path is accepted.
+fn handle_session_lifecycle_control(
+    payload: &serde_json::Value,
+    pool: &mut AgentPool,
+    observer: Option<&observer::ObserverHandle>,
+) {
+    let request_id = payload
+        .get("requestId")
+        .and_then(serde_json::Value::as_str)
+        .filter(|value| !value.trim().is_empty())
+        .unwrap_or_default()
+        .to_string();
+    let source_session_id = payload
+        .get("sessionId")
+        .and_then(serde_json::Value::as_str)
+        .filter(|value| !value.trim().is_empty())
+        .map(str::to_string);
+    let operation = payload
+        .get("operation")
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or_default()
+        .to_string();
+    let target_session_id = payload
+        .get("targetSessionId")
+        .and_then(serde_json::Value::as_str)
+        .filter(|value| !value.trim().is_empty())
+        .map(str::to_string);
+    let Some(source_session_id) = source_session_id else {
+        emit_session_lifecycle_result(
+            observer,
+            &request_id,
+            None,
+            &operation,
+            "error",
+            Some("missing source sessionId"),
+            None,
+        );
+        return;
+    };
+    if !matches!(operation.as_str(), "list" | "load" | "resume" | "fork" | "close")
+        || (operation != "list" && target_session_id.is_none())
+    {
+        emit_session_lifecycle_result(
+            observer,
+            &request_id,
+            Some(&source_session_id),
+            &operation,
+            "error",
+            Some("unsupported operation or missing targetSessionId"),
+            None,
+        );
+        return;
+    }
+    let (mut agent, scope) = match pool.take_session_lifecycle_agent(&source_session_id) {
+        Ok(pair) => pair,
+        Err(AgentCommandTarget::ActiveTurn) => {
+            emit_session_lifecycle_result(
+                observer,
+                &request_id,
+                Some(&source_session_id),
+                &operation,
+                "active_turn",
+                Some("session cannot switch while a turn or permission is pending"),
+                None,
+            );
+            return;
+        }
+        Err(AgentCommandTarget::Ambiguous) => {
+            emit_session_lifecycle_result(
+                observer,
+                &request_id,
+                Some(&source_session_id),
+                &operation,
+                "ambiguous_target",
+                Some("session is owned by more than one managed agent"),
+                None,
+            );
+            return;
+        }
+        Err(AgentCommandTarget::StaleSession) => {
+            emit_session_lifecycle_result(
+                observer,
+                &request_id,
+                Some(&source_session_id),
+                &operation,
+                "stale_session",
+                Some("session is no longer owned by this managed agent"),
+                None,
+            );
+            return;
+        }
+    };
+    let result_tx = pool.session_lifecycle_result_tx();
+    tokio::spawn(async move {
+        let target_for_result = target_session_id.clone();
+        let channel_id = scope.channel_id();
+        agent.acp.set_observer_context(observer::ObserverContext {
+            channel_id: Some(channel_id.to_string()),
+            session_id: Some(source_session_id.clone()),
+            turn_id: None,
+            started_at: Some(chrono::Utc::now().to_rfc3339()),
+        });
+        let outcome: Result<serde_json::Value, String> = async {
+            let sessions = agent
+                .acp
+                .session_list()
+                .await
+                .map_err(|error| error.to_string())?;
+            let owner_cwd = session_cwd(&sessions, &source_session_id)
+                .ok_or_else(|| "owner session has no working directory".to_string())?;
+            if operation == "list" {
+                return Ok(filter_sessions_by_cwd(&sessions, owner_cwd));
+            }
+            let target = target_session_id.as_deref().expect("validated target id");
+            let target_in_scope = sessions
+                .get("sessions")
+                .and_then(serde_json::Value::as_array)
+                .is_some_and(|sessions| {
+                    sessions.iter().any(|session| {
+                        session.get("sessionId").and_then(serde_json::Value::as_str)
+                            == Some(target)
+                            && session.get("cwd").and_then(serde_json::Value::as_str)
+                                == Some(owner_cwd)
+                    })
+                });
+            if !target_in_scope {
+                return Err("target session is outside this profile and workspace".to_string());
+            }
+            if operation == "close" {
+                agent
+                    .acp
+                    .session_close(target)
+                    .await
+                    .map_err(|error| error.to_string())?;
+                return Ok(serde_json::json!({}));
+            }
+            let cwd = owner_cwd;
+            agent.acp.set_observer_context(observer::ObserverContext {
+                channel_id: Some(channel_id.to_string()),
+                session_id: Some(target.to_string()),
+                turn_id: None,
+                started_at: Some(chrono::Utc::now().to_rfc3339()),
+            });
+            match operation.as_str() {
+                "load" => agent
+                    .acp
+                    .session_load(target, cwd, vec![])
+                    .await
+                    .map_err(|error| error.to_string()),
+                "resume" => agent
+                    .acp
+                    .session_resume(target, cwd, vec![])
+                    .await
+                    .map_err(|error| error.to_string()),
+                "fork" => {
+                    let fork = agent
+                        .acp
+                        .session_fork(target, cwd, vec![])
+                        .await
+                        .map_err(|error| error.to_string())?;
+                    let fork_id = fork
+                        .get("sessionId")
+                        .and_then(serde_json::Value::as_str)
+                        .filter(|id| !id.trim().is_empty())
+                        .ok_or_else(|| "fork response did not include sessionId".to_string())?;
+                    // Forking creates the child; loading it replays that child's
+                    // inherited transcript into the owner's direct conversation.
+                    agent.acp.set_observer_context(observer::ObserverContext {
+                        channel_id: Some(channel_id.to_string()),
+                        session_id: Some(fork_id.to_string()),
+                        turn_id: None,
+                        started_at: Some(chrono::Utc::now().to_rfc3339()),
+                    });
+                    let mut loaded = agent
+                        .acp
+                        .session_load(fork_id, cwd, vec![])
+                        .await
+                        .map_err(|error| error.to_string())?;
+                    loaded["sessionId"] = serde_json::Value::String(fork_id.to_string());
+                    Ok(loaded)
+                }
+                _ => unreachable!("operation validated before spawn"),
+            }
+        }
+        .await;
+        let target_session_id = match (&outcome, operation.as_str()) {
+            (Ok(result), "fork") => result
+                .get("sessionId")
+                .and_then(serde_json::Value::as_str)
+                .map(str::to_string),
+            (Ok(_), "load" | "resume") => target_for_result,
+            (Ok(_), "close") => target_for_result,
+            _ => None,
+        };
+        let _ = result_tx.send(AgentSessionLifecycleResult {
+            agent,
+            scope,
+            source_session_id,
+            operation,
+            target_session_id,
+            request_id,
+            result: outcome,
+        });
+    });
+}
+
+fn emit_session_lifecycle_result(
+    observer: Option<&observer::ObserverHandle>,
+    request_id: &str,
+    session_id: Option<&str>,
+    operation: &str,
+    status: &str,
+    error: Option<&str>,
+    sessions: Option<serde_json::Value>,
+) {
+    let Some(observer) = observer else {
+        return;
+    };
+    let mut payload = serde_json::json!({
+        "type": "session_lifecycle",
+        "requestId": request_id,
+        "sessionId": session_id,
+        "operation": operation,
+        "status": status,
+    });
+    if let Some(error) = error {
+        payload["error"] = serde_json::Value::String(error.to_string());
+    }
+    if let Some(sessions) = sessions {
+        payload["sessions"] = sessions;
+    }
+    observer.emit(
+        "control_result",
+        None,
+        &observer::ObserverContext {
+            channel_id: None,
+            session_id: session_id.map(str::to_string),
+            turn_id: None,
+            started_at: None,
+        },
+        payload,
+    );
+}
+
+fn session_cwd<'a>(value: &'a serde_json::Value, session_id: &str) -> Option<&'a str> {
+    value
+        .get("sessions")?
+        .as_array()?
+        .iter()
+        .find(|session| {
+            session.get("sessionId").and_then(serde_json::Value::as_str) == Some(session_id)
+        })?
+        .get("cwd")?
+        .as_str()
+}
+
+fn filter_sessions_by_cwd(value: &serde_json::Value, cwd: &str) -> serde_json::Value {
+    let sessions = value
+        .get("sessions")
+        .and_then(serde_json::Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter(|session| session.get("cwd").and_then(serde_json::Value::as_str) == Some(cwd))
+        .cloned()
+        .collect::<Vec<_>>();
+    serde_json::json!({ "sessions": sessions })
+}
+
+/// Remove paths and other session metadata before publishing the catalog over
+/// the observer relay. The direct owner already knows its profile/workspace.
+fn sanitize_session_list(value: &serde_json::Value) -> serde_json::Value {
+    let Some(sessions) = value.get("sessions").and_then(serde_json::Value::as_array) else {
+        return serde_json::Value::Array(Vec::new());
+    };
+    serde_json::Value::Array(
+        sessions
+            .iter()
+            .filter_map(|session| {
+                let session_id = session
+                    .get("sessionId")
+                    .and_then(serde_json::Value::as_str)?;
+                let mut item = serde_json::json!({ "sessionId": session_id });
+                for key in ["title", "updatedAt"] {
+                    if let Some(value) = session.get(key) {
+                        item[key] = value.clone();
+                    }
+                }
+                Some(item)
+            })
+            .collect(),
+    )
+}
+
+#[cfg(test)]
+mod session_lifecycle_projection_tests {
+    use super::{filter_sessions_by_cwd, sanitize_session_list, session_cwd};
+
+    #[test]
+    fn session_list_is_scoped_to_owner_workspace_without_publishing_paths() {
+        let sessions = serde_json::json!({
+            "sessions": [
+                { "sessionId": "owned", "cwd": "/private/project", "title": "Owned", "updatedAt": "now" },
+                { "sessionId": "other", "cwd": "/private/other", "title": "Other", "updatedAt": "later" }
+            ]
+        });
+        assert_eq!(session_cwd(&sessions, "owned"), Some("/private/project"));
+        assert_eq!(session_cwd(&sessions, "missing"), None);
+        let owner_sessions = filter_sessions_by_cwd(&sessions, "/private/project");
+        let public = sanitize_session_list(&owner_sessions);
+        assert_eq!(public.as_array().unwrap().len(), 1);
+        assert_eq!(public[0]["sessionId"], "owned");
+        assert!(public[0].get("cwd").is_none());
     }
 }
 
@@ -3613,6 +3934,7 @@ async fn tokio_main() -> Result<()> {
         Result(Box<PromptResult>),
         Command(AgentCommandResult),
         ConfigReturn(AgentConfigReturn),
+        SessionLifecycle(AgentSessionLifecycleResult),
         Panic(tokio::task::JoinError),
         SteerAck(SteerAckEvent),
         Wake(u32, Result<AgentPool, String>),
@@ -3759,7 +4081,7 @@ async fn tokio_main() -> Result<()> {
 
         // Borrow result_rx and join_set simultaneously via split-borrow helper.
         let pool_event: Option<PoolEvent> = {
-            let (result_rx, command_rx, config_return_rx, join_set) =
+            let (result_rx, command_rx, config_return_rx, session_lifecycle_rx, join_set) =
                 pool.rx_command_and_join_set();
             tokio::select! {
                 biased;
@@ -3780,6 +4102,9 @@ async fn tokio_main() -> Result<()> {
                 // keeps the pool from leaking an agent per config write.
                 Some(returned) = config_return_rx.recv(), if pool_ready => {
                     Some(PoolEvent::ConfigReturn(returned))
+                },
+                Some(result) = session_lifecycle_rx.recv(), if pool_ready => {
+                    Some(PoolEvent::SessionLifecycle(result))
                 },
                 // Guard: join_next() returns None immediately when JoinSet is
                 // empty, which would cause a tight spin. Only poll when there
@@ -4369,6 +4694,52 @@ async fn tokio_main() -> Result<()> {
                 // re-registers the scope mappings, and the caller's own oneshot
                 // already delivered the verdict, so nothing else is owed here.
                 pool.return_agent(returned.agent);
+            }
+            Some(PoolEvent::SessionLifecycle(result)) => {
+                let status = if result.result.is_ok() {
+                    "completed"
+                } else {
+                    "error"
+                };
+                let mut payload = serde_json::json!({
+                    "type": "session_lifecycle",
+                    "requestId": result.request_id,
+                    "operation": result.operation,
+                    "sessionId": result.target_session_id
+                        .as_deref()
+                        .unwrap_or(&result.source_session_id),
+                    "status": status,
+                });
+                if let Ok(value) = &result.result {
+                    if result.operation == "list" {
+                        payload["sessions"] = sanitize_session_list(value);
+                    }
+                } else if let Err(error) = &result.result {
+                    payload["error"] = serde_json::Value::String(error.clone());
+                }
+                if let Some(observer) = observer.as_ref() {
+                    observer.emit(
+                        "control_result",
+                        None,
+                        &observer::ObserverContext {
+                            channel_id: None,
+                            session_id: Some(result.source_session_id.clone()),
+                            turn_id: None,
+                            started_at: None,
+                        },
+                        payload,
+                    );
+                }
+                pool.return_session_lifecycle_agent(result);
+                for (scope, thread_tags) in dispatch_pending(
+                    &mut pool,
+                    &mut queue,
+                    &ctx,
+                    &mut last_activity,
+                    observer.as_ref(),
+                ) {
+                    typing_channels.insert(scope, thread_tags);
+                }
             }
             Some(PoolEvent::Command(result)) => {
                 if !remember_command_result(

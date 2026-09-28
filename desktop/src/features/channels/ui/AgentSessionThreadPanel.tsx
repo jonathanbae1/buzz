@@ -517,6 +517,9 @@ export function AgentSessionThreadPanel({
         <div ref={contentRef}>
           <ManagedAgentSessionPanel
             agent={agent}
+            sessionLifecycleEnabled={
+              agent.agentSource === "managed" && channel?.channelType === "dm"
+            }
             channelId={sessionChannelId}
             className="border-0 bg-transparent px-0 py-2 shadow-none"
             emptyDescription={
