@@ -797,6 +797,16 @@ export type RuntimeConfigSurface = {
   effortConfigId?: string;
   /** Adapter-advertised option values for the `thought_level` option — the picker renders these instead of hardcoded values. */
   effortOptions?: AcpConfigOptionValue[];
+  /** The adapter-advertised `model` config id, discovered from the running session — the picker sends `set_config_option` with it instead of guessing. */
+  modelConfigId?: string;
+  /**
+   * Adapter-advertised option values for the `model` option.
+   *
+   * These are the values `session/set_config_option` accepts, which is a
+   * different set from the `omp models` catalog a lane is chosen from; the UI
+   * states that rather than offering a value the live session would refuse.
+   */
+  modelOptions?: AcpConfigOptionValue[];
   /** ACP session-mode config id discovered from the running session. */
   modeConfigId?: string;
   /** Adapter-advertised options for the session-mode config option. */
