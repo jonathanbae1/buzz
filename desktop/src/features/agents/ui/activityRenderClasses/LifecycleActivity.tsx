@@ -1,6 +1,7 @@
 import * as React from "react";
 
 import { respondToManagedAgentPermission } from "@/shared/api/agentControl";
+import { subscribeControlResults } from "@/features/agents/observerRelayStore";
 import { AlertCircle, CheckCircle2, ShieldCheck, XCircle } from "lucide-react";
 
 import { Button } from "@/shared/ui/button";
@@ -33,18 +34,46 @@ function PermissionActivity(props: ActivityRenderClassItemProps) {
   const tone = outcome ? permissionOutcomeTone(outcome) : null;
   const detail = splitPermissionText(item.text);
 
-  async function answer(optionId: string, requestId: string | number) {
+  async function answer(optionId: string) {
     if (!request || submitting) return;
     setSubmitting(true);
     setError(null);
+    const controlRequestId = crypto.randomUUID();
     try {
-      await respondToManagedAgentPermission(
-        props.agentPubkey,
-        request.sessionId,
-        request.nonce,
-        optionId,
-        String(requestId),
-      );
+      await new Promise<void>((resolve, reject) => {
+        let timeout: number;
+        const unsubscribe = subscribeControlResults(
+          props.agentPubkey,
+          (frame) => {
+            if (
+              frame.type !== "permission_response" ||
+              frame.requestId !== controlRequestId ||
+              frame.sessionId !== request.sessionId
+            ) {
+              return;
+            }
+            window.clearTimeout(timeout);
+            unsubscribe();
+            if (frame.status === "sent") resolve();
+            else reject(new Error(frame.error ?? frame.status));
+          },
+        );
+        timeout = window.setTimeout(() => {
+          unsubscribe();
+          reject(new Error("No confirmation received"));
+        }, 8_000);
+        void respondToManagedAgentPermission(
+          props.agentPubkey,
+          request.sessionId,
+          request.nonce,
+          optionId,
+          controlRequestId,
+        ).catch((cause) => {
+          window.clearTimeout(timeout);
+          unsubscribe();
+          reject(cause);
+        });
+      });
     } catch (cause) {
       setError(cause instanceof Error ? cause.message : String(cause));
       setSubmitting(false);
@@ -73,7 +102,7 @@ function PermissionActivity(props: ActivityRenderClassItemProps) {
               variant={option.kind.startsWith("reject") ? "outline" : "default"}
               disabled={submitting}
               data-testid={`permission-option-${option.kind}`}
-              onClick={() => void answer(option.optionId, request.requestId)}
+              onClick={() => void answer(option.optionId)}
             >
               {option.name}
             </Button>
