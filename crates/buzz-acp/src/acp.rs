@@ -640,6 +640,12 @@ fn build_client_capabilities() -> serde_json::Value {
     })
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum PromptContentBlock<'a> {
+    Text(&'a str),
+    Image { data: &'a str, mime_type: &'a str },
+}
+
 impl AcpClient {
     /// Kill the agent subprocess and wait for it to exit (no zombies).
     ///
@@ -1158,6 +1164,40 @@ impl AcpClient {
         max_duration: std::time::Duration,
     ) -> Result<StopReason, AcpError> {
         let params = build_prompt_params(session_id, prompt_blocks);
+        self.session_prompt_params_with_idle_timeout(
+            session_id,
+            params,
+            idle_timeout,
+            max_duration,
+        )
+        .await
+    }
+
+    /// Send text and image content blocks in one `session/prompt` request.
+    pub(crate) async fn session_prompt_content_blocks_with_idle_timeout(
+        &mut self,
+        session_id: &str,
+        prompt_blocks: &[PromptContentBlock<'_>],
+        idle_timeout: std::time::Duration,
+        max_duration: std::time::Duration,
+    ) -> Result<StopReason, AcpError> {
+        let params = build_prompt_content_params(session_id, prompt_blocks);
+        self.session_prompt_params_with_idle_timeout(
+            session_id,
+            params,
+            idle_timeout,
+            max_duration,
+        )
+        .await
+    }
+
+    async fn session_prompt_params_with_idle_timeout(
+        &mut self,
+        session_id: &str,
+        params: serde_json::Value,
+        idle_timeout: std::time::Duration,
+        max_duration: std::time::Duration,
+    ) -> Result<StopReason, AcpError> {
         let hard_deadline = tokio::time::Instant::now() + max_duration;
         self.current_hard_deadline = Some(hard_deadline);
 
@@ -2921,6 +2961,26 @@ fn build_prompt_params(session_id: &str, prompt_blocks: &[&str]) -> serde_json::
         "prompt": blocks,
     })
 }
+/// Build `session/prompt` params from mixed text and image content blocks.
+fn build_prompt_content_params(
+    session_id: &str,
+    prompt_blocks: &[PromptContentBlock<'_>],
+) -> serde_json::Value {
+    let blocks: Vec<serde_json::Value> = prompt_blocks
+        .iter()
+        .map(|block| match block {
+            PromptContentBlock::Text(text) => serde_json::json!({ "type": "text", "text": text }),
+            PromptContentBlock::Image { data, mime_type } => {
+                serde_json::json!({ "type": "image", "data": data, "mimeType": mime_type })
+            }
+        })
+        .collect();
+    serde_json::json!({
+        "sessionId": session_id,
+        "prompt": blocks,
+    })
+}
+
 
 /// Build `_goose/unstable/session/steer` params from one or more text
 /// content blocks plus the freshest `expectedRunId`.
@@ -3482,6 +3542,49 @@ mod tests {
         assert_eq!(prompt[0]["text"].as_str(), Some("/goal ship it"));
         assert!(prompt[0]["text"].as_str().unwrap().starts_with('/'));
         assert_eq!(prompt[1]["type"].as_str(), Some("text"));
+    }
+
+    #[test]
+    fn session_prompt_mixed_blocks_preserve_slash_command_and_serialize_image() {
+        let params = build_prompt_content_params(
+            "sess_abc123",
+            &[
+                PromptContentBlock::Text("/goal ship it"),
+                PromptContentBlock::Text("[Buzz event]\nContent: attached image"),
+                PromptContentBlock::Image {
+                    data: "aW1n",
+                    mime_type: "image/png",
+                },
+            ],
+        );
+        let prompt = params["prompt"].as_array().unwrap();
+        assert_eq!(prompt.len(), 3);
+        assert_eq!(
+            prompt[0],
+            serde_json::json!({ "type": "text", "text": "/goal ship it" })
+        );
+        assert!(
+            prompt[0]["text"]
+                .as_str()
+                .unwrap()
+                .starts_with('/'),
+            "slash-command detection must continue to see the first text block"
+        );
+        assert_eq!(
+            prompt[1],
+            serde_json::json!({
+                "type": "text",
+                "text": "[Buzz event]\nContent: attached image"
+            })
+        );
+        assert_eq!(
+            prompt[2],
+            serde_json::json!({
+                "type": "image",
+                "data": "aW1n",
+                "mimeType": "image/png"
+            })
+        );
     }
 
     // ── permission resolution semantics (S1) ──────────────────────────────

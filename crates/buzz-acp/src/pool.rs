@@ -32,7 +32,7 @@ use uuid::Uuid;
 use crate::acp::{
     extract_config_option_id_by_category, extract_model_config_options, extract_model_state,
     extract_thought_level_config_id, model_in_catalog, resolve_model_switch_method, AcpClient,
-    AcpError, EnvVar, McpServer, ModelSwitchMethod, PermissionAnswer, StopReason,
+    AcpError, EnvVar, McpServer, ModelSwitchMethod, PermissionAnswer, PromptContentBlock, StopReason,
     SystemPromptTransport,
 };
 use crate::config::{compose_scoped_session_title, DedupMode, PermissionMode};
@@ -3269,6 +3269,29 @@ pub async fn run_prompt_task(
         return;
     };
 
+    let prompt_images = if let Some(batch_ref) = batch.as_ref() {
+        match fetch_batch_image_attachments(batch_ref, &ctx.rest_client.http).await {
+            Ok(images) => images,
+            Err(error) => {
+                tracing::error!(
+                    target: "pool::prompt",
+                    "failed to prepare image attachments: {error}"
+                );
+                send_prompt_result(
+                    &result_tx,
+                    &turn_id,
+                    agent,
+                    source,
+                    PromptOutcome::Error(error),
+                    requeue_batch_if_queue(&ctx, batch),
+                );
+                return;
+            }
+        }
+    } else {
+        Vec::new()
+    };
+
     // 💬 — fire-and-forget so the prompt fires immediately.
     // The guard's cleanup (spawned on drop) removes 💬 after the turn completes.
     // A brief race where 💬 appears slightly after the agent starts is acceptable.
@@ -3291,6 +3314,21 @@ pub async fn run_prompt_task(
             .collect(),
         None => prompt_sections.iter().map(String::as_str).collect(),
     };
+    let mut prompt_content_blocks =
+        Vec::with_capacity(prompt_blocks.len() + prompt_images.len());
+    prompt_content_blocks.extend(
+        prompt_blocks
+            .iter()
+            .copied()
+            .map(PromptContentBlock::Text),
+    );
+    prompt_content_blocks.extend(prompt_images.iter().map(|image| {
+        PromptContentBlock::Image {
+            data: &image.data,
+            mime_type: &image.mime_type,
+        }
+    }));
+
     let prompt_bytes: usize = prompt_blocks.iter().map(|block| block.len()).sum();
     let has_standing_context = match &source {
         PromptSource::Channel(_) => !standing.sections().is_empty(),
@@ -3335,9 +3373,9 @@ pub async fn run_prompt_task(
             // Heartbeat / non-cancellable path.
             tokio::select! {
                 biased;
-                result = agent.acp.session_prompt_blocks_with_idle_timeout(
+                result = agent.acp.session_prompt_content_blocks_with_idle_timeout(
                     &session_id,
-                    &prompt_blocks,
+                    &prompt_content_blocks,
                     ctx.idle_timeout,
                     ctx.max_turn_duration,
                 ) => result,
@@ -3346,9 +3384,9 @@ pub async fn run_prompt_task(
         Some(rx) => {
             tokio::select! {
                 biased;
-                result = agent.acp.session_prompt_blocks_with_idle_timeout(
+                result = agent.acp.session_prompt_content_blocks_with_idle_timeout(
                     &session_id,
-                    &prompt_blocks,
+                    &prompt_content_blocks,
                     ctx.idle_timeout,
                     ctx.max_turn_duration,
                 ) => result,
@@ -3743,6 +3781,130 @@ pub async fn run_prompt_task(
         }
     }
     // _reaction_guard drops here → spawns clear_reactions for all exit paths.
+}
+
+#[derive(Debug)]
+struct ImetaImageSource {
+    event_id: String,
+    url: url::Url,
+    mime_type: String,
+}
+
+#[derive(Debug)]
+struct PromptImageAttachment {
+    data: String,
+    mime_type: String,
+}
+
+fn parse_imeta_image_source(
+    tag: &nostr::Tag,
+    event_id: &str,
+) -> Result<Option<ImetaImageSource>, AcpError> {
+    let fields = tag.as_slice();
+    if fields.first().map(String::as_str) != Some("imeta") {
+        return Ok(None);
+    }
+
+    let mut mime_types = Vec::new();
+    let mut urls = Vec::new();
+    for field in fields.iter().skip(1) {
+        let (key, value) = field.split_once(' ').ok_or_else(|| {
+            AcpError::Protocol(format!(
+                "malformed imeta field {field:?} on event {event_id}"
+            ))
+        })?;
+        match key {
+            "m" => mime_types.push(value),
+            "url" => urls.push(value),
+            _ => {}
+        }
+    }
+
+    let Some(mime_type) = mime_types.iter().find(|mime_type| mime_type.starts_with("image/"))
+    else {
+        return Ok(None);
+    };
+    if mime_types.len() != 1 {
+        return Err(AcpError::Protocol(format!(
+            "ambiguous imeta MIME type on image attachment for event {event_id}"
+        )));
+    }
+    if mime_type.len() <= "image/".len()
+        || mime_type["image/".len()..]
+            .chars()
+            .any(char::is_whitespace)
+    {
+        return Err(AcpError::Protocol(format!(
+            "invalid image MIME type {mime_type:?} on event {event_id}"
+        )));
+    }
+    if urls.len() != 1 {
+        return Err(AcpError::Protocol(format!(
+            "image imeta tag on event {event_id} must have exactly one URL"
+        )));
+    }
+
+    let url = url::Url::parse(urls[0]).map_err(|error| {
+        AcpError::Protocol(format!(
+            "invalid image URL on event {event_id}: {error}"
+        ))
+    })?;
+    if !matches!(url.scheme(), "http" | "https") {
+        return Err(AcpError::Protocol(format!(
+            "unsupported image URL scheme {:?} on event {event_id}",
+            url.scheme()
+        )));
+    }
+
+    Ok(Some(ImetaImageSource {
+        event_id: event_id.to_owned(),
+        url,
+        mime_type: (*mime_type).to_owned(),
+    }))
+}
+
+async fn fetch_batch_image_attachments(
+    batch: &FlushBatch,
+    http: &reqwest::Client,
+) -> Result<Vec<PromptImageAttachment>, AcpError> {
+    let mut sources = Vec::new();
+    for batch_event in batch.events.iter().chain(&batch.cancelled_events) {
+        let event_id = batch_event.event.id.to_hex();
+        for tag in batch_event.event.tags.iter() {
+            if let Some(source) = parse_imeta_image_source(tag, &event_id)? {
+                sources.push(source);
+            }
+        }
+    }
+
+    use base64::Engine as _;
+    let mut attachments = Vec::with_capacity(sources.len());
+    for source in sources {
+        let response = http.get(source.url.as_str()).send().await.map_err(|error| {
+            AcpError::Protocol(format!(
+                "failed to fetch image for event {} from {}: {error}",
+                source.event_id, source.url
+            ))
+        })?;
+        let response = response.error_for_status().map_err(|error| {
+            AcpError::Protocol(format!(
+                "image fetch returned an error for event {} from {}: {error}",
+                source.event_id, source.url
+            ))
+        })?;
+        let bytes = response.bytes().await.map_err(|error| {
+            AcpError::Protocol(format!(
+                "failed to read image for event {} from {}: {error}",
+                source.event_id, source.url
+            ))
+        })?;
+        attachments.push(PromptImageAttachment {
+            data: base64::engine::general_purpose::STANDARD.encode(&bytes),
+            mime_type: source.mime_type,
+        });
+    }
+
+    Ok(attachments)
 }
 
 /// Retry wrapper for context fetches: one retry with `CONTEXT_FETCH_RETRY_DELAY`
@@ -5703,6 +5865,96 @@ mod tests {
             args: vec![],
             env: vec![],
         }
+    }
+
+    #[test]
+    fn imeta_image_parser_ignores_non_image_and_rejects_invalid_image_url() {
+        let image_url = "url https://media.example/image.png";
+        let image = Tag::parse(["imeta", image_url, "m image/png"]).unwrap();
+        let source = parse_imeta_image_source(&image, "event-image")
+            .unwrap()
+            .unwrap();
+        assert_eq!(source.url.as_str(), "https://media.example/image.png");
+        assert_eq!(source.mime_type, "image/png");
+
+        let file_url = "url https://media.example/document.pdf";
+        let file = Tag::parse(["imeta", file_url, "m application/pdf"]).unwrap();
+        assert!(
+            parse_imeta_image_source(&file, "event-file")
+                .unwrap()
+                .is_none()
+        );
+
+        let malformed_url = "url not-a-url";
+        let malformed = Tag::parse(["imeta", malformed_url, "m image/jpeg"]).unwrap();
+        assert!(
+            parse_imeta_image_source(&malformed, "event-bad")
+                .unwrap_err()
+                .to_string()
+                .contains("invalid image URL")
+        );
+    }
+
+    #[tokio::test]
+    async fn batch_image_attachments_fetch_only_images_and_base64_encode_bytes() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let image_bytes = b"image bytes";
+        let server = tokio::spawn(async move {
+            let (mut stream, _) = tokio::time::timeout(
+                std::time::Duration::from_secs(5),
+                listener.accept(),
+            )
+            .await
+            .expect("image request should reach the local server")
+            .unwrap();
+            let mut request = [0; 1024];
+            let read = stream.read(&mut request).await.unwrap();
+            let request = std::str::from_utf8(&request[..read]).unwrap();
+            assert!(request.starts_with("GET /image.png HTTP/1.1"), "{request}");
+            let response = format!(
+                "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                image_bytes.len()
+            );
+            stream.write_all(response.as_bytes()).await.unwrap();
+            stream.write_all(image_bytes).await.unwrap();
+        });
+
+        let image_url = format!("url http://{address}/image.png");
+        let file_url = format!("url http://{address}/document.pdf");
+        let event = EventBuilder::new(Kind::Custom(9), "image attachment")
+            .tags([
+                Tag::parse(["imeta", image_url.as_str(), "m image/png"]).unwrap(),
+                Tag::parse(["imeta", file_url.as_str(), "m application/pdf"]).unwrap(),
+            ])
+            .sign_with_keys(&Keys::generate())
+            .unwrap();
+        let channel_id = Uuid::new_v4();
+        let batch = FlushBatch {
+            channel_id,
+            scope: conv(channel_id),
+            events: vec![crate::queue::BatchEvent {
+                event,
+                prompt_tag: "test".into(),
+                received_at: std::time::Instant::now(),
+            }],
+            cancelled_events: Vec::new(),
+            cancel_reason: None,
+        };
+
+        let attachments =
+            fetch_batch_image_attachments(&batch, &reqwest::Client::new())
+                .await
+                .unwrap();
+        server.await.unwrap();
+        assert_eq!(attachments.len(), 1);
+        assert_eq!(attachments[0].mime_type, "image/png");
+        assert_eq!(
+            attachments[0].data,
+            "aW1hZ2UgYnl0ZXM="
+        );
     }
 
     #[test]
