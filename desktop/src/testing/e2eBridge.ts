@@ -310,6 +310,13 @@ type E2eConfig = {
       mcp?: MockCommandAvailability;
     };
     managedAgents?: MockManagedAgentSeed[];
+    /** Private M1 task board returned by the native adapter mocks. */
+    agentTasks?: {
+      host?: string | null;
+      contract?: string | null;
+      managedAvailable?: boolean;
+      tasks: Array<Record<string, unknown>>;
+    };
     /** Result returned by the mocked `add_agent_to_huddle` command. */
     addAgentToHuddleResult?: {
       ephemeral_added: boolean;
@@ -14251,6 +14258,51 @@ export function maybeInstallE2eTauriMocks() {
             },
           ],
         };
+      }
+      case "agent_tasks_status": {
+        const seed = activeConfig?.mock?.agentTasks;
+        const available = seed?.managedAvailable ?? false;
+        return {
+          configured: true,
+          host: seed?.host ?? "tasks.test",
+          contract: seed?.contract ?? null,
+          serviceVersion: available ? "0.9.28-m1.1" : null,
+          managedAvailable: available,
+          managedUnavailableReason: available ? null : "M1 contract unavailable",
+          error: null,
+        };
+      }
+      case "agent_tasks_list": {
+        const seed = activeConfig?.mock?.agentTasks;
+        if (!seed) throw new Error("task board fixture is not configured");
+        return {
+          host: seed.host ?? "tasks.test",
+          contract: seed.contract ?? null,
+          managedAvailable: seed.managedAvailable ?? false,
+          managedUnavailableReason:
+            seed.managedAvailable === false ? "M1 contract unavailable" : null,
+          tasks: structuredClone(seed.tasks),
+        };
+      }
+      case "agent_tasks_register_dispatch": {
+        const input = payload as {
+          actionId: string;
+          requestId: string;
+          sessionId: string;
+          expectedRevision: number;
+        };
+        const seed = activeConfig?.mock?.agentTasks;
+        const row = seed?.tasks.find(task => task.id === input.actionId);
+        if (!row || row.assignmentRevision !== input.expectedRevision) {
+          throw new Error("task assignment revision changed");
+        }
+        row.dispatch = {
+          requestId: input.requestId,
+          sessionId: input.sessionId,
+          at: new Date().toISOString(),
+        };
+        row.assignmentRevision = input.expectedRevision + 1;
+        return { success: true, revision: row.assignmentRevision };
       }
       case "list_managed_agents":
         return handleListManagedAgents(activeConfig);

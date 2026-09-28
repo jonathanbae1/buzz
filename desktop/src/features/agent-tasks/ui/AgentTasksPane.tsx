@@ -1,9 +1,25 @@
 import * as React from "react";
 
+import { useActiveAgentTurns } from "@/features/agents/activeAgentTurnsStore";
+import { useManagedAgentsQuery } from "@/features/agents/hooks";
+import {
+  deriveLatestSessionId,
+  mergeObserverEventWindows,
+  scopeByChannel,
+} from "@/features/agents/ui/agentSessionPanelLayout";
+import {
+  useArchivedChannelEvents,
+  useLoadArchivedObserverEvents,
+  useObserverEvents,
+} from "@/features/agents/ui/useObserverEvents";
+import { useChannelsQuery } from "@/features/channels/hooks";
+import { useSendMessageMutation } from "@/features/messages/hooks";
+import { useIdentityQuery } from "@/shared/api/hooks";
 import {
   assignAgentTask,
   getAgentTasksStatus,
   listAgentTasks,
+  registerAgentTaskDispatch,
   toTaskError,
   type StoreStatus,
   type TaskBoard,
@@ -12,6 +28,8 @@ import {
   type TaskRow,
 } from "@/shared/api/tauriAgentTasks";
 import { ViewLoadingFallback } from "@/shared/ui/ViewLoadingFallback";
+
+const M1_CONTRACT = "agentmemory-m1.1";
 
 /**
  * Private Tasks pane (M1).
@@ -136,6 +154,34 @@ export function AgentTasksPane() {
   // rather than held as its own copy.
   const selected = rows.find(row => row.id === selectedId) ?? rows[0] ?? null;
 
+  const identityQuery = useIdentityQuery();
+  const channelsQuery = useChannelsQuery();
+  const sendMessage = useSendMessageMutation(null, identityQuery.data);
+  const managedAgentsQuery = useManagedAgentsQuery();
+  const targetPubkey = selected?.assignmentTarget?.startsWith("buzz:")
+    ? selected.assignmentTarget.slice("buzz:".length).toLowerCase()
+    : null;
+  const { events: liveEvents } = useObserverEvents(Boolean(targetPubkey), targetPubkey);
+  const activeTurns = useActiveAgentTurns(targetPubkey);
+  const ownPubkey = identityQuery.data?.pubkey?.toLowerCase() ?? null;
+  const directChannel = channelsQuery.data?.find(channel =>
+    channel.channelType === "dm" &&
+    channel.participantPubkeys.length === 2 &&
+    channel.participantPubkeys.some(pubkey => pubkey.toLowerCase() === targetPubkey) &&
+    (!ownPubkey || channel.participantPubkeys.some(pubkey => pubkey.toLowerCase() === ownPubkey)),
+  ) ?? null;
+  const directChannelId = directChannel?.id ?? null;
+  useLoadArchivedObserverEvents(Boolean(directChannelId), directChannelId);
+  const archivedEvents = useArchivedChannelEvents(targetPubkey, directChannelId);
+  const sessionId = React.useMemo(() => {
+    if (!directChannelId) return null;
+    return deriveLatestSessionId(
+      mergeObserverEventWindows(
+        scopeByChannel(liveEvents, directChannelId),
+        archivedEvents,
+      ),
+    );
+  }, [archivedEvents, directChannelId, liveEvents]);
   const handleAssign = React.useCallback(
     async (row: TaskRow, targetAgentId: string | null) => {
       setBusy(true);
@@ -162,6 +208,101 @@ export function AgentTasksPane() {
     [refresh],
   );
 
+  const handleRun = React.useCallback(
+    async (row: TaskRow) => {
+      setNotice(null);
+      const target = row.assignmentTarget;
+      const match = target?.match(/^buzz:([0-9a-f]{64})$/i);
+      if (!match) {
+        setNotice("Run refused: assign this action to a managed agent first.");
+        return;
+      }
+      if (
+        !board?.managedAvailable ||
+        board.contract !== M1_CONTRACT ||
+        !status?.managedAvailable ||
+        status.contract !== M1_CONTRACT
+      ) {
+        setNotice(
+          `Run refused: the compatible ${M1_CONTRACT} task contract is unavailable.`,
+        );
+        return;
+      }
+      if (row.readiness !== "ready") {
+        setNotice(`Run refused: this action is ${READINESS_LABEL[row.readiness].toLowerCase()}.`);
+        return;
+      }
+      const pubkey = match[1].toLowerCase();
+      const agent = managedAgentsQuery.data?.find(
+        item => item.pubkey.toLowerCase() === pubkey,
+      );
+      if (!agent || (agent.status !== "running" && agent.status !== "deployed")) {
+        setNotice("Run refused: the assigned managed agent is unavailable.");
+        return;
+      }
+      if (activeTurns.length > 0) {
+        setNotice("Run refused: the assigned agent already has an active turn.");
+        return;
+      }
+      if (!identityQuery.data || !directChannel || !sessionId) {
+        setNotice(
+          "Run refused: the assigned agent has no initialized direct conversation session.",
+        );
+        return;
+      }
+      const requestId = crypto.randomUUID();
+      setBusy(true);
+      try {
+        const registration = await registerAgentTaskDispatch({
+          actionId: row.id,
+          requestId,
+          sessionId,
+          expectedRevision: row.assignmentRevision,
+        });
+        if (
+          registration === null ||
+          typeof registration !== "object" ||
+          (registration as Record<string, unknown>)["success"] !== true
+        ) {
+          throw new Error("The task store did not confirm dispatch registration.");
+        }
+        const prompt = [
+          `M1W ${row.id} ${requestId}`,
+          `Task: ${row.title}`,
+          row.description,
+          "Complete the requested work, then call work_complete with outcome succeeded or failed and the full result.",
+        ]
+          .filter(Boolean)
+          .join("\n");
+        await sendMessage.mutateAsync({
+          targetChannel: directChannel,
+          content: prompt,
+          mentionPubkeys: [pubkey],
+          transport: "http",
+        });
+        setNotice(`Run sent to ${agent.name}. Request ${requestId}. Refreshing the attempt projection.`);
+        await refresh();
+      } catch (thrown) {
+        const message =
+          thrown instanceof Error ? thrown.message : toTaskError(thrown).message;
+        setNotice(`Run delivery unknown for request ${requestId}: ${message}`);
+        await refresh();
+      } finally {
+        setBusy(false);
+      }
+    },
+    [
+      activeTurns.length,
+      board,
+      directChannel,
+      identityQuery.data,
+      managedAgentsQuery.data,
+      refresh,
+      sendMessage,
+      sessionId,
+      status,
+    ],
+  );
   const managedUnavailable = board !== null && !board.managedAvailable;
 
   return (
@@ -275,7 +416,7 @@ export function AgentTasksPane() {
           {loading && !board ? (
             <ViewLoadingFallback kind="tasks" />
           ) : selected ? (
-            <TaskDetail row={selected} busy={busy} onAssign={handleAssign} />
+            <TaskDetail row={selected} busy={busy} onAssign={handleAssign} onRun={handleRun} />
           ) : (
             <p className="text-sm text-muted-foreground">Select an action to see its detail.</p>
           )}
@@ -298,10 +439,12 @@ function TaskDetail({
   row,
   busy,
   onAssign,
+  onRun,
 }: {
   row: TaskRow;
   busy: boolean;
   onAssign: (row: TaskRow, targetAgentId: string | null) => Promise<void>;
+  onRun: (row: TaskRow) => Promise<void>;
 }) {
   return (
     <div className="space-y-4">
@@ -404,12 +547,20 @@ function TaskDetail({
         >
           Clear assignment
         </button>
+        <button
+          type="button"
+          disabled={busy}
+          onClick={() => void onRun(row)}
+          className="rounded-md bg-primary px-3 py-1.5 text-xs text-primary-foreground hover:opacity-90 disabled:opacity-50"
+        >
+          {busy ? "Starting…" : "Run"}
+        </button>
       </div>
 
       <p className="text-xs text-muted-foreground">
-        Assign writes intent only. Starting work is a separate explicit action, and this pane does not
-        start it: Run requires the work extension in the managed host and a reconciled dispatch, and it
-        is refused before then rather than attempted and reported as success.
+        Run requires a ready action, the assigned managed agent's initialized idle direct session,
+        and the compatible task contract. Dispatch is registered before the ordinary direct-message
+        prompt is sent; refresh shows the authoritative request and lease projection.
       </p>
     </div>
   );

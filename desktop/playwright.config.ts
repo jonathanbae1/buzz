@@ -53,6 +53,7 @@ export default defineConfig({
         "**/channel-activity-popover.spec.ts",
         "**/active-turn-resilience.spec.ts",
         "**/agent-control-regressions.spec.ts",
+        "**/agent-tasks-run.spec.ts",
         "**/profile-active-turn.spec.ts",
         "**/config-bridge-screenshots.spec.ts",
         "**/observer-feed-screenshots.spec.ts",
