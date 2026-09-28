@@ -859,7 +859,7 @@ export function processTranscriptEvent(
         d,
         itemId,
         "permission",
-        request.title,
+        "Permission requested",
         request.text,
         event.timestamp,
         ctx,
