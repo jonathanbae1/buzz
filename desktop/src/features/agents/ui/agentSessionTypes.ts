@@ -109,6 +109,16 @@ export type TranscriptItem =
       text: string;
       /** Resolved outcome for permission items (e.g. "Approved (allow_once)", "Denied (reject_once)", "Cancelled"). */
       outcome?: string;
+      permissionRequest?: {
+        nonce: number;
+        requestId: string | number;
+        sessionId: string;
+        options: Array<{
+          optionId: string;
+          kind: string;
+          name: string;
+        }>;
+      };
       timestamp: string;
       descriptor?: AgentActivityDescriptor;
       acpSource?: TranscriptAcpSource;

@@ -469,7 +469,11 @@ export type AgentSessionCommandOutputDisposition =
   | "tool_handled";
 
 export type ControlResultFrame = {
-  type: "cancel_turn" | "switch_model" | "dispatch_command";
+  type:
+    | "cancel_turn"
+    | "switch_model"
+    | "dispatch_command"
+    | "permission_response";
   status: string;
   modelId?: string;
   commandName?: string;

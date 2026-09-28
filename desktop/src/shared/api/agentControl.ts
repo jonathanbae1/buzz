@@ -12,6 +12,22 @@ export async function cancelManagedAgentTurn(
     requestId,
   });
 }
+/** Answer a pending ACP permission prompt on its exact live session. */
+export async function respondToManagedAgentPermission(
+  pubkey: string,
+  sessionId: string,
+  nonce: number,
+  optionId: string,
+  requestId: string,
+): Promise<void> {
+  await sendAgentObserverControl(pubkey, {
+    type: "permission_response",
+    sessionId,
+    nonce,
+    optionId,
+    requestId,
+  });
+}
 
 /**
  * Send a live model-switch control frame to a running agent. The switch rides
