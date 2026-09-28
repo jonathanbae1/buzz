@@ -124,6 +124,8 @@ export function markdownPropsAreEqual(
     prev.configNudgeAuthorPubkey === next.configNudgeAuthorPubkey &&
     prev.searchQuery === next.searchQuery &&
     prev.snapshotSharedBy === next.snapshotSharedBy &&
-    prev.videoReviewContext === next.videoReviewContext
+    prev.videoReviewContext === next.videoReviewContext &&
+    prev.documentSurface === next.documentSurface &&
+    prev.documentLinkPolicy === next.documentLinkPolicy
   );
 }

@@ -53,6 +53,8 @@ import {
 } from "./markdown/CodeBlock";
 import { EntityLinkAnchor, useOpenEntityLink } from "./markdown/entityLinks";
 import { ExternalLinkAnchor } from "./markdown/ExternalLinkAnchor";
+import { DocumentArtifactAnchor } from "./markdown/DocumentArtifactAnchor";
+import { ProvenanceChip } from "./markdown/ProvenanceChip";
 import { FileCard } from "./markdown/FileCard";
 import {
   AuthoredDeepLinkAnchor,
@@ -145,6 +147,15 @@ type ImageBlockProps = {
 type WebKitGestureLikeEvent = Event & {
   scale?: number;
 };
+
+/**
+ * Only an absolute `http(s)://` URL is a URL on a document surface. Everything
+ * else in wiki content is a repo-relative reference, which `buzzDeepLinkUrlTransform`
+ * passes through unchanged and which the OS opener cannot resolve.
+ */
+function isAbsoluteHttpUrl(value: string): boolean {
+  return /^https?:\/\//i.test(value);
+}
 
 function ImageZoomOverlay({
   alt,
@@ -1213,6 +1224,7 @@ export function createMarkdownComponents(
   interactive = true,
   mediaInset = false,
   blockCode = false,
+  documentSurface = false,
 ): Components {
   const listItemClassName = "[&_p]:inline";
   const listClassName = "space-y-1 pl-6 marker:text-muted-foreground/80";
@@ -1224,8 +1236,11 @@ export function createMarkdownComponents(
   }: React.ComponentPropsWithoutRef<"a">) {
     const {
       channels,
+      documentLinkPolicy,
       imetaByUrl,
       onOpenChannel,
+      onOpenDocumentArtifact,
+      onOpenDocumentLink,
       onOpenEntityLink,
       onOpenMessageLink,
       onImportSnapshotFromUrl,
@@ -1364,6 +1379,60 @@ export function createMarkdownComponents(
       ? parseSupportedLinkPreview(href, relayOrigin)
       : null;
     const isLinearLink = supportedLinkPreview?.kind === "linear-issue";
+
+    // Document surface: a relative href means nothing as a URL (the app uses
+    // hashed routing under `default-src 'self'`), and a root-confined file is
+    // not externally resolvable either. Resolution decides the class, and
+    // anything unresolved renders inert rather than as a link to a wrong
+    // target.
+    if (documentSurface && href && !isAbsoluteHttpUrl(href)) {
+      const target = documentLinkPolicy
+        ? documentLinkPolicy(href)
+        : ({ kind: "unresolved" } as const);
+      if (target.kind === "document" && onOpenDocumentLink) {
+        return (
+          <button
+            className="font-medium text-primary underline underline-offset-4 transition-colors hover:text-primary/80"
+            data-document-link={target.href}
+            onClick={() => onOpenDocumentLink(target.href, target.heading)}
+            type="button"
+          >
+            {children}
+          </button>
+        );
+      }
+      if (target.kind === "artifact" && onOpenDocumentArtifact) {
+        return (
+          <DocumentArtifactAnchor
+            onOpen={onOpenDocumentArtifact}
+            path={target.path}
+          >
+            {children}
+          </DocumentArtifactAnchor>
+        );
+      }
+      if (target.kind === "external") {
+        return (
+          <ExternalLinkAnchor
+            anchorProps={props}
+            href={target.href}
+            isLinearLink={false}
+            label={label}
+          >
+            {children}
+          </ExternalLinkAnchor>
+        );
+      }
+      return (
+        <span
+          className="font-medium text-muted-foreground"
+          data-document-link-inert={href}
+          title={`Unresolved document link: ${href}`}
+        >
+          {children}
+        </span>
+      );
+    }
 
     return (
       <ExternalLinkAnchor
@@ -1596,6 +1665,23 @@ export function createMarkdownComponents(
         {children}
       </MarkdownChannelReference>
     ),
+    // Emitted only by the document-surface provenance plugin; chat and README
+    // rendering never produce this node type.
+    "provenance-marker": function MarkdownProvenanceMarker({
+      children,
+    }: {
+      children?: React.ReactNode;
+    }) {
+      const { onOpenSourceCitation, resolveSourceCitation } =
+        useMarkdownRuntime();
+      return (
+        <ProvenanceChip
+          onOpenSource={onOpenSourceCitation}
+          raw={String(children ?? "")}
+          resolveSource={resolveSourceCitation}
+        />
+      );
+    },
     "entity-link": function MarkdownEntityLink({
       children,
     }: {
@@ -1643,7 +1729,7 @@ export function createMarkdownComponents(
  * sixteen instances ever exist. Module-stable maps mean cached markdown
  * element trees (see ./markdown/nodeCache.ts) never embed per-mount closures.
  */
-const MARKDOWN_COMPONENT_SCHEMA_VERSION = "8";
+const MARKDOWN_COMPONENT_SCHEMA_VERSION = "9";
 const markdownComponentsByVariant = new Map<string, MarkdownComponentSet>();
 
 type MarkdownComponentSet = { components: Components; variant: string };
@@ -1660,12 +1746,18 @@ function getMarkdownComponents(
   leadingInlineContent: boolean,
   mediaInset: boolean,
   blockCode: boolean,
+  documentSurface: boolean,
 ): MarkdownComponentSet {
-  const variant = `${MARKDOWN_COMPONENT_SCHEMA_VERSION}:${interactive ? "i" : ""}${leadingInlineContent ? "l" : ""}${mediaInset ? "m" : ""}${blockCode ? "c" : ""}`;
+  const variant = `${MARKDOWN_COMPONENT_SCHEMA_VERSION}:${interactive ? "i" : ""}${leadingInlineContent ? "l" : ""}${mediaInset ? "m" : ""}${blockCode ? "c" : ""}${documentSurface ? "d" : ""}`;
   let entry = markdownComponentsByVariant.get(variant);
   if (!entry) {
     entry = {
-      components: createMarkdownComponents(interactive, mediaInset, blockCode),
+      components: createMarkdownComponents(
+        interactive,
+        mediaInset,
+        blockCode,
+        documentSurface,
+      ),
       variant,
     };
     markdownComponentsByVariant.set(variant, entry);
@@ -1695,6 +1787,12 @@ function MarkdownInner({
   searchQuery,
   snapshotSharedBy,
   videoReviewContext,
+  documentSurface = false,
+  documentLinkPolicy,
+  onOpenDocumentLink,
+  onOpenDocumentArtifact,
+  onOpenSourceCitation,
+  resolveSourceCitation,
 }: MarkdownProps) {
   const { channels: rawChannels } = useChannelNavigation();
   const channels = useStableArray(rawChannels);
@@ -1743,6 +1841,11 @@ function MarkdownInner({
       relayOrigin,
       resolveChannelReferences: true,
       snapshotSharedBy,
+      documentLinkPolicy,
+      onOpenDocumentLink,
+      onOpenDocumentArtifact,
+      onOpenSourceCitation,
+      resolveSourceCitation,
       onImportSnapshotFromUrl: (
         fileBytes: number[],
         fileName: string,
@@ -1763,6 +1866,11 @@ function MarkdownInner({
       onOpenMessageLink,
       relayOrigin,
       snapshotSharedBy,
+      documentLinkPolicy,
+      onOpenDocumentLink,
+      onOpenDocumentArtifact,
+      onOpenSourceCitation,
+      resolveSourceCitation,
       goAgents,
     ],
   );
@@ -1790,6 +1898,7 @@ function MarkdownInner({
     hasLeadingInlineContent,
     mediaInset,
     blockCode,
+    documentSurface,
   );
   const markdownNode =
     configNudge === null
@@ -1803,11 +1912,13 @@ function MarkdownInner({
           mentionNames,
           searchQuery,
           variant: componentSet.variant,
+          documentSurface,
         })
       : null;
 
   return (
     <div
+      data-markdown-document-surface={documentSurface ? "true" : "false"}
       className={cn(
         MESSAGE_MARKDOWN_CLASS,
         [

@@ -1,3 +1,4 @@
+use super::super::project_git_exec::build_test_git_auth_config;
 use super::super::project_git_file_content::validate_repo_file_path;
 use super::*;
 
@@ -108,4 +109,87 @@ fn parse_worktree_files_counts_only_files_toward_eager_preview_limit() {
 
     assert_eq!(files.len(), MAX_EAGER_FILE_PREVIEWS);
     assert!(files.iter().all(|file| file.preview_content.is_some()));
+}
+
+/// A real git fixture: `parse_worktree_files` and `parse_tracked_paths` must
+/// disagree on the untracked scratch file, which is the whole reason the
+/// tracked-paths command exists.
+#[test]
+fn tracked_paths_exclude_untracked_scratch_files() {
+    let repo_dir = tempfile::tempdir().expect("create temporary repository");
+    let root = repo_dir.path();
+    let git = |args: &[&str]| {
+        let status = std::process::Command::new("git")
+            .args(args)
+            .current_dir(root)
+            .env("GIT_AUTHOR_NAME", "t")
+            .env("GIT_AUTHOR_EMAIL", "t@example.com")
+            .env("GIT_COMMITTER_NAME", "t")
+            .env("GIT_COMMITTER_EMAIL", "t@example.com")
+            .output()
+            .expect("run git");
+        assert!(
+            status.status.success(),
+            "git {args:?} failed: {}",
+            String::from_utf8_lossy(&status.stderr)
+        );
+    };
+    git(&["init", "-q"]);
+    std::fs::create_dir_all(root.join("wiki")).expect("create wiki dir");
+    std::fs::write(root.join("wiki/README.md"), "# Wiki\n").expect("write readme");
+    std::fs::write(root.join("wiki/store.md"), "# Store\n").expect("write store");
+    git(&["add", "wiki/README.md", "wiki/store.md"]);
+    git(&["commit", "-q", "-m", "seed wiki"]);
+    // An uncurated draft that must never be listed as a wiki page.
+    std::fs::write(root.join("wiki/scratch.md"), "# Scratch\n").expect("write scratch");
+
+    let auth = build_test_git_auth_config().expect("build test auth config");
+    let tracked = parse_tracked_paths(
+        &run_git(&["ls-files", "--cached", "-z", "--", "wiki"], Some(root), &auth)
+            .expect("list tracked paths"),
+    );
+    assert_eq!(tracked, vec!["wiki/README.md", "wiki/store.md"]);
+
+    // The snapshot command's own listing DOES see the untracked draft, which is
+    // exactly why filtering its output could never enforce the promise.
+    let worktree = run_git(
+        &[
+            "ls-files",
+            "--cached",
+            "--others",
+            "--exclude-standard",
+            "-z",
+            "--",
+            "wiki",
+        ],
+        Some(root),
+        &auth,
+    )
+    .expect("list worktree files");
+    assert!(worktree.contains("scratch.md"));
+}
+
+#[test]
+fn tracked_paths_surface_a_git_failure_as_an_error() {
+    let repo_dir = tempfile::tempdir().expect("create non-repository directory");
+    let auth = build_test_git_auth_config().expect("build test auth config");
+
+    let result = run_git(&["ls-files", "--cached", "-z"], Some(repo_dir.path()), &auth);
+
+    assert!(result.is_err(), "a non-repository must not read as empty");
+}
+
+#[test]
+fn resolve_repo_file_confines_the_opener_to_the_checkout() {
+    let repo_dir = tempfile::tempdir().expect("create temporary repository");
+    std::fs::write(repo_dir.path().join("buzz-fork.json"), "{}").expect("write artifact");
+    std::fs::create_dir_all(repo_dir.path().join("wiki")).expect("create wiki dir");
+
+    let resolved = resolve_repo_file(repo_dir.path(), "buzz-fork.json").expect("resolve artifact");
+    assert!(resolved.starts_with(repo_dir.path().canonicalize().expect("canonical root")));
+
+    assert!(resolve_repo_file(repo_dir.path(), "../../etc/passwd").is_err());
+    assert!(resolve_repo_file(repo_dir.path(), "/etc/passwd").is_err());
+    assert!(resolve_repo_file(repo_dir.path(), "wiki").is_err());
+    assert!(resolve_repo_file(repo_dir.path(), "absent.md").is_err());
 }

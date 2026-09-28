@@ -7,8 +7,10 @@ import remarkChannelDeepLinks from "@/features/messages/lib/remarkChannelDeepLin
 import remarkMessageLinks from "@/features/messages/lib/remarkMessageLinks";
 import remarkEntityLinks from "@/features/messages/lib/remarkEntityLinks";
 import rehypeImageGallery from "@/shared/lib/rehypeImageGallery";
+import rehypeDocumentHeadings from "@/shared/lib/rehypeDocumentHeadings";
 import rehypeLeadingInlineContent from "@/shared/lib/rehypeLeadingInlineContent";
 import rehypeSearchHighlight from "@/shared/lib/rehypeSearchHighlight";
+import remarkProvenanceMarkers from "@/shared/lib/remarkProvenanceMarkers";
 import remarkChannelLinks from "@/shared/lib/remarkChannelLinks";
 import remarkCustomEmoji, {
   type CustomEmoji,
@@ -75,6 +77,8 @@ export type MarkdownParseInputs = {
   mentionNames?: string[];
   searchQuery?: string;
   variant: string;
+  /** Document surfaces add stable heading ids; see rehypeDocumentHeadings. */
+  documentSurface?: boolean;
 };
 
 /** Length-prefix a segment so no value can forge a boundary — an injective
@@ -97,6 +101,9 @@ function buildMarkdownElement(input: MarkdownParseInputs): React.ReactElement {
   if (input.searchQuery && input.searchQuery.trim().length >= 1) {
     rehypePlugins.push([rehypeSearchHighlight, { query: input.searchQuery }]);
   }
+  if (input.documentSurface) {
+    rehypePlugins.push(rehypeDocumentHeadings);
+  }
   // Called as a plain function rather than rendered as <ReactMarkdown/>:
   // react-markdown's `Markdown` is synchronous and hook-free (the hook
   // variant is `MarkdownHooks`), so this returns the parsed element tree
@@ -106,6 +113,10 @@ function buildMarkdownElement(input: MarkdownParseInputs): React.ReactElement {
     components: input.components,
     remarkPlugins: [
       remarkGfm,
+      // Before any link/channel plugin: `remarkChannelLinks` splits `#2528` out
+      // of `(upstream #2528)`, so a scanner running after it sees a broken
+      // marker. Provenance is matched whole, so it claims its text first.
+      ...(input.documentSurface ? [remarkProvenanceMarkers] : []),
       ...(input.hardLineBreaks === false ? [] : [remarkBreaks]),
       remarkSpoilers,
       remarkChannelDeepLinks,
@@ -145,6 +156,7 @@ export function renderCachedMarkdown(
     segment(input.hardLineBreaks === false ? "soft" : "hard") +
     segment(input.variant) +
     segment(input.leadingInlineContent ? "leading" : "") +
+    segment(input.documentSurface ? "document" : "") +
     listSegment(input.mentionNames) +
     listSegment(input.channelNames) +
     listSegment(

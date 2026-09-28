@@ -1399,6 +1399,17 @@ declare global {
     __BUZZ_E2E_PROJECT_LOCAL_REPO_SNAPSHOT__?: unknown;
     /** Optional bounded file contents returned by repository content reads. */
     __BUZZ_E2E_PROJECT_REPO_FILE_CONTENTS__?: Record<string, string | null>;
+    /** Optional tracked-paths listing, overriding the snapshot-derived one. */
+    __BUZZ_E2E_PROJECT_LOCAL_REPO_TRACKED_PATHS__?: {
+      root: string;
+      paths: string[];
+    };
+    /**
+     * Document contents keyed by path, where `null` marks a file the reader
+     * refused — so a spec can exercise the 64 KiB ceiling, the reason-aware
+     * reader and the "not covered by search" label.
+     */
+    __BUZZ_E2E_PROJECT_LOCAL_REPO_DOCUMENTS__?: Record<string, string | null>;
     __BUZZ_E2E_PROJECT_REPO_SYNC_STATUS__?: {
       local_path: string | null;
       local_branch: string | null;
@@ -3877,6 +3888,8 @@ function initializeMockHuddle(
   persistMockHuddle();
 }
 const openedExternalUrls: string[] = [];
+/** Paths handed to the root-confined local-repo opener, for A10's editor action. */
+export const openedLocalRepoFiles: string[] = [];
 const defaultMockRelayAgents: RawRelayAgent[] = [
   {
     pubkey: ALICE_PUBKEY,
@@ -12943,6 +12956,50 @@ export function maybeInstallE2eTauriMocks() {
         };
       case "get_project_local_repo_snapshot":
         return window.__BUZZ_E2E_PROJECT_LOCAL_REPO_SNAPSHOT__ ?? null;
+      case "get_project_local_repo_tracked_paths": {
+        const override = window.__BUZZ_E2E_PROJECT_LOCAL_REPO_TRACKED_PATHS__;
+        if (override) return override;
+        const prefix = (payload as { prefix?: string } | undefined)?.prefix;
+        const snapshot = window.__BUZZ_E2E_PROJECT_LOCAL_REPO_SNAPSHOT__ as
+          | { path?: string; snapshot?: { files?: Array<{ path: string }> } }
+          | undefined;
+        const files = snapshot?.snapshot?.files ?? [];
+        return {
+          root: snapshot?.path ?? "mock-repo-root",
+          paths: files
+            .map((file) => file.path)
+            .filter((path) => !prefix || path.startsWith(prefix)),
+        };
+      }
+      case "get_project_local_repo_document_content": {
+        const path = (payload as { path?: string } | undefined)?.path ?? "";
+        const documents =
+          window.__BUZZ_E2E_PROJECT_LOCAL_REPO_DOCUMENTS__ ?? {};
+        if (path in documents) {
+          return {
+            path,
+            content: documents[path] ?? null,
+            unavailable_reason:
+              documents[path] === null
+                ? "file exceeds the preview size"
+                : null,
+          };
+        }
+        const contents = window.__BUZZ_E2E_PROJECT_REPO_FILE_CONTENTS__ ?? {};
+        return {
+          path,
+          content: contents[path] ?? null,
+          unavailable_reason:
+            contents[path] === null || contents[path] === undefined
+              ? "file was not found in the checkout"
+              : null,
+        };
+      }
+      case "open_project_local_repo_file":
+        openedLocalRepoFiles.push(
+          (payload as { path?: string } | undefined)?.path ?? "",
+        );
+        return null;
       case "get_project_repo_file_content":
       case "get_project_local_repo_file_content": {
         const path = (payload as { path?: string } | undefined)?.path;

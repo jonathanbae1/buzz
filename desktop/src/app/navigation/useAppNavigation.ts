@@ -104,6 +104,17 @@ export function useAppNavigation() {
     [commitNavigation],
   );
 
+  const goWiki = React.useCallback(
+    (behavior?: NavigationBehavior) =>
+      commitNavigation(
+        {
+          to: "/wiki",
+        },
+        behavior,
+      ),
+    [commitNavigation],
+  );
+
   const goProfile = React.useCallback(
     (pubkey: string, behavior?: NavigationBehavior) =>
       commitNavigation(
@@ -471,6 +482,7 @@ export function useAppNavigation() {
     goProjects,
     goPulse,
     goProfile,
+    goWiki,
     goSettings,
     goWorkflow,
     goWorkflows,

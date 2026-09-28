@@ -51,6 +51,25 @@ export type ProjectLocalRepoSnapshot = {
   snapshot: ProjectRepoSnapshot;
 };
 
+/**
+ * Tracked paths in a local checkout plus the resolved checkout root, so a
+ * caller can show which directory answered.
+ */
+export type ProjectLocalRepoPaths = {
+  root: string;
+  paths: string[];
+};
+
+/**
+ * One document's content, or the reason it is unavailable — so a reader can
+ * label an oversized or non-UTF-8 document instead of calling it missing.
+ */
+export type ProjectLocalRepoDocument = {
+  path: string;
+  content: string | null;
+  unavailableReason: string | null;
+};
+
 export type ProjectLocalRepository = {
   name: string;
   path: string;
