@@ -140,8 +140,9 @@ pub struct SessionState {
     /// session scope → session_id
     pub sessions: HashMap<SessionScope, String>,
     pub heartbeat_session: Option<String>,
+    /// Conversation scopes verified as direct messages by relay metadata.
+    pub dm_scopes: HashSet<SessionScope>,
     /// Per-scope turn counters for proactive session rotation.
-    /// Incremented on each successful prompt; reset when the session is rotated.
     pub turn_counts: HashMap<SessionScope, u32>,
     /// Turn counter for the heartbeat session.
     pub heartbeat_turn_count: u32,
@@ -215,6 +216,7 @@ impl SessionState {
     /// Invalidate all sessions and turn counters (e.g. after agent exit).
     pub fn invalidate_all(&mut self) {
         self.sessions.clear();
+        self.dm_scopes.clear();
         self.turn_counts.clear();
         self.heartbeat_session = None;
         self.heartbeat_turn_count = 0;
@@ -363,7 +365,9 @@ pub struct AgentPool {
     session_lifecycle_tx: mpsc::UnboundedSender<AgentSessionLifecycleResult>,
     session_lifecycle_rx: mpsc::UnboundedReceiver<AgentSessionLifecycleResult>,
     /// Direct conversation scopes temporarily checked out for ACP lifecycle work.
+    /// Scopes in which the current ACP session is a direct message.
     session_lifecycle_scopes: HashSet<SessionScope>,
+    dm_scopes: HashSet<SessionScope>,
     config_return_rx: mpsc::UnboundedReceiver<AgentConfigReturn>,
     pub join_set: JoinSet<()>,
     task_map: HashMap<tokio::task::Id, TaskMeta>,
@@ -921,9 +925,13 @@ impl AgentPool {
         let (session_lifecycle_tx, session_lifecycle_rx) = mpsc::unbounded_channel();
         let (config_return_tx, config_return_rx) = mpsc::unbounded_channel();
         let mut session_scopes = HashMap::new();
+        let mut dm_scopes = HashSet::new();
         for agent in slots.iter().flatten() {
             for (scope, session_id) in &agent.state.sessions {
                 session_scopes.insert(session_id.clone(), scope.clone());
+                if agent.state.dm_scopes.contains(scope) {
+                    dm_scopes.insert(scope.clone());
+                }
             }
         }
         Self {
@@ -941,6 +949,7 @@ impl AgentPool {
             task_map: HashMap::new(),
             session_owners: HashMap::new(),
             session_scopes,
+            dm_scopes,
             held_since: HashMap::new(),
         }
     }
@@ -1060,16 +1069,34 @@ impl AgentPool {
             self.return_agent(agent);
             return Err(AgentCommandTarget::StaleSession);
         };
-        if !matches!(scope, SessionScope::Conversation { .. }) {
+        if !self.dm_scopes.contains(&scope) {
             self.return_agent(agent);
             return Err(AgentCommandTarget::StaleSession);
         }
-        if self.task_map.values().any(|meta| meta.scope.as_ref() == Some(&scope)) {
+        if self.task_map.values().any(|meta| meta.scope.as_ref() == Some(&scope))
+            || self.session_lifecycle_scopes.contains(&scope)
+        {
             self.return_agent(agent);
             return Err(AgentCommandTarget::ActiveTurn);
         }
         self.session_lifecycle_scopes.insert(scope.clone());
         Ok((agent, scope))
+    }
+    pub fn lifecycle_target_is_unowned_or_in_scope(
+        &self,
+        target_session_id: &str,
+        scope: &SessionScope,
+    ) -> bool {
+        self.session_scopes
+            .get(target_session_id)
+            .is_none_or(|owner| owner == scope)
+            && !self.agents.iter().flatten().any(|agent| {
+                agent
+                    .state
+                    .sessions
+                    .iter()
+                    .any(|(owner, id)| id == target_session_id && owner != scope)
+            })
     }
 
     pub fn session_lifecycle_result_tx(
@@ -1095,23 +1122,42 @@ impl AgentPool {
             && matches!(result.operation.as_str(), "load" | "resume" | "fork");
         if binding_changed {
             if let Some(target_session_id) = result.target_session_id.take() {
-                if result.operation != "fork"
-                    && previous_session_id.as_deref() != Some(target_session_id.as_str())
-                {
-                    result.agent.state.invalidate_scope(&result.scope);
+                let target_is_already_bound_elsewhere = self
+                    .session_scopes
+                    .get(&target_session_id)
+                    .is_some_and(|scope| scope != &result.scope)
+                    || result
+                        .agent
+                        .state
+                        .sessions
+                        .iter()
+                        .any(|(scope, id)| id == &target_session_id && scope != &result.scope);
+                if target_is_already_bound_elsewhere {
+                    tracing::error!(
+                        session_id = %target_session_id,
+                        "refusing to bind a lifecycle target owned by another scope"
+                    );
+                } else {
+                    if result.operation != "fork"
+                        && previous_session_id.as_deref() != Some(target_session_id.as_str())
+                    {
+                        result.agent.state.invalidate_scope(&result.scope);
+                    }
+                    result
+                        .agent
+                        .state
+                        .sessions
+                        .insert(result.scope.clone(), target_session_id.clone());
+                    if let Some(previous) =
+                        previous_session_id.filter(|id| id != &target_session_id)
+                    {
+                        self.session_scopes.remove(&previous);
+                    }
+                    self.session_owners
+                        .insert(result.scope.clone(), result.agent.index);
+                    self.session_scopes
+                        .insert(target_session_id, result.scope.clone());
                 }
-                result
-                    .agent
-                    .state
-                    .sessions
-                    .insert(result.scope.clone(), target_session_id.clone());
-                if let Some(previous) = previous_session_id.filter(|id| id != &target_session_id) {
-                    self.session_scopes.remove(&previous);
-                }
-                self.session_owners
-                    .insert(result.scope.clone(), result.agent.index);
-                self.session_scopes
-                    .insert(target_session_id, result.scope.clone());
             }
         } else if result.result.is_ok()
             && result.operation == "close"
@@ -1120,6 +1166,7 @@ impl AgentPool {
             result.agent.state.invalidate_scope(&result.scope);
             self.session_scopes.remove(&result.source_session_id);
             self.session_owners.remove(&result.scope);
+            self.dm_scopes.remove(&result.scope);
         }
         self.session_lifecycle_scopes.remove(&result.scope);
         self.return_agent(result.agent);
@@ -1129,6 +1176,9 @@ impl AgentPool {
         for (scope, session_id) in &agent.state.sessions {
             self.session_scopes
                 .insert(session_id.clone(), scope.clone());
+            if agent.state.dm_scopes.contains(scope) {
+                self.dm_scopes.insert(scope.clone());
+            }
         }
         if self.agents[idx].is_some() {
             tracing::error!(
@@ -2041,7 +2091,6 @@ async fn create_session_and_apply_model(
             "configOptions": config_options_for_cache,
             "modes": modes_for_cache,
             // `models` must come from the SAME snapshot as configOptions — the
-            // post-switch snapshot on a successful switch, session/new otherwise.
             // Taking it from `resp.raw` here would emit the target model's option
             // set alongside the pre-switch model identity, so the desktop panel
             // would report the old model as live after an applied switch. When a
@@ -2969,6 +3018,9 @@ pub async fn run_prompt_task(
                             scope.telemetry_label()
                         );
                         agent.state.sessions.insert(scope.clone(), sid.clone());
+                        if origin_channel_type.as_deref() == Some("dm") {
+                            agent.state.dm_scopes.insert(scope.clone());
+                        }
                         agent
                             .state
                             .deliveries
@@ -8672,9 +8724,9 @@ printf '%s\n' '{{"jsonrpc":"2.0","id":0,"result":{{"stopReason":"end_turn"}}}}'"
     async fn direct_session_lifecycle_refuses_overlap_and_rebinds_exact_scope() {
         let channel_id = Uuid::new_v4();
         let scope = conv(channel_id);
-        let mut pool = AgentPool::from_slots(vec![Some(
-            idle_agent_with_session(scope.clone()).await,
-        )]);
+        let mut agent = idle_agent_with_session(scope.clone()).await;
+        agent.state.dm_scopes.insert(scope.clone());
+        let mut pool = AgentPool::from_slots(vec![Some(agent)]);
         pool.record_scope_owner(scope.clone(), 0);
 
         let (agent, resolved_scope) = pool

@@ -380,6 +380,7 @@ pub struct AcpClient {
     observer_agent_index: Option<usize>,
     /// Best-effort context attached to raw ACP wire events.
     observer_context: ObserverContext,
+    suppress_raw_rpc_observer: bool,
     /// Capture enabled only around a command-dispatch prompt.
     command_output: Option<CommandOutput>,
     /// Most recently observed `_meta.goose.activeRunId` from a
@@ -792,6 +793,7 @@ impl AcpClient {
             observer: None,
             observer_agent_index: None,
             observer_context: ObserverContext::default(),
+            suppress_raw_rpc_observer: false,
             command_output: None,
             active_run_id: None,
             steering_supported: false,
@@ -959,15 +961,17 @@ impl AcpClient {
     ///
     /// The process already owns the selected profile and cwd. Do not accept
     /// either value from an observer control frame.
-    pub async fn session_list(&mut self) -> Result<serde_json::Value, AcpError> {
+    pub async fn session_list(&mut self, cwd: &str) -> Result<serde_json::Value, AcpError> {
         let mut sessions = Vec::new();
         let mut cursor: Option<String> = None;
         loop {
-            let mut params = serde_json::json!({});
+            let mut params = serde_json::json!({ "cwd": cwd });
             if let Some(cursor) = cursor.as_deref() {
                 params["cursor"] = serde_json::Value::String(cursor.to_string());
             }
-            let page = self.send_request("session/list", params).await?;
+            let page = self
+                .send_lifecycle_request("session/list", params)
+                .await?;
             if let Some(items) = page.get("sessions").and_then(serde_json::Value::as_array) {
                 sessions.extend(items.iter().cloned());
             }
@@ -990,7 +994,7 @@ impl AcpClient {
         mcp_servers: Vec<McpServer>,
     ) -> Result<serde_json::Value, AcpError> {
         let result = self
-            .send_request(
+            .send_lifecycle_request(
                 "session/load",
                 serde_json::json!({
                     "sessionId": session_id,
@@ -1014,7 +1018,7 @@ impl AcpClient {
         mcp_servers: Vec<McpServer>,
     ) -> Result<serde_json::Value, AcpError> {
         let result = self
-            .send_request(
+            .send_lifecycle_request(
                 "session/resume",
                 serde_json::json!({
                     "sessionId": session_id,
@@ -1037,7 +1041,7 @@ impl AcpClient {
         mcp_servers: Vec<McpServer>,
     ) -> Result<serde_json::Value, AcpError> {
         let result = self
-            .send_request(
+            .send_lifecycle_request(
                 "session/fork",
                 serde_json::json!({
                     "sessionId": session_id,
@@ -1054,7 +1058,7 @@ impl AcpClient {
 
     /// Close a session without changing the owner process or its profile.
     pub async fn session_close(&mut self, session_id: &str) -> Result<(), AcpError> {
-        self.send_request(
+        self.send_lifecycle_request(
             "session/close",
             serde_json::json!({ "sessionId": session_id }),
         )
@@ -1689,7 +1693,9 @@ impl AcpClient {
         .await
         .map_err(|_| AcpError::WriteTimeout(WRITE_TIMEOUT))?
         .map_err(AcpError::Io)?;
-        self.observe("acp_write", value.clone());
+        if !self.suppress_raw_rpc_observer {
+            self.observe("acp_write", value.clone());
+        }
         Ok(())
     }
 
@@ -1744,6 +1750,16 @@ impl AcpClient {
             Ok(result) => result,
             Err(_) => Err(AcpError::Timeout(timeout)),
         }
+    }
+    async fn send_lifecycle_request(
+        &mut self,
+        method: &str,
+        params: serde_json::Value,
+    ) -> Result<serde_json::Value, AcpError> {
+        self.suppress_raw_rpc_observer = true;
+        let result = self.send_request(method, params).await;
+        self.suppress_raw_rpc_observer = false;
+        result
     }
 
     /// Drain any buffered lines from the agent's stdout without blocking.
@@ -1855,7 +1871,9 @@ impl AcpClient {
                     continue;
                 }
             };
-            self.observe("acp_read", msg.clone());
+            if !self.suppress_raw_rpc_observer || msg.get("method").is_some() {
+                self.observe("acp_read", msg.clone());
+            }
 
             // Check if this is a response to our expected request (has matching id
             // AND no `method` field — a `method` field means it's an agent-initiated

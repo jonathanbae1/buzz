@@ -1572,6 +1572,7 @@ fn handle_relay_observer_control_event(
     owner_pubkey_hex: &str,
     event_publisher: RelayEventPublisher,
     config: &Config,
+    prompt_context: &PromptContext,
 ) {
     // Defense-in-depth: verify signature even though the relay already checked.
     if let Err(e) = buzz_core::verify_event(&event) {
@@ -1618,7 +1619,7 @@ fn handle_relay_observer_control_event(
             handle_switch_model_control(&payload, pool, observer);
         }
         Some("session_lifecycle") => {
-            handle_session_lifecycle_control(&payload, pool, observer);
+            handle_session_lifecycle_control(&payload, pool, observer, prompt_context);
         }
         Some("dispatch_command") => {
             handle_dispatch_command_control(&payload, pool, observer, &config);
@@ -2066,6 +2067,7 @@ fn handle_session_lifecycle_control(
     payload: &serde_json::Value,
     pool: &mut AgentPool,
     observer: Option<&observer::ObserverHandle>,
+    prompt_context: &PromptContext,
 ) {
     let request_id = payload
         .get("requestId")
@@ -2154,25 +2156,51 @@ fn handle_session_lifecycle_control(
         }
     };
     let result_tx = pool.session_lifecycle_result_tx();
+    let target_for_result = target_session_id.clone();
+    let channel_id = scope.channel_id();
+    let cwd = prompt_context.cwd.clone();
+    let mcp_servers = pool::mcp_servers_with_git_origin(
+        &prompt_context.mcp_servers,
+        Some(channel_id),
+        Some("dm"),
+        prompt_context.session_title.as_deref(),
+    );
+    if let Some(target) = target_session_id.as_deref() {
+        if (operation == "close" && target != source_session_id)
+            || !pool.lifecycle_target_is_unowned_or_in_scope(target, &scope)
+        {
+            pool.return_agent(agent);
+            emit_session_lifecycle_result(
+                observer,
+                &request_id,
+                Some(&source_session_id),
+                &operation,
+                "error",
+                Some("target session is already owned by another conversation"),
+                None,
+            );
+            return;
+        }
+    }
     tokio::spawn(async move {
-        let target_for_result = target_session_id.clone();
-        let channel_id = scope.channel_id();
-        agent.acp.set_observer_context(observer::ObserverContext {
-            channel_id: Some(channel_id.to_string()),
-            session_id: Some(source_session_id.clone()),
-            turn_id: None,
-            started_at: Some(chrono::Utc::now().to_rfc3339()),
-        });
         let outcome: Result<serde_json::Value, String> = async {
             let sessions = agent
                 .acp
-                .session_list()
+                .session_list(&cwd)
                 .await
                 .map_err(|error| error.to_string())?;
-            let owner_cwd = session_cwd(&sessions, &source_session_id)
-                .ok_or_else(|| "owner session has no working directory".to_string())?;
+            let owner_session_exists = sessions
+                .get("sessions")
+                .and_then(serde_json::Value::as_array)
+                .is_some_and(|sessions| sessions.iter().any(|session| {
+                    session.get("sessionId").and_then(serde_json::Value::as_str)
+                        == Some(&source_session_id)
+                }));
+            if !owner_session_exists {
+                return Err("owner session is not available in this workspace".to_string());
+            }
             if operation == "list" {
-                return Ok(filter_sessions_by_cwd(&sessions, owner_cwd));
+                return Ok(filter_sessions_by_cwd(&sessions, &cwd));
             }
             let target = target_session_id.as_deref().expect("validated target id");
             let target_in_scope = sessions
@@ -2182,8 +2210,6 @@ fn handle_session_lifecycle_control(
                     sessions.iter().any(|session| {
                         session.get("sessionId").and_then(serde_json::Value::as_str)
                             == Some(target)
-                            && session.get("cwd").and_then(serde_json::Value::as_str)
-                                == Some(owner_cwd)
                     })
                 });
             if !target_in_scope {
@@ -2197,28 +2223,21 @@ fn handle_session_lifecycle_control(
                     .map_err(|error| error.to_string())?;
                 return Ok(serde_json::json!({}));
             }
-            let cwd = owner_cwd;
-            agent.acp.set_observer_context(observer::ObserverContext {
-                channel_id: Some(channel_id.to_string()),
-                session_id: Some(target.to_string()),
-                turn_id: None,
-                started_at: Some(chrono::Utc::now().to_rfc3339()),
-            });
             match operation.as_str() {
                 "load" => agent
                     .acp
-                    .session_load(target, cwd, vec![])
+                    .session_load(target, &cwd, mcp_servers.clone())
                     .await
                     .map_err(|error| error.to_string()),
                 "resume" => agent
                     .acp
-                    .session_resume(target, cwd, vec![])
+                    .session_resume(target, &cwd, mcp_servers.clone())
                     .await
                     .map_err(|error| error.to_string()),
                 "fork" => {
                     let fork = agent
                         .acp
-                        .session_fork(target, cwd, vec![])
+                        .session_fork(target, &cwd, mcp_servers.clone())
                         .await
                         .map_err(|error| error.to_string())?;
                     let fork_id = fork
@@ -2228,15 +2247,9 @@ fn handle_session_lifecycle_control(
                         .ok_or_else(|| "fork response did not include sessionId".to_string())?;
                     // Forking creates the child; loading it replays that child's
                     // inherited transcript into the owner's direct conversation.
-                    agent.acp.set_observer_context(observer::ObserverContext {
-                        channel_id: Some(channel_id.to_string()),
-                        session_id: Some(fork_id.to_string()),
-                        turn_id: None,
-                        started_at: Some(chrono::Utc::now().to_rfc3339()),
-                    });
                     let mut loaded = agent
                         .acp
-                        .session_load(fork_id, cwd, vec![])
+                        .session_load(fork_id, &cwd, mcp_servers.clone())
                         .await
                         .map_err(|error| error.to_string())?;
                     loaded["sessionId"] = serde_json::Value::String(fork_id.to_string());
@@ -2255,6 +2268,16 @@ fn handle_session_lifecycle_control(
             (Ok(_), "close") => target_for_result,
             _ => None,
         };
+        if outcome.is_ok() {
+            if let Some(session_id) = target_session_id.as_deref() {
+                agent.acp.set_observer_context(observer::ObserverContext {
+                    channel_id: Some(channel_id.to_string()),
+                    session_id: Some(session_id.to_string()),
+                    turn_id: None,
+                    started_at: None,
+                });
+            }
+        }
         let _ = result_tx.send(AgentSessionLifecycleResult {
             agent,
             scope,
@@ -4173,6 +4196,7 @@ async fn tokio_main() -> Result<()> {
                                     owner_hex,
                                     relay.event_publisher(),
                                     &config,
+                                    &ctx,
                                 );
                             } else {
                                 tracing::warn!("observer control frame received but no owner resolved — dropping");
