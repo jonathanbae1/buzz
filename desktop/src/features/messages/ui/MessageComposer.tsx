@@ -37,6 +37,11 @@ import {
   type LinkSelectionInfo,
   useRichTextEditor,
 } from "@/features/messages/lib/useRichTextEditor";
+import {
+  getPromptHistoryDirection,
+  promptHistoryStorageKey,
+  usePromptHistory,
+} from "@/features/messages/lib/usePromptHistory";
 import { useLinkEditor } from "@/features/messages/lib/useLinkEditor";
 import { useComposerSpoilerParticles } from "@/features/messages/lib/useComposerSpoilerParticles";
 import { useTypingBroadcast } from "@/features/messages/useTypingBroadcast";
@@ -127,6 +132,14 @@ function MessageComposerImpl({
   const identityQuery = useIdentityQuery();
   const effectiveDraftKey = draftKey ?? channelId;
   const ownerPubkey = identityQuery.data?.pubkey ?? null;
+  const promptHistoryAgentPubkey =
+    commandTarget?.agentPubkey?.trim() ||
+    (commandTarget?.candidateAgentPubkeys?.length === 1
+      ? commandTarget.candidateAgentPubkeys[0]
+      : null);
+  const promptHistory = usePromptHistory(
+    promptHistoryStorageKey(promptHistoryAgentPubkey),
+  );
   const audienceScope =
     audienceContext && channelId && ownerPubkey
       ? getPersistentAgentAudienceScope({
@@ -305,6 +318,7 @@ function MessageComposerImpl({
     onLinkSelectionChange: (info) => onLinkSelectionChangeRef.current?.(info),
     onLinkShortcut: () => onLinkShortcutRef.current?.() ?? false,
     onUpdate: ({ cursor, linkPreviewContent, text }) => {
+      promptHistory.observeComposerText(text);
       trackAuthoredContent(text);
       contentRef.current = text;
       setComposerContentFromText(text);
@@ -378,6 +392,7 @@ function MessageComposerImpl({
     onAddressedAgentsSendSucceeded:
       addressedMentionRestore.onAddressedAgentsSendSucceeded,
     onPrepareSendChannel,
+    onPromptSent: promptHistory.recordSentPrompt,
     onSendRef,
     richText,
     setContent: setComposerContent,
@@ -652,6 +667,7 @@ function MessageComposerImpl({
           await commandPicker.dispatchSelectedCommand(trimmed);
         if (commandResult.handled) {
           if (!commandResult.succeeded) return;
+          promptHistory.recordSentPrompt(trimmed);
           setComposerContent("");
           richText.clearContent();
           mentions.clearMentions();
@@ -721,6 +737,7 @@ function MessageComposerImpl({
     media.setPendingImeta,
     media.setUploadState,
     mentionSendFlow.isPreparingMentionSend,
+    promptHistory.recordSentPrompt,
     mentionSendFlow.sendMessageWithMentionFlow,
     mentions.clearMentions,
     richText.clearContent,
@@ -820,6 +837,26 @@ function MessageComposerImpl({
         }
         return;
       }
+      const historyDirection = getPromptHistoryDirection(event.nativeEvent);
+      if (
+        historyDirection &&
+        !isAutocompleteOpenRef.current &&
+        !linkEditor.isCardOpen &&
+        !isEmojiPickerOpen &&
+        !isFormattingOpen &&
+        !editTargetRef.current
+      ) {
+        const prompt = promptHistory.navigate(
+          historyDirection,
+          contentRef.current,
+        );
+        if (prompt !== null) {
+          event.preventDefault();
+          setComposerContent(prompt);
+          richText.setContent(prompt);
+          return;
+        }
+      }
       // Escape in edit mode
       if (
         event.key === "Escape" &&
@@ -847,6 +884,11 @@ function MessageComposerImpl({
       linkEditor.focusCardFirstControl,
       isDeferredEditPending,
       onCancelEdit,
+      isEmojiPickerOpen,
+      isFormattingOpen,
+      promptHistory.navigate,
+      setComposerContent,
+      richText.setContent,
     ],
   );
   useComposerPasteHandler({

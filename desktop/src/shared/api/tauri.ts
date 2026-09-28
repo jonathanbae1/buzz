@@ -943,9 +943,11 @@ export async function getAgentModels(pubkey: string) {
 
 export async function getAgentConfigSurface(
   pubkey: string,
+  sessionId?: string | null,
 ): Promise<RuntimeConfigSurface> {
   return invokeTauri<RuntimeConfigSurface>("get_agent_config_surface", {
     pubkey,
+    sessionId: sessionId ?? null,
   });
 }
 
@@ -955,9 +957,10 @@ export async function getOmpProfileCatalog(): Promise<OmpProfileCatalog> {
 
 export async function putAgentSessionConfig(
   pubkey: string,
+  sessionId: string,
   payload: unknown,
 ): Promise<void> {
-  return invokeTauri<void>("put_agent_session_config", { pubkey, payload });
+  return invokeTauri<void>("put_agent_session_config", { pubkey, sessionId, payload });
 }
 
 /** File-layer config for a runtime (e.g. `~/.config/goose/config.yaml`). */

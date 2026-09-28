@@ -1,4 +1,13 @@
 import * as React from "react";
+
+import { SessionConfigControls } from "./SessionConfigControls";
+import { SessionLifecycleControls } from "./SessionLifecycleControls";
+
+import { useActiveAgentTurns } from "@/features/agents/activeAgentTurnsStore";
+import { awaitCancelTurnOutcome } from "@/features/agents/lib/cancelTurnOutcome";
+import { subscribeControlResults } from "@/features/agents/observerRelayStore";
+import { cancelManagedAgentTurn } from "@/shared/api/agentControl";
+import { Button } from "@/shared/ui/button";
 import {
   CircleAlert,
   CircleDot,
@@ -64,6 +73,7 @@ type ManagedAgentSessionPanelProps = {
   transcriptVariant?: AgentSessionTranscriptVariant;
   profiles?: UserProfileLookup;
   rawEventsOverride?: ObserverEvent[];
+  sessionLifecycleEnabled?: boolean;
   transcriptOverride?: TranscriptItem[];
 };
 
@@ -81,9 +91,57 @@ export function ManagedAgentSessionPanel({
   transcriptContentClassName,
   transcriptVariant = "default",
   profiles,
+  sessionLifecycleEnabled = false,
   rawEventsOverride,
   transcriptOverride,
 }: ManagedAgentSessionPanelProps) {
+  const activeTurns = useActiveAgentTurns(agent.pubkey);
+  const stopTargets = activeTurns.filter(
+    (turn) => !channelId || turn.channelId === channelId,
+  );
+  const [stopPending, setStopPending] = React.useState(false);
+  const [stopMessage, setStopMessage] = React.useState<string | null>(null);
+  const handleStop = React.useCallback(async () => {
+    if (stopTargets.length !== 1 || stopPending) return;
+    const target = stopTargets[0];
+    const requestId = crypto.randomUUID();
+    setStopPending(true);
+    setStopMessage(null);
+    try {
+      const outcome = await awaitCancelTurnOutcome({
+        requestId,
+        channelId: target.channelId,
+        subscribe: (listener) =>
+          subscribeControlResults(agent.pubkey, listener),
+        sendCancel: () =>
+          cancelManagedAgentTurn(agent.pubkey, target.channelId, requestId),
+        scheduleTimeout: (onTimeout) => {
+          const timeout = window.setTimeout(onTimeout, 8_000);
+          return () => window.clearTimeout(timeout);
+        },
+      });
+      setStopMessage(
+        outcome === "sent"
+          ? "Stop requested"
+          : outcome.replaceAll("_", " "),
+      );
+    } catch (error) {
+      setStopMessage(
+        error instanceof Error ? error.message : String(error),
+      );
+    } finally {
+      setStopPending(false);
+    }
+  }, [agent.pubkey, stopPending, stopTargets]);
+  const handlePanelKeyDown = React.useCallback(
+    (event: React.KeyboardEvent<HTMLElement>) => {
+      if (event.key !== "Escape" || stopTargets.length !== 1) return;
+      event.preventDefault();
+      event.stopPropagation();
+      void handleStop();
+    },
+    [handleStop, stopTargets.length],
+  );
   const hasObserver = agent.status === "running" || agent.status === "deployed";
   // Always read from the store — archived frames are ingested regardless of
   // live status and must be renderable for idle agents with channel history.
@@ -165,13 +223,34 @@ export function ManagedAgentSessionPanel({
         autoTail && "flex flex-col overflow-hidden",
         className,
       )}
+      onKeyDownCapture={handlePanelKeyDown}
     >
       {showHeader ? (
         <SessionHeader
           connectionState={connectionState}
           eventCount={displayEvents.length}
           hasObserver={hasObserver}
+          onStop={() => void handleStop()}
+          stopDisabled={stopTargets.length !== 1 || stopPending}
+          stopMessage={stopMessage}
+          stopPending={stopPending}
           latestSessionId={latestSessionId}
+        />
+      ) : null}
+      {latestSessionId ? (
+        <SessionConfigControls
+          agent={agent}
+          channelId={channelId}
+          isBusy={stopTargets.length > 0}
+          isRunning={hasObserver}
+          sessionId={latestSessionId}
+        />
+      ) : null}
+      {sessionLifecycleEnabled && latestSessionId ? (
+        <SessionLifecycleControls
+          agentPubkey={agent.pubkey}
+          enabled={sessionLifecycleEnabled}
+          sessionId={latestSessionId}
         />
       ) : null}
       {commandCatalog ? (
@@ -210,11 +289,19 @@ function SessionHeader({
   eventCount,
   hasObserver,
   latestSessionId,
+  onStop,
+  stopDisabled,
+  stopPending,
+  stopMessage,
 }: {
   connectionState: ConnectionState;
   eventCount: number;
   hasObserver: boolean;
   latestSessionId: string | null | undefined;
+  onStop: () => void;
+  stopDisabled: boolean;
+  stopPending: boolean;
+  stopMessage: string | null;
 }) {
   return (
     <div className="flex flex-col gap-3 sm:flex-row sm:items-start sm:justify-between">
@@ -233,9 +320,26 @@ function SessionHeader({
             : "Restart this local agent to attach the observer feed."}
         </p>
       </div>
-      <Badge className="w-fit font-mono" variant="outline">
-        {eventCount} event{eventCount === 1 ? "" : "s"}
-      </Badge>
+      <div className="flex items-center gap-2">
+        <Badge className="w-fit font-mono" variant="outline">
+          {eventCount} event{eventCount === 1 ? "" : "s"}
+        </Badge>
+        {stopMessage ? (
+          <span role="status" className="text-xs text-muted-foreground">
+            {stopMessage}
+          </span>
+        ) : null}
+        <Button
+          type="button"
+          size="sm"
+          variant="destructive"
+          disabled={stopDisabled || !hasObserver}
+          data-testid="managed-agent-session-stop"
+          onClick={onStop}
+        >
+          {stopPending ? "Stopping…" : "Stop"}
+        </Button>
+      </div>
     </div>
   );
 }
@@ -296,6 +400,11 @@ function CommandCatalogBar({
       {dispatchStatus ? (
         <span className="text-xs text-muted-foreground">{dispatchStatus}</span>
       ) : null}
+      <span className="basis-full text-xs text-muted-foreground">
+        Terminal-only commands are not available in this client. Approval-mode
+        control is not exposed over ACP, and plan proposals are auto-approved
+        because this client does not support the required confirmation form.
+      </span>
     </div>
   );
 }

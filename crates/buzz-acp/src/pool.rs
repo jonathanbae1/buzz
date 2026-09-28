@@ -32,7 +32,8 @@ use uuid::Uuid;
 use crate::acp::{
     extract_config_option_id_by_category, extract_model_config_options, extract_model_state,
     extract_thought_level_config_id, model_in_catalog, resolve_model_switch_method, AcpClient,
-    AcpError, EnvVar, McpServer, ModelSwitchMethod, StopReason, SystemPromptTransport,
+    AcpError, EnvVar, McpServer, ModelSwitchMethod, PermissionAnswer, PromptContentBlock, StopReason,
+    SystemPromptTransport,
 };
 use crate::config::{compose_scoped_session_title, DedupMode, PermissionMode};
 use crate::observer;
@@ -79,6 +80,24 @@ pub struct TaskMeta {
     /// tasks only — all prompt tasks install a steer channel regardless
     /// of the agent's name.
     pub steer_tx: Option<tokio::sync::mpsc::Sender<SteerRequest>>,
+    /// Answer channel for the in-flight task's `session/request_permission`
+    /// requests. Capacity-1; `try_send` from the main loop fails on
+    /// `Full`/`Closed`, in which case the caller reports an explicit failure
+    /// rather than silently leaving the approval unanswered.
+    ///
+    /// This is the reason a permission reply cannot ride `control_tx`: that
+    /// branch cancels the turn it would be approving. `None` for heartbeat
+    /// tasks and for prompt tasks on an agent with no observer attached to
+    /// answer requests.
+    pub permission_tx: Option<tokio::sync::mpsc::Sender<PermissionAnswer>>,
+    /// Config-write channel for an exact-session `set_config_option` against the
+    /// in-flight turn's live session. `None` for heartbeat tasks and for turns
+    /// whose worker does not expose a writable config surface.
+    ///
+    /// A config write is **not** a control signal: it neither cancels nor
+    /// requeues, so it needs its own channel rather than a `ControlSignal`
+    /// variant, and it must reach the read loop (the only owner of the reader).
+    pub config_tx: Option<tokio::sync::mpsc::Sender<crate::acp::SessionConfigRequest>>,
     /// Successful non-cancelling steers acknowledged while this task owned the
     /// live session. The session ID prevents a late ack from contaminating a
     /// replacement session after task return.
@@ -121,8 +140,9 @@ pub struct SessionState {
     /// session scope → session_id
     pub sessions: HashMap<SessionScope, String>,
     pub heartbeat_session: Option<String>,
+    /// Conversation scopes verified as direct messages by relay metadata.
+    pub dm_scopes: HashSet<SessionScope>,
     /// Per-scope turn counters for proactive session rotation.
-    /// Incremented on each successful prompt; reset when the session is rotated.
     pub turn_counts: HashMap<SessionScope, u32>,
     /// Turn counter for the heartbeat session.
     pub heartbeat_turn_count: u32,
@@ -196,6 +216,7 @@ impl SessionState {
     /// Invalidate all sessions and turn counters (e.g. after agent exit).
     pub fn invalidate_all(&mut self) {
         self.sessions.clear();
+        self.dm_scopes.clear();
         self.turn_counts.clear();
         self.heartbeat_session = None;
         self.heartbeat_turn_count = 0;
@@ -336,6 +357,18 @@ pub struct AgentPool {
     result_rx: mpsc::UnboundedReceiver<PromptResult>,
     command_result_tx: mpsc::UnboundedSender<AgentCommandResult>,
     command_result_rx: mpsc::UnboundedReceiver<AgentCommandResult>,
+    /// Completed out-of-band config writes whose worker must go back in its slot.
+    /// Writes are applied against a checked-out worker (see
+    /// [`AgentPool::route_session_config`]), so the pool must be told when the
+    /// slot can be reclaimed or the agent leaks out of the pool.
+    config_return_tx: mpsc::UnboundedSender<AgentConfigReturn>,
+    session_lifecycle_tx: mpsc::UnboundedSender<AgentSessionLifecycleResult>,
+    session_lifecycle_rx: mpsc::UnboundedReceiver<AgentSessionLifecycleResult>,
+    /// Direct conversation scopes temporarily checked out for ACP lifecycle work.
+    /// Scopes in which the current ACP session is a direct message.
+    session_lifecycle_scopes: HashSet<SessionScope>,
+    dm_scopes: HashSet<SessionScope>,
+    config_return_rx: mpsc::UnboundedReceiver<AgentConfigReturn>,
     pub join_set: JoinSet<()>,
     task_map: HashMap<tokio::task::Id, TaskMeta>,
     /// Authoritative directory of which worker most recently owned each session
@@ -352,6 +385,49 @@ pub enum AgentCommandTarget {
     StaleSession,
     Ambiguous,
 }
+/// Why a permission answer could not be handed to the in-flight turn.
+///
+/// Every variant is reported to the client as an explicit `control_result`
+/// status. There is no silent drop: the operator clicked an approval button and
+/// is entitled to know whether it landed.
+#[derive(Debug, thiserror::Error)]
+pub enum PermissionAnswerError {
+    /// No worker holds this ACP session id.
+    #[error("no worker holds that ACP session")]
+    UnknownSession,
+    /// The session is known but no turn is in flight on it — the request this
+    /// answer targets has already settled.
+    #[error("no turn in flight for the target session")]
+    NoActiveTurn,
+    /// The in-flight turn has no permission answer channel: no UI is attached
+    /// to this agent, so the request cannot be answered from here.
+    #[error("this turn has no permission answer channel")]
+    NotAnswerable,
+    /// The channel refused the answer (full or closed): the previous answer is
+    /// still in flight, or the read loop has already gone.
+    #[error("permission answer channel refused the answer: {0}")]
+    Undeliverable(String),
+}
+/// A worker that finished an out-of-band config write and must be reinserted.
+///
+/// The write's outcome travels separately (the caller's own oneshot), because the
+/// session-scoped cone admitted here is fully covered by those two facts: the
+/// intrinsic result and the new projection, both kept on the frames the caller
+/// already correlates. This payload exists so the pool can reclaim the slot.
+pub struct AgentConfigReturn {
+    pub agent: OwnedAgent,
+}
+pub struct AgentSessionLifecycleResult {
+    pub agent: OwnedAgent,
+    pub scope: SessionScope,
+    pub source_session_id: String,
+    pub operation: String,
+    pub target_session_id: Option<String>,
+    pub request_id: String,
+    pub result: Result<serde_json::Value, String>,
+}
+
+
 pub struct AgentCommandResult {
     pub agent: OwnedAgent,
     pub request_id: String,
@@ -846,10 +922,16 @@ impl AgentPool {
     pub fn from_slots(slots: Vec<Option<OwnedAgent>>) -> Self {
         let (result_tx, result_rx) = mpsc::unbounded_channel();
         let (command_result_tx, command_result_rx) = mpsc::unbounded_channel();
+        let (session_lifecycle_tx, session_lifecycle_rx) = mpsc::unbounded_channel();
+        let (config_return_tx, config_return_rx) = mpsc::unbounded_channel();
         let mut session_scopes = HashMap::new();
+        let mut dm_scopes = HashSet::new();
         for agent in slots.iter().flatten() {
             for (scope, session_id) in &agent.state.sessions {
                 session_scopes.insert(session_id.clone(), scope.clone());
+                if agent.state.dm_scopes.contains(scope) {
+                    dm_scopes.insert(scope.clone());
+                }
             }
         }
         Self {
@@ -858,10 +940,16 @@ impl AgentPool {
             result_rx,
             command_result_tx,
             command_result_rx,
+            config_return_tx,
+            session_lifecycle_tx,
+            session_lifecycle_rx,
+            session_lifecycle_scopes: HashSet::new(),
+            config_return_rx,
             join_set: JoinSet::new(),
             task_map: HashMap::new(),
             session_owners: HashMap::new(),
             session_scopes,
+            dm_scopes,
             held_since: HashMap::new(),
         }
     }
@@ -908,6 +996,14 @@ impl AgentPool {
         now: std::time::Instant,
         timeout: Duration,
     ) -> HoldDecision {
+        if let Some(owner_index) = self.session_owners.get(scope).copied() {
+            if self.session_lifecycle_scopes.contains(scope) {
+                return HoldDecision::Hold {
+                    held_for: Duration::ZERO,
+                    owner_index,
+                };
+            }
+        }
         if !scope.is_thread() || !self.should_hold_for_busy_owner(scope) {
             self.held_since.remove(scope);
             return HoldDecision::Dispatch;
@@ -956,12 +1052,133 @@ impl AgentPool {
         idx.map(|i| self.agents[i].take().unwrap())
     }
 
-    /// Return an agent to its slot after a task completes.
+    /// Check out the idle worker that owns an exact session for lifecycle work.
+    /// Session ids are lookup keys only; the destination scope is resolved from
+    /// the pool's own ownership map.
+    pub fn take_session_lifecycle_agent(
+        &mut self,
+        session_id: &str,
+    ) -> Result<(OwnedAgent, SessionScope), AgentCommandTarget> {
+        let agent = self.take_command_agent(session_id)?;
+        let Some(scope) = agent
+            .state
+            .sessions
+            .iter()
+            .find_map(|(scope, id)| (id == session_id).then(|| scope.clone()))
+        else {
+            self.return_agent(agent);
+            return Err(AgentCommandTarget::StaleSession);
+        };
+        if !self.dm_scopes.contains(&scope) {
+            self.return_agent(agent);
+            return Err(AgentCommandTarget::StaleSession);
+        }
+        if self.task_map.values().any(|meta| meta.scope.as_ref() == Some(&scope))
+            || self.session_lifecycle_scopes.contains(&scope)
+        {
+            self.return_agent(agent);
+            return Err(AgentCommandTarget::ActiveTurn);
+        }
+        self.session_lifecycle_scopes.insert(scope.clone());
+        Ok((agent, scope))
+    }
+    pub fn lifecycle_target_is_unowned_or_in_scope(
+        &self,
+        target_session_id: &str,
+        scope: &SessionScope,
+    ) -> bool {
+        self.session_scopes
+            .get(target_session_id)
+            .is_none_or(|owner| owner == scope)
+            && !self.agents.iter().flatten().any(|agent| {
+                agent
+                    .state
+                    .sessions
+                    .iter()
+                    .any(|(owner, id)| id == target_session_id && owner != scope)
+            })
+    }
+
+    pub fn session_lifecycle_result_tx(
+        &self,
+    ) -> mpsc::UnboundedSender<AgentSessionLifecycleResult> {
+        self.session_lifecycle_tx.clone()
+    }
+
+
+    /// Return a lifecycle worker after updating its existing direct-conversation
+    /// binding. A fork/load/resume changes only that scope, never a Buzz lease.
+    pub fn return_session_lifecycle_agent(
+        &mut self,
+        mut result: AgentSessionLifecycleResult,
+    ) {
+        let previous_session_id = result
+            .agent
+            .state
+            .sessions
+            .get(&result.scope)
+            .cloned();
+        let binding_changed = result.result.is_ok()
+            && matches!(result.operation.as_str(), "load" | "resume" | "fork");
+        if binding_changed {
+            if let Some(target_session_id) = result.target_session_id.take() {
+                let target_is_already_bound_elsewhere = self
+                    .session_scopes
+                    .get(&target_session_id)
+                    .is_some_and(|scope| scope != &result.scope)
+                    || result
+                        .agent
+                        .state
+                        .sessions
+                        .iter()
+                        .any(|(scope, id)| id == &target_session_id && scope != &result.scope);
+                if target_is_already_bound_elsewhere {
+                    tracing::error!(
+                        session_id = %target_session_id,
+                        "refusing to bind a lifecycle target owned by another scope"
+                    );
+                } else {
+                    if result.operation != "fork"
+                        && previous_session_id.as_deref() != Some(target_session_id.as_str())
+                    {
+                        result.agent.state.invalidate_scope(&result.scope);
+                    }
+                    result
+                        .agent
+                        .state
+                        .sessions
+                        .insert(result.scope.clone(), target_session_id.clone());
+                    if let Some(previous) =
+                        previous_session_id.filter(|id| id != &target_session_id)
+                    {
+                        self.session_scopes.remove(&previous);
+                    }
+                    self.session_owners
+                        .insert(result.scope.clone(), result.agent.index);
+                    self.session_scopes
+                        .insert(target_session_id, result.scope.clone());
+                }
+            }
+        } else if result.result.is_ok()
+            && result.operation == "close"
+            && result.target_session_id.as_deref() == Some(&result.source_session_id)
+        {
+            result.agent.state.invalidate_scope(&result.scope);
+            self.session_scopes.remove(&result.source_session_id);
+            self.session_owners.remove(&result.scope);
+            self.dm_scopes.remove(&result.scope);
+        }
+        self.session_lifecycle_scopes.remove(&result.scope);
+        self.return_agent(result.agent);
+    }
     pub fn return_agent(&mut self, agent: OwnedAgent) {
         let idx = agent.index;
         for (scope, session_id) in &agent.state.sessions {
             self.session_scopes
                 .insert(session_id.clone(), scope.clone());
+            if agent.state.dm_scopes.contains(scope) {
+                self.dm_scopes.insert(scope.clone());
+            }
         }
         if self.agents[idx].is_some() {
             tracing::error!(
@@ -1017,6 +1234,10 @@ impl AgentPool {
             {
                 return Err(AgentCommandTarget::ActiveTurn);
             }
+            if self.session_lifecycle_scopes.contains(scope) {
+                return Err(AgentCommandTarget::ActiveTurn);
+            }
+
         }
         Err(AgentCommandTarget::StaleSession)
     }
@@ -1025,13 +1246,131 @@ impl AgentPool {
         self.command_result_tx.clone()
     }
 
-    /// Count of agents that are alive: idle OR checked out (have a task_map entry).
+    /// Route an exact-session config write to whichever surface owns that session.
+    ///
+    /// The pool owns the ack channel so the caller only has to await it and emit
+    /// the result frame; the write itself is delivered either into the in-flight
+    /// turn's read loop (the only writer while the reader is held) or applied by
+    /// the caller against a checked-out idle worker.
+    ///
+    /// Two paths, chosen by whether a turn is in flight for the session's scope:
+    ///
+    /// * **Busy** — the write rides `TaskMeta.config_tx` into the turn's read
+    ///   loop. Deliberately *borrow*-based: taking the worker out of its slot
+    ///   would serialize every in-flight turn behind a config write.
+    /// * **Idle** — nobody owns the reader, so the worker is checked out and the
+    ///   caller applies the write against its own `AcpClient`. Checking out is
+    ///   what makes it race-free: the slot is empty while the write runs, so a
+    ///   dispatch cannot claim the same worker mid-write. The caller returns it
+    ///   through [`AgentPool::config_return_tx`].
+    ///
+    /// The owning scope comes from the pool's own maps, never from the client: a
+    /// client-supplied session id is a lookup key, not an authorization.
+    pub fn route_session_config(
+        &mut self,
+        session_id: &str,
+        category: crate::acp::ConfigCategory,
+        value: String,
+    ) -> Result<ConfigRouteOutcome, AgentCommandTarget> {
+        let owners: Vec<usize> = self
+            .agents
+            .iter()
+            .enumerate()
+            .filter_map(|(index, slot)| {
+                slot.as_ref().and_then(|agent| {
+                    agent
+                        .state
+                        .sessions
+                        .values()
+                        .any(|id| id == session_id)
+                        .then_some(index)
+                })
+            })
+            .collect();
+        if owners.len() > 1 {
+            return Err(AgentCommandTarget::Ambiguous);
+        }
+        let Some(scope) = self.session_scopes.get(session_id).cloned() else {
+            return Err(AgentCommandTarget::StaleSession);
+        };
+
+        // Busy path: an in-flight task for this scope owns the reader.
+        if self
+            .task_map
+            .values()
+            .any(|m| m.scope.as_ref() == Some(&scope))
+        {
+            let meta = self
+                .task_map
+                .values_mut()
+                .find(|m| m.scope.as_ref() == Some(&scope))
+                .expect("just matched");
+            let Some(tx) = meta.config_tx.as_ref() else {
+                // The turn cannot accept config writes (no channel installed).
+                return Err(AgentCommandTarget::ActiveTurn);
+            };
+            let (ack_tx, ack_rx) = tokio::sync::oneshot::channel();
+            let request = crate::acp::SessionConfigRequest {
+                category,
+                value,
+                ack_tx,
+            };
+            // A full channel means a write is already queued for this turn: a
+            // refusal the caller reports, never a silent drop. Dropping the
+            // request there also drops `ack_tx`, so nothing waits on it.
+            tx.try_send(request)
+                .map_err(|_| AgentCommandTarget::ActiveTurn)?;
+            return Ok(ConfigRouteOutcome::Busy { ack_rx });
+        }
+
+        // Idle path: check the owning worker out so the write cannot race a dispatch.
+        let Some(index) = owners.first().copied() else {
+            return Err(AgentCommandTarget::StaleSession);
+        };
+        let Some(agent) = self.agents[index].take() else {
+            return Err(AgentCommandTarget::ActiveTurn);
+        };
+        Ok(ConfigRouteOutcome::Idle {
+            agent,
+            scope,
+            category,
+            value,
+        })
+    }
+
+    /// Sender for returning a worker after an out-of-band config write.
+    pub fn config_return_tx(&self) -> mpsc::UnboundedSender<AgentConfigReturn> {
+        self.config_return_tx.clone()
+    }
+
+    /// Count agents that are idle, running a task, or serving a lifecycle request.
     ///
     /// Used to detect when all agents have exited so the caller can respawn.
     pub fn live_count(&self) -> usize {
         let idle = self.agents.iter().filter(|s| s.is_some()).count();
         let checked_out = self.task_map.len();
-        idle + checked_out
+        idle + checked_out + self.session_lifecycle_scopes.len()
+    }
+
+    /// Test seam: the agent slots, so tests can assert a worker was returned
+    /// after an out-of-band write instead of leaking out of the pool.
+    #[cfg(test)]
+    pub(crate) fn agents_for_test(&self) -> &Vec<Option<OwnedAgent>> {
+        &self.agents
+    }
+
+    /// Test seam: run the main loop's config-return arm (drain + reinsert).
+    #[cfg(test)]
+    pub(crate) fn drain_config_returns_for_test(&mut self) {
+        while let Ok(returned) = self.config_return_rx.try_recv() {
+            self.return_agent(returned.agent);
+        }
+    }
+
+    /// Test seam: append a worker in the next free slot.
+    #[cfg(test)]
+    pub(crate) fn push_agent_for_test(&mut self, agent: OwnedAgent) {
+        self.agents.push(Some(agent));
     }
 
     pub fn task_map(&self) -> &HashMap<tokio::task::Id, TaskMeta> {
@@ -1089,6 +1428,43 @@ impl AgentPool {
             .map_err(|e| SteerError::Transport(e.to_string()))
     }
 
+    /// Try to deliver a permission answer to the in-flight task that owns the
+    /// pending request.
+    ///
+    /// Scoped by the exact ACP session id, not by channel: the request belongs
+    /// to one session on one worker, and a channel can hold several sessions.
+    /// Returns `Ok(())` when the read loop accepted the answer, or a reason the
+    /// caller must surface — a permission reply has no silent fallback, because
+    /// the operator is waiting on the outcome of their own click.
+    ///
+    /// This deliberately does **not** touch `control_tx`: that branch cancels
+    /// the turn, which would destroy the very tool call being approved.
+    pub fn send_permission_answer(
+        &mut self,
+        session_id: &str,
+        answer: PermissionAnswer,
+    ) -> Result<(), PermissionAnswerError> {
+        // Resolve the session's scope first — `session_scopes` is the durable
+        // session→scope index and borrowing it separately keeps the task lookup
+        // below free of a double borrow of `self`.
+        let scope = self
+            .session_scopes
+            .get(session_id)
+            .cloned()
+            .ok_or(PermissionAnswerError::UnknownSession)?;
+        let meta = self
+            .task_map
+            .values_mut()
+            .find(|meta| meta.scope.as_ref() == Some(&scope))
+            .ok_or(PermissionAnswerError::NoActiveTurn)?;
+        let tx = meta
+            .permission_tx
+            .as_ref()
+            .ok_or(PermissionAnswerError::NotAnswerable)?;
+        tx.try_send(answer)
+            .map_err(|e| PermissionAnswerError::Undeliverable(e.to_string()))
+    }
+
     /// Durably associate a successful steer with the exact ACP session that
     /// accepted it. Acks may arrive before or after the prompt result: while
     /// the task is in flight we stage the delivery in `TaskMeta`; after return
@@ -1141,14 +1517,19 @@ impl AgentPool {
     ) -> (
         &mut mpsc::UnboundedReceiver<PromptResult>,
         &mut mpsc::UnboundedReceiver<AgentCommandResult>,
+        &mut mpsc::UnboundedReceiver<AgentConfigReturn>,
+        &mut mpsc::UnboundedReceiver<AgentSessionLifecycleResult>,
         &mut JoinSet<()>,
     ) {
         (
             &mut self.result_rx,
             &mut self.command_result_rx,
+            &mut self.config_return_rx,
+            &mut self.session_lifecycle_rx,
             &mut self.join_set,
         )
     }
+
 
     /// Non-blocking drain of the result channel. Used during shutdown to
     /// collect agents that completed while join_set was being drained.
@@ -1161,7 +1542,11 @@ impl AgentPool {
     /// empty and available for refill.
     pub fn slot_alive(&self, index: usize) -> bool {
         let idle = self.agents.get(index).is_some_and(|s| s.is_some());
-        if idle {
+        let lifecycle = self
+            .session_owners
+            .iter()
+            .any(|(scope, owner)| *owner == index && self.session_lifecycle_scopes.contains(scope));
+        if idle || lifecycle {
             return true;
         }
         // Check if the agent is checked out (in-flight on a task).
@@ -1308,6 +1693,26 @@ impl AgentPool {
         self.held_since.remove(&scope);
         IdleSwitchResult::Switched
     }
+}
+
+/// Where [`AgentPool::route_session_config`] sent a config write.
+///
+/// `Busy` means it is on its way into the in-flight turn's read loop; `Idle`
+/// hands the caller a checked-out worker to apply it against. Either way
+/// `ack_rx` resolves exactly once with the adapter's verdict, so the caller can
+/// emit one correlated result frame per request.
+pub enum ConfigRouteOutcome {
+    Busy {
+        ack_rx: tokio::sync::oneshot::Receiver<
+            Result<serde_json::Value, crate::acp::SessionConfigError>,
+        >,
+    },
+    Idle {
+        agent: OwnedAgent,
+        scope: SessionScope,
+        category: crate::acp::ConfigCategory,
+        value: String,
+    },
 }
 
 /// Outcome of [`AgentPool::hold_decision`] for one queued batch.
@@ -1686,7 +2091,6 @@ async fn create_session_and_apply_model(
             "configOptions": config_options_for_cache,
             "modes": modes_for_cache,
             // `models` must come from the SAME snapshot as configOptions — the
-            // post-switch snapshot on a successful switch, session/new otherwise.
             // Taking it from `resp.raw` here would emit the target model's option
             // set alongside the pre-switch model identity, so the desktop panel
             // would report the old model as live after an applied switch. When a
@@ -1713,7 +2117,7 @@ async fn create_session_and_apply_model(
     Ok(resp.session_id)
 }
 
-fn mcp_servers_with_git_origin(
+pub(crate) fn mcp_servers_with_git_origin(
     servers: &[McpServer],
     channel_id: Option<Uuid>,
     channel_type: Option<&str>,
@@ -2320,6 +2724,8 @@ fn send_prompt_result(
     batch: Option<FlushBatch>,
 ) {
     agent.acp.clear_steer_rx();
+    agent.acp.clear_permission_answer_rx();
+    agent.acp.clear_config_rx();
     let _ = result_tx.send(PromptResult {
         agent,
         source,
@@ -2612,6 +3018,9 @@ pub async fn run_prompt_task(
                             scope.telemetry_label()
                         );
                         agent.state.sessions.insert(scope.clone(), sid.clone());
+                        if origin_channel_type.as_deref() == Some("dm") {
+                            agent.state.dm_scopes.insert(scope.clone());
+                        }
                         agent
                             .state
                             .deliveries
@@ -3029,6 +3438,29 @@ pub async fn run_prompt_task(
         return;
     };
 
+    let prompt_images = if let Some(batch_ref) = batch.as_ref() {
+        match fetch_batch_image_attachments(batch_ref, &ctx.rest_client.http).await {
+            Ok(images) => images,
+            Err(error) => {
+                tracing::error!(
+                    target: "pool::prompt",
+                    "failed to prepare image attachments: {error}"
+                );
+                send_prompt_result(
+                    &result_tx,
+                    &turn_id,
+                    agent,
+                    source,
+                    PromptOutcome::Error(error),
+                    requeue_batch_if_queue(&ctx, batch),
+                );
+                return;
+            }
+        }
+    } else {
+        Vec::new()
+    };
+
     // 💬 — fire-and-forget so the prompt fires immediately.
     // The guard's cleanup (spawned on drop) removes 💬 after the turn completes.
     // A brief race where 💬 appears slightly after the agent starts is acceptable.
@@ -3051,6 +3483,21 @@ pub async fn run_prompt_task(
             .collect(),
         None => prompt_sections.iter().map(String::as_str).collect(),
     };
+    let mut prompt_content_blocks =
+        Vec::with_capacity(prompt_blocks.len() + prompt_images.len());
+    prompt_content_blocks.extend(
+        prompt_blocks
+            .iter()
+            .copied()
+            .map(PromptContentBlock::Text),
+    );
+    prompt_content_blocks.extend(prompt_images.iter().map(|image| {
+        PromptContentBlock::Image {
+            data: &image.data,
+            mime_type: &image.mime_type,
+        }
+    }));
+
     let prompt_bytes: usize = prompt_blocks.iter().map(|block| block.len()).sum();
     let has_standing_context = match &source {
         PromptSource::Channel(_) => !standing.sections().is_empty(),
@@ -3095,9 +3542,9 @@ pub async fn run_prompt_task(
             // Heartbeat / non-cancellable path.
             tokio::select! {
                 biased;
-                result = agent.acp.session_prompt_blocks_with_idle_timeout(
+                result = agent.acp.session_prompt_content_blocks_with_idle_timeout(
                     &session_id,
-                    &prompt_blocks,
+                    &prompt_content_blocks,
                     ctx.idle_timeout,
                     ctx.max_turn_duration,
                 ) => result,
@@ -3106,9 +3553,9 @@ pub async fn run_prompt_task(
         Some(rx) => {
             tokio::select! {
                 biased;
-                result = agent.acp.session_prompt_blocks_with_idle_timeout(
+                result = agent.acp.session_prompt_content_blocks_with_idle_timeout(
                     &session_id,
-                    &prompt_blocks,
+                    &prompt_content_blocks,
                     ctx.idle_timeout,
                     ctx.max_turn_duration,
                 ) => result,
@@ -3503,6 +3950,130 @@ pub async fn run_prompt_task(
         }
     }
     // _reaction_guard drops here → spawns clear_reactions for all exit paths.
+}
+
+#[derive(Debug)]
+struct ImetaImageSource {
+    event_id: String,
+    url: url::Url,
+    mime_type: String,
+}
+
+#[derive(Debug)]
+struct PromptImageAttachment {
+    data: String,
+    mime_type: String,
+}
+
+fn parse_imeta_image_source(
+    tag: &nostr::Tag,
+    event_id: &str,
+) -> Result<Option<ImetaImageSource>, AcpError> {
+    let fields = tag.as_slice();
+    if fields.first().map(String::as_str) != Some("imeta") {
+        return Ok(None);
+    }
+
+    let mut mime_types = Vec::new();
+    let mut urls = Vec::new();
+    for field in fields.iter().skip(1) {
+        let (key, value) = field.split_once(' ').ok_or_else(|| {
+            AcpError::Protocol(format!(
+                "malformed imeta field {field:?} on event {event_id}"
+            ))
+        })?;
+        match key {
+            "m" => mime_types.push(value),
+            "url" => urls.push(value),
+            _ => {}
+        }
+    }
+
+    let Some(mime_type) = mime_types.iter().find(|mime_type| mime_type.starts_with("image/"))
+    else {
+        return Ok(None);
+    };
+    if mime_types.len() != 1 {
+        return Err(AcpError::Protocol(format!(
+            "ambiguous imeta MIME type on image attachment for event {event_id}"
+        )));
+    }
+    if mime_type.len() <= "image/".len()
+        || mime_type["image/".len()..]
+            .chars()
+            .any(char::is_whitespace)
+    {
+        return Err(AcpError::Protocol(format!(
+            "invalid image MIME type {mime_type:?} on event {event_id}"
+        )));
+    }
+    if urls.len() != 1 {
+        return Err(AcpError::Protocol(format!(
+            "image imeta tag on event {event_id} must have exactly one URL"
+        )));
+    }
+
+    let url = url::Url::parse(urls[0]).map_err(|error| {
+        AcpError::Protocol(format!(
+            "invalid image URL on event {event_id}: {error}"
+        ))
+    })?;
+    if !matches!(url.scheme(), "http" | "https") {
+        return Err(AcpError::Protocol(format!(
+            "unsupported image URL scheme {:?} on event {event_id}",
+            url.scheme()
+        )));
+    }
+
+    Ok(Some(ImetaImageSource {
+        event_id: event_id.to_owned(),
+        url,
+        mime_type: (*mime_type).to_owned(),
+    }))
+}
+
+async fn fetch_batch_image_attachments(
+    batch: &FlushBatch,
+    http: &reqwest::Client,
+) -> Result<Vec<PromptImageAttachment>, AcpError> {
+    let mut sources = Vec::new();
+    for batch_event in batch.events.iter().chain(&batch.cancelled_events) {
+        let event_id = batch_event.event.id.to_hex();
+        for tag in batch_event.event.tags.iter() {
+            if let Some(source) = parse_imeta_image_source(tag, &event_id)? {
+                sources.push(source);
+            }
+        }
+    }
+
+    use base64::Engine as _;
+    let mut attachments = Vec::with_capacity(sources.len());
+    for source in sources {
+        let response = http.get(source.url.as_str()).send().await.map_err(|error| {
+            AcpError::Protocol(format!(
+                "failed to fetch image for event {} from {}: {error}",
+                source.event_id, source.url
+            ))
+        })?;
+        let response = response.error_for_status().map_err(|error| {
+            AcpError::Protocol(format!(
+                "image fetch returned an error for event {} from {}: {error}",
+                source.event_id, source.url
+            ))
+        })?;
+        let bytes = response.bytes().await.map_err(|error| {
+            AcpError::Protocol(format!(
+                "failed to read image for event {} from {}: {error}",
+                source.event_id, source.url
+            ))
+        })?;
+        attachments.push(PromptImageAttachment {
+            data: base64::engine::general_purpose::STANDARD.encode(&bytes),
+            mime_type: source.mime_type,
+        });
+    }
+
+    Ok(attachments)
 }
 
 /// Retry wrapper for context fetches: one retry with `CONTEXT_FETCH_RETRY_DELAY`
@@ -5463,6 +6034,96 @@ mod tests {
             args: vec![],
             env: vec![],
         }
+    }
+
+    #[test]
+    fn imeta_image_parser_ignores_non_image_and_rejects_invalid_image_url() {
+        let image_url = "url https://media.example/image.png";
+        let image = Tag::parse(["imeta", image_url, "m image/png"]).unwrap();
+        let source = parse_imeta_image_source(&image, "event-image")
+            .unwrap()
+            .unwrap();
+        assert_eq!(source.url.as_str(), "https://media.example/image.png");
+        assert_eq!(source.mime_type, "image/png");
+
+        let file_url = "url https://media.example/document.pdf";
+        let file = Tag::parse(["imeta", file_url, "m application/pdf"]).unwrap();
+        assert!(
+            parse_imeta_image_source(&file, "event-file")
+                .unwrap()
+                .is_none()
+        );
+
+        let malformed_url = "url not-a-url";
+        let malformed = Tag::parse(["imeta", malformed_url, "m image/jpeg"]).unwrap();
+        assert!(
+            parse_imeta_image_source(&malformed, "event-bad")
+                .unwrap_err()
+                .to_string()
+                .contains("invalid image URL")
+        );
+    }
+
+    #[tokio::test]
+    async fn batch_image_attachments_fetch_only_images_and_base64_encode_bytes() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let image_bytes = b"image bytes";
+        let server = tokio::spawn(async move {
+            let (mut stream, _) = tokio::time::timeout(
+                std::time::Duration::from_secs(5),
+                listener.accept(),
+            )
+            .await
+            .expect("image request should reach the local server")
+            .unwrap();
+            let mut request = [0; 1024];
+            let read = stream.read(&mut request).await.unwrap();
+            let request = std::str::from_utf8(&request[..read]).unwrap();
+            assert!(request.starts_with("GET /image.png HTTP/1.1"), "{request}");
+            let response = format!(
+                "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                image_bytes.len()
+            );
+            stream.write_all(response.as_bytes()).await.unwrap();
+            stream.write_all(image_bytes).await.unwrap();
+        });
+
+        let image_url = format!("url http://{address}/image.png");
+        let file_url = format!("url http://{address}/document.pdf");
+        let event = EventBuilder::new(Kind::Custom(9), "image attachment")
+            .tags([
+                Tag::parse(["imeta", image_url.as_str(), "m image/png"]).unwrap(),
+                Tag::parse(["imeta", file_url.as_str(), "m application/pdf"]).unwrap(),
+            ])
+            .sign_with_keys(&Keys::generate())
+            .unwrap();
+        let channel_id = Uuid::new_v4();
+        let batch = FlushBatch {
+            channel_id,
+            scope: conv(channel_id),
+            events: vec![crate::queue::BatchEvent {
+                event,
+                prompt_tag: "test".into(),
+                received_at: std::time::Instant::now(),
+            }],
+            cancelled_events: Vec::new(),
+            cancel_reason: None,
+        };
+
+        let attachments =
+            fetch_batch_image_attachments(&batch, &reqwest::Client::new())
+                .await
+                .unwrap();
+        server.await.unwrap();
+        assert_eq!(attachments.len(), 1);
+        assert_eq!(attachments[0].mime_type, "image/png");
+        assert_eq!(
+            attachments[0].data,
+            "aW1hZ2UgYnl0ZXM="
+        );
     }
 
     #[test]
@@ -7900,6 +8561,8 @@ printf '%s\n' '{{"jsonrpc":"2.0","id":0,"result":{{"stopReason":"end_turn"}}}}'"
                 recoverable_batch: None,
                 control_tx: None,
                 steer_tx: None,
+                permission_tx: None,
+                config_tx: None,
                 successful_steer_deliveries: HashSet::new(),
             },
         );
@@ -8056,6 +8719,85 @@ printf '%s\n' '{{"jsonrpc":"2.0","id":0,"result":{{"stopReason":"end_turn"}}}}'"
                 );
             }
         }
+    }
+    #[tokio::test]
+    async fn direct_session_lifecycle_refuses_overlap_and_rebinds_exact_scope() {
+        let channel_id = Uuid::new_v4();
+        let scope = conv(channel_id);
+        let mut agent = idle_agent_with_session(scope.clone()).await;
+        agent.state.dm_scopes.insert(scope.clone());
+        let mut pool = AgentPool::from_slots(vec![Some(agent)]);
+        pool.record_scope_owner(scope.clone(), 0);
+
+        let (agent, resolved_scope) = pool
+            .take_session_lifecycle_agent("sess")
+            .unwrap_or_else(|_| panic!("idle direct session should be routed"));
+        assert_eq!(resolved_scope, scope);
+        assert!(pool.slot_alive(0));
+        assert!(matches!(
+            pool.take_session_lifecycle_agent("sess"),
+            Err(AgentCommandTarget::ActiveTurn)
+        ));
+        assert!(matches!(
+            pool.hold_decision(
+                &scope,
+                std::time::Instant::now(),
+                Duration::from_secs(1),
+            ),
+            HoldDecision::Hold { .. }
+        ));
+
+        pool.return_session_lifecycle_agent(AgentSessionLifecycleResult {
+            agent,
+            scope: scope.clone(),
+            source_session_id: "sess".into(),
+            operation: "fork".into(),
+            target_session_id: Some("forked-sess".into()),
+            request_id: "req-1".into(),
+            result: Ok(serde_json::json!({ "sessionId": "forked-sess" })),
+        });
+
+        assert!(matches!(
+            pool.take_command_agent("sess"),
+            Err(AgentCommandTarget::StaleSession)
+        ));
+        let agent = pool
+            .take_command_agent("forked-sess")
+            .unwrap_or_else(|_| panic!("fork must own the direct conversation session"));
+        assert_eq!(
+            agent.state.sessions.get(&scope).map(String::as_str),
+            Some("forked-sess"),
+        );
+        pool.return_agent(agent);
+    }
+    #[tokio::test]
+    async fn lifecycle_requires_a_server_verified_dm_scope() {
+        let scope = conv(Uuid::new_v4());
+        let agent = idle_agent_with_session(scope).await;
+        let mut pool = AgentPool::from_slots(vec![Some(agent)]);
+
+        assert!(matches!(
+            pool.take_session_lifecycle_agent("sess"),
+            Err(AgentCommandTarget::StaleSession)
+        ));
+    }
+
+    #[tokio::test]
+    async fn lifecycle_rejects_sessions_bound_to_another_conversation() {
+        let dm_scope = conv(Uuid::new_v4());
+        let other_scope = conv(Uuid::new_v4());
+        let mut dm_agent = idle_agent_with_session(dm_scope.clone()).await;
+        dm_agent.state.dm_scopes.insert(dm_scope.clone());
+        let mut other_agent = idle_agent_with_session(other_scope.clone()).await;
+        other_agent.index = 1;
+        other_agent
+            .state
+            .sessions
+            .insert(other_scope.clone(), "other".into());
+        let pool = AgentPool::from_slots(vec![Some(dm_agent), Some(other_agent)]);
+
+        assert!(pool.lifecycle_target_is_unowned_or_in_scope("sess", &dm_scope));
+        assert!(!pool.lifecycle_target_is_unowned_or_in_scope("other", &dm_scope));
     }
 
     #[test]

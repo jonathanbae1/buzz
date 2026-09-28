@@ -471,10 +471,18 @@ export type AgentSessionCommandOutputDisposition =
   | "tool_handled";
 
 export type ControlResultFrame = {
-  type: "cancel_turn" | "switch_model" | "dispatch_command";
+  type:
+    | "cancel_turn"
+    | "switch_model"
+    | "dispatch_command"
+    | "permission_response"
+    | "set_session_config"
+    | "session_lifecycle";
   status: string;
   modelId?: string;
   commandName?: string;
+  operation?: "list" | "load" | "resume" | "fork" | "close";
+  sessions?: AgentSessionLifecycleEntry[];
   sessionId?: string;
   /** Opaque per-pick id echoed from the request; correlates late frames. */
   requestId?: string;
@@ -484,7 +492,27 @@ export type ControlResultFrame = {
   outputDisposition?: AgentSessionCommandOutputDisposition;
   /** Runtime refusal detail, when the harness has one. */
   error?: string;
+  /**
+   * Selector category for `set_session_config` results — the *category*, never a
+   * config id, because the adapter defines the id (omp advertises `thinking` for
+   * `thought_level`).
+   */
+  category?: ConfigSelectorCategory;
 };
+
+export type AgentSessionLifecycleEntry = {
+  sessionId: string;
+  title?: string;
+  updatedAt?: string;
+};
+
+/**
+ * The three selectors the exact-session config path serves.
+ *
+ * One category vocabulary is shared by the request and its result so a frame's
+ * provenance can never disagree with what was written.
+ */
+export type ConfigSelectorCategory = "mode" | "model" | "thought_level";
 
 export type AgentSessionCommandSubcommand = {
   name: string;
@@ -781,6 +809,16 @@ export type RuntimeConfigSurface = {
   effortConfigId?: string;
   /** Adapter-advertised option values for the `thought_level` option — the picker renders these instead of hardcoded values. */
   effortOptions?: AcpConfigOptionValue[];
+  /** The adapter-advertised `model` config id, discovered from the running session — the picker sends `set_config_option` with it instead of guessing. */
+  modelConfigId?: string;
+  /**
+   * Adapter-advertised option values for the `model` option.
+   *
+   * These are the values `session/set_config_option` accepts, which is a
+   * different set from the `omp models` catalog a lane is chosen from; the UI
+   * states that rather than offering a value the live session would refuse.
+   */
+  modelOptions?: AcpConfigOptionValue[];
   /** ACP session-mode config id discovered from the running session. */
   modeConfigId?: string;
   /** Adapter-advertised options for the session-mode config option. */

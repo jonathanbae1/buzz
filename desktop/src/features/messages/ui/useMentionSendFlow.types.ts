@@ -30,6 +30,7 @@ export type UseMentionSendFlowOptions = {
     pubkeys: readonly string[],
     newlyPinnedPubkeys: readonly string[],
   ) => void;
+  onPromptSent?: (prompt: string) => void;
   onSendRef: React.MutableRefObject<
     (
       content: string,

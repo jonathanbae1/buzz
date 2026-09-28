@@ -110,6 +110,150 @@ impl StopReason {
     }
 }
 
+/// One selectable answer on a `session/request_permission` request, as the
+/// agent advertised it. `kind` is the ACP enum (`allow_once`, `allow_always`,
+/// `reject_once`, `reject_always`); `option_id` is what an answer must echo
+/// back, and is never hardcoded because agents choose their own ids.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PermissionOption {
+    pub option_id: String,
+    pub kind: String,
+    pub name: Option<String>,
+}
+
+/// A `session/request_permission` request received from the agent and awaiting
+/// an answer from the client.
+#[derive(Debug, Clone, PartialEq)]
+pub struct PermissionRequest {
+    /// This client's connection-scoped identity. JSON-RPC ids are reusable
+    /// after a respawn, so an answer is only trusted when it carries the same
+    /// nonce as the request it claims to answer.
+    pub nonce: u64,
+    /// The JSON-RPC id to echo on the response. `serde_json::Value` because
+    /// JSON-RPC 2.0 permits both numeric and string ids from the agent.
+    pub request_id: serde_json::Value,
+    /// ACP session id, for attribution and the observer frame.
+    pub session_id: String,
+    pub tool_call_id: Option<String>,
+    pub title: Option<String>,
+    pub options: Vec<PermissionOption>,
+}
+
+/// The client's answer to one [`PermissionRequest`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PermissionAnswer {
+    /// Echoes the request's nonce, so a stale or replayed answer is rejected.
+    pub nonce: u64,
+    /// The chosen `optionId`, echoed verbatim from the request.
+    pub option_id: String,
+}
+
+/// How long a `session/request_permission` request may stay unanswered before
+/// the harness settles it `cancelled`.
+///
+/// Deliberately much shorter than the turn's hard cap
+/// (`DEFAULT_MAX_TURN_DURATION_SECS`, 2h): an approval nobody answers must not
+/// hold the turn open for two hours. `cancelled` is ACP's own "no decision"
+/// outcome, so expiry refuses the tool call — it never approves it, which is
+/// exactly what the removed auto-answer did.
+pub const PERMISSION_ANSWER_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(600);
+/// The three selector categories a `set_session_config` frame may address.
+///
+/// The wire string is the request's `category` field, and it is deliberately
+/// the *category* rather than a config id: the adapter defines the config id
+/// (Claude Code spells its effort option `effort`, omp spells it `thinking`),
+/// so resolving by category is what lets one path serve every adapter.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ConfigCategory {
+    Mode,
+    Model,
+    ThoughtLevel,
+}
+
+impl ConfigCategory {
+    /// Parse the frame's `category` field. An unknown value is a refusal,
+    /// never a silently ignored frame.
+    pub fn parse(raw: &str) -> Option<Self> {
+        match raw {
+            "mode" => Some(Self::Mode),
+            "model" => Some(Self::Model),
+            "thought_level" => Some(Self::ThoughtLevel),
+            _ => None,
+        }
+    }
+
+    /// The ACP `configOptions[].category` value this selector reads.
+    pub fn option_category(self) -> &'static str {
+        match self {
+            Self::Mode => "mode",
+            Self::Model => "model",
+            // Adapters that predate the canonical category emitted `effort`;
+            // `resolve_category_config_id` falls back to that string.
+            Self::ThoughtLevel => "thought_level",
+        }
+    }
+
+    pub fn as_wire_str(self) -> &'static str {
+        match self {
+            Self::Mode => "mode",
+            Self::Model => "model",
+            Self::ThoughtLevel => "thought_level",
+        }
+    }
+}
+
+/// Why a `session/set_config_option` write failed.
+///
+/// `Rejected` and `Unsupported` are distinct on purpose: the first means the
+/// adapter refused a value it knows about (the prior value stands), the second
+/// means the adapter advertises no option for this category at all, so nothing
+/// could be written. `Transport` means the stdio stream may be poisoned and the
+/// caller must respawn rather than reuse the client.
+#[derive(Debug)]
+pub enum SessionConfigError {
+    /// The adapter returned an application-level error. Nothing was mutated.
+    Rejected { message: String },
+    /// No advertised `configOptions` entry carries this category, so the
+    /// selector is not writable on this adapter.
+    Unsupported { category: String },
+    /// The value is not in the advertised option list for this category.
+    InvalidValue { value: String, offered: Vec<String> },
+    /// Transport-class failure — the client must not be reused.
+    Transport(AcpError),
+}
+
+impl std::fmt::Display for SessionConfigError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Rejected { message } => write!(f, "adapter rejected the value: {message}"),
+            Self::Unsupported { category } => {
+                write!(f, "the adapter advertises no {category} config option")
+            }
+            Self::InvalidValue { value, offered } => write!(
+                f,
+                "{value} is not an advertised value (offered: {})",
+                offered.join(", ")
+            ),
+            Self::Transport(error) => write!(f, "transport error: {error}"),
+        }
+    }
+}
+
+/// A config write requested by the main loop for a live session.
+///
+/// Delivered to the read loop over a per-turn channel, exactly like
+/// [`crate::pool::SteerRequest`], because only the read loop owns the agent's
+/// reader while a prompt is in flight. Unlike a steer, the write neither
+/// cancels the prompt nor starts a new turn: it is a plain JSON-RPC request
+/// whose response is routed back to `ack_tx` by id.
+#[derive(Debug)]
+pub struct SessionConfigRequest {
+    pub category: ConfigCategory,
+    pub value: String,
+    /// Reports the write outcome to whoever is awaiting it.
+    pub ack_tx: tokio::sync::oneshot::Sender<Result<serde_json::Value, SessionConfigError>>,
+}
+
 /// Errors that can occur in the ACP client.
 #[derive(Debug, thiserror::Error)]
 pub enum AcpError {
@@ -157,6 +301,22 @@ fn agent_error_from_json(error: &serde_json::Value) -> AcpError {
     AcpError::AgentError { code, message }
 }
 
+/// Render an ACP error response as a message for a refusal frame.
+///
+/// The numeric code is preserved when present so the desktop can distinguish a
+/// protocol-level refusal from a business one, and the whole JSON is used when
+/// no `message` member exists — a provider-specific `data` payload is then not
+/// lost, which is the difference between a diagnosable refusal and "rejected".
+fn agent_error_message(error: &serde_json::Value) -> String {
+    match error.get("message").and_then(|m| m.as_str()) {
+        Some(message) => match error.get("code").and_then(|c| c.as_i64()) {
+            Some(code) => format!("{message} (code {code})"),
+            None => message.to_string(),
+        },
+        None => error.to_string(),
+    }
+}
+
 fn build_initialize_params() -> serde_json::Value {
     serde_json::json!({
         "protocolVersion": 2,
@@ -184,16 +344,28 @@ pub struct AcpClient {
     /// Monotonically increasing JSON-RPC request id counter.
     /// Harness-generated IDs are always numeric.
     next_id: u64,
-    /// The id of a `session/request_permission` request that has been received
-    /// but not yet responded to. Stored as `serde_json::Value` because JSON-RPC 2.0
-    /// permits both numeric and string IDs from the agent.
-    /// Used by [`cancel_with_cleanup`](AcpClient::cancel_with_cleanup) to send
-    /// a `cancelled` outcome before the agent returns from `session/prompt`.
-    pending_permission_id: Option<serde_json::Value>,
-    /// Whether we have already sent a response to the pending permission request.
-    /// Guards against double-response if a timeout fires after the allow_once
-    /// response was written but before `pending_permission_id` was cleared.
-    permission_responded: bool,
+    /// The `session/request_permission` request this client has received and
+    /// not yet answered. `None` means no request is outstanding — either none
+    /// ever arrived, or the only one did and has been settled exactly once.
+    ///
+    /// Replaces the former `pending_permission_id` + `permission_responded`
+    /// pair: a single `Option` *is* the once-only guard, because settling takes
+    /// the state and a second settlement finds `None`.
+    pending_permission: Option<PermissionRequest>,
+    /// Per-turn channel carrying the client's answer to the pending request into
+    /// the read loop, which owns the client's writer for the duration of a turn.
+    /// Installed by the prompt task like `steer_rx` and taken into a local in
+    /// the same way, so a late answer cannot address a request whose turn ended.
+    permission_answer_rx: Option<tokio::sync::mpsc::Receiver<PermissionAnswer>>,
+    /// Wall-clock deadline for the pending permission request, derived from the
+    /// prompter's `answer_timeout` when the request arrived. `None` when no
+    /// request is outstanding or the prompter is a policy that answers inline.
+    /// On expiry the read loop settles the request `cancelled`.
+    permission_deadline: Option<tokio::time::Instant>,
+    /// Connection-scoped nonce source for permission requests. JSON-RPC ids are
+    /// reusable, so the nonce — not the id — is what tells two requests apart
+    /// across a respawn, and an answer must quote it.
+    next_permission_nonce: u64,
     /// The JSON-RPC id of the most recently sent `session/prompt` request.
     /// Used by [`cancel_with_cleanup`] to drain the correct response.
     /// Set in [`session_prompt_with_idle_timeout`]; consumed in [`cancel_with_cleanup`].
@@ -208,6 +380,7 @@ pub struct AcpClient {
     observer_agent_index: Option<usize>,
     /// Best-effort context attached to raw ACP wire events.
     observer_context: ObserverContext,
+    suppress_raw_rpc_observer: bool,
     /// Capture enabled only around a command-dispatch prompt.
     command_output: Option<CommandOutput>,
     /// Most recently observed `_meta.goose.activeRunId` from a
@@ -244,6 +417,25 @@ pub struct AcpClient {
     /// outside of a goose-native turn — the read loop's steer arm is
     /// disabled in that case.
     steer_rx: Option<tokio::sync::mpsc::Receiver<crate::pool::SteerRequest>>,
+    /// Per-turn channel for exact-session config writes (`session/set_config_option`)
+    /// requested while the prompt is in flight. Installed by
+    /// [`install_config_rx`](Self::install_config_rx) at dispatch and consumed
+    /// (via `take()`) by the read loop, which owns the reader for the turn's
+    /// duration. Separate from `steer_rx` because a config write is not a
+    /// message: it must not be framed as a steer, must not cancel, and must not
+    /// start a new turn. `None` outside a controllable turn.
+    config_rx: Option<tokio::sync::mpsc::Receiver<SessionConfigRequest>>,
+    /// The advertised `configOptions` array of the session (or sessions) this
+    /// client created, as last seen.
+    ///
+    /// This is the harness's own authoritative projection for resolving a
+    /// selector's `configId` by *category* and for rejecting an unadvertised
+    /// value *before* any mutation. It is seeded from `session/new` and replaced
+    /// by the adapter's own `config_option_update` push, which is the only other
+    /// statement of the running values. Config ids are stable per adapter for
+    /// the life of a session, but the values behind them are not, so this is
+    /// refreshed rather than cached once.
+    session_config_options: Option<serde_json::Value>,
     /// Usage tracker for goose/buzz-agent's cumulative notification format.
     goose_usage: UsageTracker,
     /// Per-turn prompt-response usage and Claude's optional cumulative cost.
@@ -449,6 +641,12 @@ fn build_client_capabilities() -> serde_json::Value {
     })
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum PromptContentBlock<'a> {
+    Text(&'a str),
+    Image { data: &'a str, mime_type: &'a str },
+}
+
 impl AcpClient {
     /// Kill the agent subprocess and wait for it to exit (no zombies).
     ///
@@ -586,17 +784,22 @@ impl AcpClient {
             stdin,
             reader: FramedRead::new(stdout, LinesCodec::new_with_max_length(MAX_LINE_SIZE)),
             next_id: 0,
-            pending_permission_id: None,
-            permission_responded: false,
+            pending_permission: None,
+            permission_answer_rx: None,
+            permission_deadline: None,
+            next_permission_nonce: 1,
             last_prompt_id: None,
             current_hard_deadline: None,
             observer: None,
             observer_agent_index: None,
             observer_context: ObserverContext::default(),
+            suppress_raw_rpc_observer: false,
             command_output: None,
             active_run_id: None,
             steering_supported: false,
             steer_rx: None,
+            config_rx: None,
+            session_config_options: None,
             goose_usage: UsageTracker::default(),
             standard_usage: StandardUsageTracker::default(),
             standard_adapter,
@@ -727,6 +930,11 @@ impl AcpClient {
             .ok_or_else(|| AcpError::Protocol("session/new response missing sessionId".into()))?
             .to_owned();
         tracing::info!(target: "acp::session", "session created: {session_id}");
+        // Seed the harness's own projection from the same response the desktop
+        // reads. A selector's configId is resolved by CATEGORY from here, never
+        // from a literal, because adapters disagree on the id (omp advertises
+        // `thinking` for `thought_level`) and on the key (`configId` vs `id`).
+        self.session_config_options = result.get("configOptions").cloned();
         Ok(SessionNewResponse {
             session_id,
             raw: result,
@@ -749,8 +957,116 @@ impl AcpClient {
             .await?
             .session_id)
     }
+    /// List resumable sessions visible to this managed agent process.
+    ///
+    /// The process already owns the selected profile and cwd. Do not accept
+    /// either value from an observer control frame.
+    pub async fn session_list(&mut self, cwd: &str) -> Result<serde_json::Value, AcpError> {
+        let mut sessions = Vec::new();
+        let mut cursor: Option<String> = None;
+        loop {
+            let mut params = serde_json::json!({ "cwd": cwd });
+            if let Some(cursor) = cursor.as_deref() {
+                params["cursor"] = serde_json::Value::String(cursor.to_string());
+            }
+            let page = self
+                .send_lifecycle_request("session/list", params)
+                .await?;
+            if let Some(items) = page.get("sessions").and_then(serde_json::Value::as_array) {
+                sessions.extend(items.iter().cloned());
+            }
+            cursor = page
+                .get("nextCursor")
+                .and_then(serde_json::Value::as_str)
+                .map(str::to_string);
+            if cursor.is_none() {
+                return Ok(serde_json::json!({ "sessions": sessions }));
+            }
+        }
+    }
 
-    /// Replace Goose's native system prompt after `session/new`.
+    /// Load a session into this process, replaying its transcript through the
+    /// existing ACP notification path.
+    pub async fn session_load(
+        &mut self,
+        session_id: &str,
+        cwd: &str,
+        mcp_servers: Vec<McpServer>,
+    ) -> Result<serde_json::Value, AcpError> {
+        let result = self
+            .send_lifecycle_request(
+                "session/load",
+                serde_json::json!({
+                    "sessionId": session_id,
+                    "cwd": cwd,
+                    "mcpServers": mcp_servers,
+                }),
+            )
+            .await?;
+        if let Some(options) = result.get("configOptions") {
+            self.session_config_options = Some(options.clone());
+        }
+        Ok(result)
+    }
+
+    /// Resume a session using the managed agent's configured cwd and MCP
+    /// servers. ACP session identity remains the session id returned by omp.
+    pub async fn session_resume(
+        &mut self,
+        session_id: &str,
+        cwd: &str,
+        mcp_servers: Vec<McpServer>,
+    ) -> Result<serde_json::Value, AcpError> {
+        let result = self
+            .send_lifecycle_request(
+                "session/resume",
+                serde_json::json!({
+                    "sessionId": session_id,
+                    "cwd": cwd,
+                    "mcpServers": mcp_servers,
+                }),
+            )
+            .await?;
+        if let Some(options) = result.get("configOptions") {
+            self.session_config_options = Some(options.clone());
+        }
+        Ok(result)
+    }
+
+    /// Fork a session while preserving the source transcript.
+    pub async fn session_fork(
+        &mut self,
+        session_id: &str,
+        cwd: &str,
+        mcp_servers: Vec<McpServer>,
+    ) -> Result<serde_json::Value, AcpError> {
+        let result = self
+            .send_lifecycle_request(
+                "session/fork",
+                serde_json::json!({
+                    "sessionId": session_id,
+                    "cwd": cwd,
+                    "mcpServers": mcp_servers,
+                }),
+            )
+            .await?;
+        if let Some(options) = result.get("configOptions") {
+            self.session_config_options = Some(options.clone());
+        }
+        Ok(result)
+    }
+
+    /// Close a session without changing the owner process or its profile.
+    pub async fn session_close(&mut self, session_id: &str) -> Result<(), AcpError> {
+        self.send_lifecycle_request(
+            "session/close",
+            serde_json::json!({ "sessionId": session_id }),
+        )
+        .await?;
+        Ok(())
+    }
+
+    /// Replace Goose's native system prompt after session/new.
     pub async fn session_set_goose_system_prompt(
         &mut self,
         session_id: &str,
@@ -796,6 +1112,134 @@ impl AcpClient {
         self.send_request("session/set_model", params).await
     }
 
+    /// Resolve the advertised `configId` for a selector category.
+    ///
+    /// The lookup is by *category*, never by a literal id: omp advertises
+    /// `thinking` for category `thought_level`, claude-agent-acp advertises
+    /// `effort`, and both spell the id under `configId` or `id`. `thought_level`
+    /// falls back to the legacy invented category `effort` only when the
+    /// canonical one is entirely absent, so an advertised-but-unset
+    /// `thought_level` entry is still selected rather than flipping the write
+    /// route to a different option.
+    pub fn resolve_category_config_id(&self, category: ConfigCategory) -> Option<String> {
+        let options = self.session_config_options.as_ref()?.as_array()?;
+        let by_category = |want: &str| {
+            options.iter().find_map(|opt| {
+                (opt.get("category").and_then(|c| c.as_str()) == Some(want))
+                    .then(|| {
+                        opt.get("configId")
+                            .or_else(|| opt.get("id"))
+                            .and_then(|v| v.as_str())
+                            .map(str::to_string)
+                    })
+                    .flatten()
+            })
+        };
+        match category {
+            ConfigCategory::ThoughtLevel => {
+                by_category("thought_level").or_else(|| by_category("effort"))
+            }
+            other => by_category(other.option_category()),
+        }
+    }
+
+    /// The advertised values for a selector category, in adapter order.
+    ///
+    /// Empty when the category is not advertised; the caller turns that into an
+    /// `Unsupported` refusal rather than writing a value nothing offered.
+    pub fn category_option_values(&self, category: ConfigCategory) -> Vec<String> {
+        let Some(options) = self.session_config_options.as_ref().and_then(|v| v.as_array())
+        else {
+            return Vec::new();
+        };
+        let wanted: &[&str] = match category {
+            ConfigCategory::ThoughtLevel => &["thought_level", "effort"],
+            other => &[other.option_category()],
+        };
+        for want in wanted {
+            let found = options.iter().find(|opt| {
+                opt.get("category").and_then(|c| c.as_str()) == Some(*want)
+            });
+            if let Some(opt) = found {
+                return opt
+                    .get("options")
+                    .and_then(|v| v.as_array())
+                    .map(|arr| {
+                        arr.iter()
+                            .filter_map(|o| o.get("value").and_then(|v| v.as_str()))
+                            .map(str::to_string)
+                            .collect()
+                    })
+                    .unwrap_or_default();
+            }
+        }
+        Vec::new()
+    }
+
+    /// Apply a config write to an exact session, validating before mutating.
+    ///
+    /// Validation order is load-bearing: the category must be advertised and the
+    /// value must be in that option's advertised list *before* the request is
+    /// written. A rejected value therefore leaves both the session and this
+    /// client's projection untouched — the failure mode the plan's check 19
+    /// asserts, and the reason an unsupported effort cannot be silently clamped.
+    ///
+    /// `categories_offered` overrides the internal projection when the caller
+    /// holds a fresher snapshot (the main loop reads the cached capabilities the
+    /// desktop also reads); pass `None` to use the client's own copy.
+    pub async fn session_apply_config_option(
+        &mut self,
+        session_id: &str,
+        category: ConfigCategory,
+        value: &str,
+    ) -> Result<serde_json::Value, SessionConfigError> {
+        let Some(config_id) = self.resolve_category_config_id(category) else {
+            return Err(SessionConfigError::Unsupported {
+                category: category.as_wire_str().to_string(),
+            });
+        };
+        let offered = self.category_option_values(category);
+        // An adapter may advertise no `options` list at all (the value is then
+        // open-ended, e.g. a free-form model string). Only enumerate-and-reject
+        // when the adapter actually enumerated something.
+        if !offered.is_empty() && !offered.iter().any(|o| o == value) {
+            return Err(SessionConfigError::InvalidValue {
+                value: value.to_string(),
+                offered,
+            });
+        }
+
+        let result = tokio::time::timeout(Self::CONFIG_WRITE_TIMEOUT, async {
+            self.session_set_config_option(session_id, &config_id, value)
+                .await
+        })
+        .await;
+
+        match result {
+            Ok(Ok(value)) => {
+                tracing::info!(
+                    target: "acp::config",
+                    "applied {category:?} = {value:?} via configId={config_id} on session {session_id}"
+                );
+                // The adapter echoes the refreshed `configOptions`. Adopting it
+                // keeps the projection authoritative for the next validation
+                // instead of trusting the locally-written value.
+                if let Some(options) = value.get("configOptions") {
+                    if !options.is_null() {
+                        self.session_config_options = Some(options.clone());
+                    }
+                }
+                Ok(value)
+            }
+            Ok(Err(error)) => Err(SessionConfigError::Rejected {
+                message: error.to_string(),
+            }),
+            Err(_) => Err(SessionConfigError::Transport(AcpError::Timeout(
+                Self::CONFIG_WRITE_TIMEOUT,
+            ))),
+        }
+    }
+
     /// Send `session/prompt` with idle-based timeout instead of wall-clock.
     ///
     /// The idle deadline resets on any stdout activity from the agent. The hard
@@ -830,8 +1274,48 @@ impl AcpClient {
         max_duration: std::time::Duration,
     ) -> Result<StopReason, AcpError> {
         let params = build_prompt_params(session_id, prompt_blocks);
+        self.session_prompt_params_with_idle_timeout(
+            session_id,
+            params,
+            idle_timeout,
+            max_duration,
+        )
+        .await
+    }
+
+    /// Send text and image content blocks in one `session/prompt` request.
+    pub(crate) async fn session_prompt_content_blocks_with_idle_timeout(
+        &mut self,
+        session_id: &str,
+        prompt_blocks: &[PromptContentBlock<'_>],
+        idle_timeout: std::time::Duration,
+        max_duration: std::time::Duration,
+    ) -> Result<StopReason, AcpError> {
+        let params = build_prompt_content_params(session_id, prompt_blocks);
+        self.session_prompt_params_with_idle_timeout(
+            session_id,
+            params,
+            idle_timeout,
+            max_duration,
+        )
+        .await
+    }
+
+    async fn session_prompt_params_with_idle_timeout(
+        &mut self,
+        session_id: &str,
+        params: serde_json::Value,
+        idle_timeout: std::time::Duration,
+        max_duration: std::time::Duration,
+    ) -> Result<StopReason, AcpError> {
         let hard_deadline = tokio::time::Instant::now() + max_duration;
         self.current_hard_deadline = Some(hard_deadline);
+
+        // Start the turn with no permission request outstanding and no answer
+        // timer armed: both belong to a request, and any request from an
+        // earlier turn has already been settled by that turn's exit path.
+        self.pending_permission = None;
+        self.permission_deadline = None;
 
         // Mark the usage tracker as in-flight for this turn BEFORE sending the
         // prompt so that any setup notifications recorded earlier are not
@@ -981,6 +1465,47 @@ impl AcpClient {
         self.steer_rx = None;
     }
 
+    /// Install the per-turn receiver for exact-session config writes.
+    ///
+    /// Called by the dispatch path with the same lifetime as
+    /// [`install_steer_rx`](Self::install_steer_rx); the matching `Sender` is
+    /// stored in `TaskMeta.config_tx`. Panics on a stacked receiver, since one
+    /// `AcpClient` serves exactly one turn at a time and stacking would
+    /// misroute a write into the wrong turn's reader.
+    pub fn install_config_rx(
+        &mut self,
+        rx: tokio::sync::mpsc::Receiver<SessionConfigRequest>,
+    ) {
+        assert!(
+            self.config_rx.is_none(),
+            "install_config_rx: previous turn's receiver was not consumed — \
+             stacking receivers would misroute config writes across turns"
+        );
+        self.config_rx = Some(rx);
+    }
+
+    /// Clear any installed config receiver without consuming it.
+    ///
+    /// Called on every exit path of the prompt task alongside
+    /// [`clear_steer_rx`](Self::clear_steer_rx) so the `is_none()` invariant
+    /// holds for the next dispatch. Idempotent.
+    pub fn clear_config_rx(&mut self) {
+        self.config_rx = None;
+    }
+
+    /// Returns `true` if no config receiver is currently installed.
+    #[cfg(test)]
+    pub fn config_rx_is_none(&self) -> bool {
+        self.config_rx.is_none()
+    }
+
+    /// Test seam: the advertised configOptions this client holds, so tests can
+    /// assert that a refused write left the projection untouched.
+    #[cfg(test)]
+    pub fn session_config_options_for_test(&self) -> Option<serde_json::Value> {
+        self.session_config_options.clone()
+    }
+
     /// Returns `true` if no steer receiver is currently installed.
     ///
     /// Test-only: used by `pool` tests to assert the post-return invariant
@@ -988,6 +1513,51 @@ impl AcpClient {
     #[cfg(test)]
     pub fn steer_rx_is_none(&self) -> bool {
         self.steer_rx.is_none()
+    }
+
+    /// Install the prompter and answer channel that decide this turn's
+    /// `session/request_permission` requests.
+    ///
+    /// Both are per-turn and dropped with the turn: the receiver is taken into
+    /// a local by the read loop (like `steer_rx`), and the prompter is cleared
+    /// by [`Self::clear_steer_rx`]'s counterpart on the way back to the pool.
+    /// A later answer therefore lands on a channel nobody holds and is inert
+    /// rather than being written against a request from an earlier turn.
+    ///
+    /// Mirror of [`Self::install_steer_rx`]: same one-receiver-per-turn
+    /// invariant, asserted the same way.
+    pub fn install_permission_answer_rx(
+        &mut self,
+        rx: tokio::sync::mpsc::Receiver<PermissionAnswer>,
+    ) {
+        assert!(
+            self.permission_answer_rx.is_none(),
+            "install_permission_answer_rx: previous turn's receiver was not consumed — \
+             stacking receivers would misroute permission answers across turns"
+        );
+        self.permission_answer_rx = Some(rx);
+    }
+
+    /// Drop the per-turn permission answer state without consuming it.
+    ///
+    /// Called on every path that returns the agent to the pool, alongside
+    /// [`Self::clear_steer_rx`], so a turn that ends before the read loop's
+    /// `take()` cannot leave a stale prompter deciding the *next* turn's
+    /// requests with the *previous* turn's policy.
+    pub fn clear_permission_answer_rx(&mut self) {
+        self.permission_answer_rx = None;
+        self.pending_permission = None;
+        self.permission_deadline = None;
+    }
+
+    /// Returns `true` when this client has a permission request outstanding.
+    ///
+    /// Read by the S4 session-switch refusal path: a switch must not proceed
+    /// while an approval is pending, because the answer would then address a
+    /// session that is no longer bound. Not yet wired — S4 is not implemented.
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub fn has_pending_permission(&self) -> bool {
+        self.pending_permission.is_some()
     }
 
     /// Cancel a turn cleanly, handling any pending permission request first.
@@ -1071,20 +1641,18 @@ impl AcpClient {
             AcpError::Protocol("cancel_with_cleanup called with no in-flight prompt".into())
         })?;
 
-        // Step 1: respond to any pending permission request with "cancelled",
-        // but only if we haven't already responded (guards against double-response race).
-        if let Some(perm_id) = self.pending_permission_id.clone() {
-            if !self.permission_responded {
-                let response = permission_response_cancelled(&perm_id);
-                self.write_ndjson(&response).await?;
-                tracing::debug!(
-                    target: "acp::cancel",
-                    "responded cancelled to pending permission id={perm_id}"
-                );
-            }
-            self.pending_permission_id = None;
-            self.permission_responded = false;
+        // Step 1: resolve any pending permission request with "cancelled" —
+        // the correct outcome once a turn is being stopped (a request that is
+        // never answered leaves the agent waiting on a reply that will not
+        // come). Taking the state makes this once-only by construction: a
+        // later Prompter answer finds no pending request and is rejected.
+        if self.pending_permission.is_some() {
+            self.settle_pending_permission_cancelled().await?;
         }
+        // Drop the per-turn answer state with the request it belonged to. A
+        // Stop means the operator is done with this turn, so no late answer may
+        // be applied to it, and no prompter may carry into the next turn.
+        self.clear_permission_answer_rx();
 
         // Step 2: send session/cancel notification (no id)
         self.session_cancel(session_id).await?;
@@ -1125,12 +1693,23 @@ impl AcpClient {
         .await
         .map_err(|_| AcpError::WriteTimeout(WRITE_TIMEOUT))?
         .map_err(AcpError::Io)?;
-        self.observe("acp_write", value.clone());
+        if !self.suppress_raw_rpc_observer {
+            self.observe("acp_write", value.clone());
+        }
         Ok(())
     }
 
     /// Default timeout for non-prompt RPCs (initialize, session/new, etc.).
     const REQUEST_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(60);
+
+    /// Deadline for one `session/set_config_option` write.
+    ///
+    /// Deliberately shorter than [`Self::REQUEST_TIMEOUT`]: a selector write is
+    /// a bounded mutation of live state and the caller has a UI waiting on it,
+    /// while `REQUEST_TIMEOUT` guards general requests like `session/new`. A
+    /// write that outlives this is treated as a transport failure so the caller
+    /// respawns rather than reusing a possibly-poisoned stream.
+    const CONFIG_WRITE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
 
     /// Send a JSON-RPC request and wait for the matching response.
     ///
@@ -1171,6 +1750,16 @@ impl AcpClient {
             Ok(result) => result,
             Err(_) => Err(AcpError::Timeout(timeout)),
         }
+    }
+    async fn send_lifecycle_request(
+        &mut self,
+        method: &str,
+        params: serde_json::Value,
+    ) -> Result<serde_json::Value, AcpError> {
+        self.suppress_raw_rpc_observer = true;
+        let result = self.send_request(method, params).await;
+        self.suppress_raw_rpc_observer = false;
+        result
     }
 
     /// Drain any buffered lines from the agent's stdout without blocking.
@@ -1282,7 +1871,9 @@ impl AcpClient {
                     continue;
                 }
             };
-            self.observe("acp_read", msg.clone());
+            if !self.suppress_raw_rpc_observer || msg.get("method").is_some() {
+                self.observe("acp_read", msg.clone());
+            }
 
             // Check if this is a response to our expected request (has matching id
             // AND no `method` field — a `method` field means it's an agent-initiated
@@ -1306,7 +1897,8 @@ impl AcpClient {
                         self.handle_goose_usage_update(&msg);
                     }
                     "session/request_permission" => {
-                        self.handle_permission_request(&msg).await?;
+                        let request = self.register_permission_request(&msg)?;
+                        self.open_permission_request(&request).await;
                     }
                     other => {
                         // If the unknown message has an id, it's a request expecting a reply.
@@ -1375,6 +1967,30 @@ impl AcpClient {
         // Dropped at scope exit (return paths drain `pending_steer` first
         // so the ack_tx oneshot is never leaked silently).
         let mut steer_rx = self.steer_rx.take();
+        // Config-write receiver for this turn, taken for the same reason: the
+        // read loop owns the reader, so a mid-turn `set_config_option` must be
+        // written from here. This one is deliberately NOT gated on a
+        // pending-write flag — a config write is a single JSON-RPC request with
+        // no withhold/ack protocol, so consecutive writes are safe.
+        let mut config_rx = self.config_rx.take();
+
+        // In-flight config writes: `(jsonrpc id, config_id, value, ack_tx)`.
+        // Unlike `pending_steer` there is no single-slot gate — several writes
+        // may be outstanding at once and each is routed back by id. Drained on
+        // every return path so no caller is left waiting on a oneshot.
+        let mut pending_configs: Vec<(
+            u64,
+            String,
+            String,
+            tokio::sync::oneshot::Sender<Result<serde_json::Value, SessionConfigError>>,
+        )> = Vec::new();
+
+        // Same shape for the permission answer channel: the read loop owns the
+        // writer for the turn, so an answer must reach it here. Taken into a
+        // local (not borrowed off `self`) because the reader arm borrows `self`
+        // mutably; dropping it at scope exit is what makes an answer arriving
+        // after the turn ended address nothing.
+        let mut permission_rx = self.permission_answer_rx.take();
 
         // Tracks the in-flight steer write: `(request_id, transport, ack_tx)`.
         // While `Some`, the steer arm is gated off so we don't stack writes,
@@ -1397,12 +2013,16 @@ impl AcpClient {
         loop {
             // Determine which deadline fires first BEFORE sleeping — this is
             // the classification we'll use on timeout, immune to scheduler jitter.
-            let idle_fires_first = idle_deadline < hard_deadline;
-            let next_deadline = if idle_fires_first {
-                idle_deadline
-            } else {
-                hard_deadline
-            };
+            // The permission answer deadline joins in only while a request is
+            // outstanding, so it cannot shorten an ordinary turn.
+            let permission_deadline = self.permission_deadline;
+            let next_deadline = [Some(idle_deadline), Some(hard_deadline), permission_deadline]
+                .into_iter()
+                .flatten()
+                .min()
+                .expect("idle and hard deadlines are always present");
+            let idle_fires_first = idle_deadline == next_deadline;
+            let permission_fires_first = permission_deadline == Some(next_deadline);
 
             // Pre-select deadline check — required by Max's review. Under
             // `biased`, a continuously-ready reader arm wins every poll and
@@ -1419,6 +2039,15 @@ impl AcpClient {
                     // normal dispatch handles redelivery).
                     let _ = ack_tx.send(crate::pool::SteerAck::PromptCompletedNeutral);
                 }
+                if permission_fires_first {
+                    // An approval nobody answered stops being an approval
+                    // waiting to happen. Settling it `cancelled` — ACP's own
+                    // "no decision" outcome — refuses the tool call and leaves
+                    // the turn running, which is the only outcome that is both
+                    // honest and non-blocking.
+                    self.settle_expired_permission().await;
+                    continue;
+                }
                 if idle_fires_first {
                     tracing::warn!("idle timeout ({idle_timeout:?}) — no agent activity");
                     return Err(AcpError::IdleTimeout(idle_timeout));
@@ -1434,6 +2063,44 @@ impl AcpClient {
             let read_result = tokio::select! {
                 biased;
                 read_result = self.reader.next() => Some(read_result),
+                // Permission-answer arm: a UI's decision for the request the
+                // permission arm below registered. Gated on there being a
+                // pending request, so an answer that outlived its request (or
+                // one sent for a different turn) cannot be written. Settling
+                // never cancels the turn — the request is answered in place,
+                // which is exactly what the pool's control branch cannot do.
+                Some(answer) = async {
+                    match permission_rx.as_mut() {
+                        Some(rx) => rx.recv().await,
+                        None => None,
+                    }
+                }, if self.pending_permission.is_some() => {
+                    match self.settle_pending_permission(&answer).await {
+                        Ok(true) => tracing::info!(
+                            target: "acp::permission",
+                            nonce = answer.nonce,
+                            option_id = %answer.option_id,
+                            "permission request settled from the client answer"
+                        ),
+                        // A rejected answer leaves the request pending, so the
+                        // next answer (or the deadline) still settles it. Loud,
+                        // because a rejected click is otherwise invisible.
+                        Ok(false) => tracing::warn!(
+                            target: "acp::permission",
+                            nonce = answer.nonce,
+                            "permission answer did not settle the pending request — ignored"
+                        ),
+                        Err(error) => {
+                            tracing::error!(
+                                target: "acp::permission",
+                                nonce = answer.nonce,
+                                "failed to write the permission answer: {error}"
+                            );
+                            return Err(error);
+                        }
+                    }
+                    None
+                }
                 // Steer arm: gated off whenever a steer write is already in
                 // flight so we don't stack two writes against the same
                 // process. The `async { steer_rx.as_mut()?.recv().await }`
@@ -1532,6 +2199,69 @@ impl AcpClient {
                     // response or the steer response next.
                     None
                 }
+                // Exact-session config write (`session/set_config_option`).
+                // Validation happens here, before the write, so a rejected
+                // value leaves both the session and our projection untouched.
+                // Not gated on `pending_steer`: a config write is an ordinary
+                // JSON-RPC request with no withhold/ack protocol, so it can be
+                // written while a steer request is outstanding.
+                Some(request) = async {
+                    match config_rx.as_mut() {
+                        Some(rx) => rx.recv().await,
+                        None => None,
+                    }
+                } => {
+                    let SessionConfigRequest { category, value, ack_tx } = request;
+                    match self.resolve_category_config_id(category) {
+                        None => {
+                            let _ = ack_tx.send(Err(SessionConfigError::Unsupported {
+                                category: category.as_wire_str().to_string(),
+                            }));
+                        }
+                        Some(config_id) => {
+                            let offered = self.category_option_values(category);
+                            // An adapter that enumerates the option values gets
+                            // rejected here on anything outside the list, which
+                            // is the only way to prevent a silent clamp; one
+                            // that advertises no list is treated as open.
+                            if !offered.is_empty() && !offered.iter().any(|o| o == &value) {
+                                let _ = ack_tx.send(Err(SessionConfigError::InvalidValue {
+                                    value: value.clone(),
+                                    offered,
+                                }));
+                            } else {
+                                let id = self.next_id;
+                                self.next_id += 1;
+                                let msg = serde_json::json!({
+                                    "jsonrpc": "2.0",
+                                    "id": id,
+                                    "method": "session/set_config_option",
+                                    "params": {
+                                        "sessionId": session_id,
+                                        "configId": config_id,
+                                        "value": value,
+                                    },
+                                });
+                                tracing::debug!(
+                                    target: "acp::wire",
+                                    "→ {}",
+                                    serde_json::to_string(&msg).unwrap_or_default()
+                                );
+                                match self.write_ndjson(&msg).await {
+                                    Ok(()) => pending_configs.push((id, config_id, value, ack_tx)),
+                                    Err(e) => {
+                                        tracing::warn!(
+                                            "config write failed (configId={config_id}): {e}"
+                                        );
+                                        let _ = ack_tx.send(Err(SessionConfigError::Transport(e)));
+                                    }
+                                }
+                            }
+                        }
+                    }
+                    // No reader line consumed; loop to re-evaluate deadlines.
+                    None
+                }
                 _ = tokio::time::sleep_until(next_deadline) => {
                     // The pre-select check at the top of the next iteration
                     // would catch this anyway, but firing the deadline arm
@@ -1539,6 +2269,12 @@ impl AcpClient {
                     // round-trip when stdout is idle).
                     if let Some((_, _, ack_tx)) = pending_steer.take() {
                         let _ = ack_tx.send(crate::pool::SteerAck::PromptCompletedNeutral);
+                    }
+                    if permission_fires_first {
+                        // Same settlement as the pre-select check: the wakeup is
+                        // immediate here instead of one reader poll later.
+                        self.settle_expired_permission().await;
+                        continue;
                     }
                     if idle_fires_first {
                         tracing::warn!("idle timeout ({idle_timeout:?}) — no agent activity");
@@ -1618,6 +2354,43 @@ impl AcpClient {
                     // share the `no method` guard.
                     if let Some(id) = msg.get("id") {
                         if msg.get("method").is_none() {
+                            // Config writes first: they are keyed by their own
+                            // ids and must never be mistaken for the prompt
+                            // response, which would end the turn.
+                            if let Some(index) = pending_configs
+                                .iter()
+                                .position(|(config_id, ..)| *id == serde_json::json!(*config_id))
+                            {
+                                let (_, config_id, value, ack_tx) =
+                                    pending_configs.remove(index);
+                                let ack = match msg.get("error") {
+                                    Some(error) => Err(SessionConfigError::Rejected {
+                                        message: agent_error_message(error),
+                                    }),
+                                    None => {
+                                        tracing::info!(
+                                            target: "acp::config",
+                                            "adapter accepted configId={config_id} = {value:?} \
+                                             on session {session_id}"
+                                        );
+                                        // Adopt the adapter's refreshed options
+                                        // so the next validation reads the
+                                        // adapter's own statement of the
+                                        // running values, not our local guess.
+                                        if let Some(options) =
+                                            msg.pointer("/result/configOptions")
+                                        {
+                                            if !options.is_null() {
+                                                self.session_config_options =
+                                                    Some(options.clone());
+                                            }
+                                        }
+                                        Ok(msg["result"].clone())
+                                    }
+                                };
+                                let _ = ack_tx.send(ack);
+                                continue;
+                            }
                             if let Some((steer_id, _, _)) = pending_steer.as_ref() {
                                 if *id == serde_json::json!(*steer_id) {
                                     // Take the ack_tx out and route the
@@ -1754,7 +2527,8 @@ impl AcpClient {
                                 self.handle_goose_usage_update(&msg);
                             }
                             "session/request_permission" => {
-                                self.handle_permission_request(&msg).await?;
+                                let request = self.register_permission_request(&msg)?;
+                                self.open_permission_request(&request).await;
                             }
                             other => {
                                 // If the unknown message has an id, it's a request expecting a reply.
@@ -1979,90 +2753,293 @@ impl AcpClient {
         }
     }
 
-    /// Auto-approve a `session/request_permission` request from the agent.
+    /// Register a `session/request_permission` request as pending and return
+    /// the request that must be answered.
     ///
-    /// Finds the option with `kind == "allow_once"` and responds with its `optionId`.
-    /// If no `allow_once` option exists, falls back to `reject_once`.
+    /// This does **not** answer anything. The only answer paths are
+    /// [`Self::settle_pending_permission`] (the client's choice, validated)
+    /// against this request's own option list),
+    /// [`Self::settle_pending_permission_cancelled`] (the turn is stopping or
+    /// nobody could answer), and the read loop's answer/timeout arms. There is
+    /// no auto-allow fallback on any path, and a request that nobody answers
+    /// fails visibly rather than being approved.
     ///
-    /// **Critical:** Never hardcode `optionId` — always find it dynamically by `kind`.
+    /// The returned `PermissionRequest` carries a fresh `nonce`; an answer
+    /// quoting any other nonce is rejected, which is what makes a click that
+    /// outlived its request inert instead of an approval delivered to whatever
+    /// request next reuses the same connection-scoped JSON-RPC id.
     ///
-    /// The request `id` is stored as `serde_json::Value` to support both numeric
+    /// The request `id` is kept as `serde_json::Value` to support both numeric
     /// and string IDs per JSON-RPC 2.0.
-    async fn handle_permission_request(&mut self, msg: &serde_json::Value) -> Result<(), AcpError> {
-        // Extract id as a Value — JSON-RPC 2.0 allows both numeric and string IDs.
-        let id = msg
+    fn register_permission_request(
+        &mut self,
+        msg: &serde_json::Value,
+    ) -> Result<PermissionRequest, AcpError> {
+        // One request at a time: the agent blocks its tool call until it is
+        // answered, so a second concurrent request is a protocol violation.
+        // Overwriting the first would leave the agent waiting for a reply that
+        // never arrives, so this fails loudly instead of dropping it.
+        if self.pending_permission.is_some() {
+            return Err(AcpError::Protocol(
+                "session/request_permission received while another request is still pending".into(),
+            ));
+        }
+        let request_id = msg
             .get("id")
             .cloned()
             .ok_or_else(|| AcpError::Protocol("permission request missing id".into()))?;
 
-        // Store pending permission id so cancel_with_cleanup can respond to it.
-        self.pending_permission_id = Some(id.clone());
-        // Mark as not yet responded — guards against double-response race.
-        self.permission_responded = false;
-
-        let options = msg["params"]["options"]
+        let params = &msg["params"];
+        let options: Vec<PermissionOption> = params["options"]
             .as_array()
-            .ok_or_else(|| AcpError::Protocol("permission request missing options".into()))?;
+            .ok_or_else(|| AcpError::Protocol("permission request missing options".into()))?
+            .iter()
+            .filter_map(|option| {
+                Some(PermissionOption {
+                    option_id: option.get("optionId")?.as_str()?.to_string(),
+                    kind: option.get("kind")?.as_str()?.to_string(),
+                    name: option.get("name").and_then(|n| n.as_str()).map(str::to_string),
+                })
+            })
+            .collect();
+
+        let request = PermissionRequest {
+            nonce: self.next_permission_nonce,
+            request_id,
+            session_id: params
+                .get("sessionId")
+                .and_then(|s| s.as_str())
+                .unwrap_or_default()
+                .to_string(),
+            tool_call_id: params
+                .get("toolCallId")
+                .or_else(|| params.get("tool_call_id"))
+                .and_then(|t| t.as_str())
+                .map(str::to_string),
+            title: params
+                .get("title")
+                .or_else(|| params.get("message"))
+                .or_else(|| params.get("reason"))
+                .and_then(|t| t.as_str())
+                .map(str::to_string),
+            options,
+        };
+        self.next_permission_nonce += 1;
 
         tracing::debug!(
             target: "acp::permission",
-            "session/request_permission id={id}, {} options",
-            options.len()
+            nonce = request.nonce,
+            request_id = %request.request_id,
+            session_id = %request.session_id,
+            options = request.options.len(),
+            "session/request_permission received — awaiting an answer"
         );
 
-        // Find allow_once by kind — NEVER hardcode optionId.
-        let allow_once = options
-            .iter()
-            .find(|opt| opt.get("kind").and_then(|k| k.as_str()) == Some("allow_once"));
+        self.pending_permission = Some(request.clone());
+        Ok(request)
+    }
 
-        let response = if let Some(opt) = allow_once {
-            let option_id = opt["optionId"]
-                .as_str()
-                .ok_or_else(|| AcpError::Protocol("allow_once option missing optionId".into()))?;
-            tracing::info!(
-                target: "acp::permission",
-                "auto-approving permission id={id} with allow_once optionId={option_id:?}"
-            );
-            permission_response_selected(&id, option_id)
-        } else {
-            // No allow_once — fall back to reject_once.
+    /// Announce a just-registered request and arm its answer deadline.
+    ///
+    /// Called immediately after [`Self::register_permission_request`]. An
+    /// attached observer is what makes the request answerable, so that is also
+    /// the condition for announcing it; either way the deadline is armed, so a
+    /// request nobody answers settles `cancelled` instead of holding the turn
+    /// open or — as before S1 — being approved by the harness itself.
+    async fn open_permission_request(&mut self, request: &PermissionRequest) {
+        if self.observer.is_none() {
+            // Nobody can answer this. Waiting would only stall the tool call
+            // for the whole deadline, so settle it now — `cancelled` refuses
+            // the call, which is the only honest outcome when the deployment
+            // has no approval surface at all.
             tracing::warn!(
                 target: "acp::permission",
-                "no allow_once option found in permission request id={id}, falling back to reject_once"
+                nonce = request.nonce,
+                request_id = %request.request_id,
+                session_id = %request.session_id,
+                "no observer attached to answer this permission request — \
+                 settling cancelled instead of leaving the tool call waiting"
             );
-            let reject = options
-                .iter()
-                .find(|opt| opt.get("kind").and_then(|k| k.as_str()) == Some("reject_once"));
-
-            if let Some(opt) = reject {
-                let option_id = opt["optionId"].as_str().unwrap_or("reject");
-                permission_response_selected(&id, option_id)
-            } else {
-                return Err(AcpError::Protocol(
-                    "no suitable permission option found (neither allow_once nor reject_once)"
-                        .into(),
-                ));
+            self.permission_deadline = None;
+            if let Err(error) = self.settle_pending_permission_cancelled().await {
+                tracing::error!(
+                    target: "acp::permission",
+                    nonce = request.nonce,
+                    "failed to write the cancelled outcome for an unanswerable request: {error}"
+                );
             }
-        };
+            return;
+        }
+        self.permission_deadline = Some(tokio::time::Instant::now() + PERMISSION_ANSWER_TIMEOUT);
+        self.announce_permission_request(request);
+    }
 
-        // Write the response first, then mark as responded.
-        //
-        // Previous ordering (flag-before-write) was intended to guard against a
-        // double-response if a timeout fires between write and flag-set. However,
-        // the deadlock risk is worse: if write_ndjson fails (e.g. WriteTimeout),
-        // the flag would be true but no response was actually sent. Then
-        // cancel_with_cleanup would see permission_responded=true, skip sending
-        // the cancelled outcome, and the agent would hang waiting for a reply
-        // that never arrives — a guaranteed deadlock.
-        //
-        // The correct fix: set the flag AFTER a successful write. The double-
-        // response window (between write completion and flag-set) is negligibly
-        // small and bounded by a single memory store; the deadlock window was
-        // unbounded.
-        self.write_ndjson(&response).await?;
-        self.permission_responded = true;
-        self.pending_permission_id = None;
-        Ok(())
+    /// Settle an outstanding permission request whose answer deadline passed.
+    ///
+    /// `cancelled` is ACP's own "no decision" outcome, so the tool call is
+    /// refused rather than approved and the turn keeps running. Logged loudly:
+    /// an expired approval is a client that did not answer, and that is not a
+    /// state the operator should have to infer from a failed tool call.
+    async fn settle_expired_permission(&mut self) {
+        let Some(request) = self.pending_permission.as_ref() else {
+            // Nothing outstanding — the deadline was stale. Clear it so it
+            // cannot keep firing.
+            self.permission_deadline = None;
+            return;
+        };
+        let (nonce, request_id, title) = (
+            request.nonce,
+            request.request_id.clone(),
+            request.title.clone(),
+        );
+        tracing::warn!(
+            target: "acp::permission",
+            nonce,
+            request_id = %request_id,
+            title = title.as_deref().unwrap_or("<untitled>"),
+            "no answer to the permission request before its deadline — settling cancelled"
+        );
+        if let Err(error) = self.settle_pending_permission_cancelled().await {
+            tracing::error!(
+                target: "acp::permission",
+                nonce,
+                "failed to write the cancelled outcome for an expired permission request: {error}"
+            );
+        }
+        self.permission_deadline = None;
+    }
+
+    /// Settle the pending permission request with the client's answer.
+    ///
+    /// Returns `Ok(true)` when this answer was the request's one terminal
+    /// outcome and has been written to the agent. Returns `Ok(false)` when the
+    /// answer addressed nothing — no request pending, a nonce mismatch (a stale
+    /// or replayed answer), or an `option_id` this request never advertised —
+    /// in which case **nothing is written** and the pending request is left
+    /// exactly as it was, so the real answer can still settle it.
+    ///
+    /// Taking the state is what makes settlement once-only: a duplicate answer
+    /// arrives to find `None` and is rejected rather than applied.
+    pub async fn settle_pending_permission(
+        &mut self,
+        answer: &PermissionAnswer,
+    ) -> Result<bool, AcpError> {
+        let Some(request) = self.pending_permission.take() else {
+            tracing::warn!(
+                target: "acp::permission",
+                nonce = answer.nonce,
+                "permission answer rejected: no request pending"
+            );
+            return Ok(false);
+        };
+        if request.nonce != answer.nonce {
+            // Hand the request back untouched: this answer belongs to a
+            // different (earlier) request and must not settle this one.
+            tracing::warn!(
+                target: "acp::permission",
+                answer_nonce = answer.nonce,
+                pending_nonce = request.nonce,
+                "permission answer rejected: nonce does not match the pending request"
+            );
+            self.pending_permission = Some(request);
+            return Ok(false);
+        }
+        if !request
+            .options
+            .iter()
+            .any(|option| option.option_id == answer.option_id)
+        {
+            tracing::warn!(
+                target: "acp::permission",
+                nonce = answer.nonce,
+                option_id = %answer.option_id,
+                "permission answer rejected: optionId was not offered on this request"
+            );
+            self.pending_permission = Some(request);
+            return Ok(false);
+        }
+
+        let response = permission_response_selected(&request.request_id, &answer.option_id);
+        tracing::info!(
+            target: "acp::permission",
+            nonce = answer.nonce,
+            request_id = %request.request_id,
+            option_id = %answer.option_id,
+            "permission request settled with the answered option"
+        );
+        // Write before declaring settled: if the write fails there is no answer
+        // on the wire, and the request must stay answerable rather than leave
+        // the agent waiting for a reply that never arrives.
+        match self.write_ndjson(&response).await {
+            Ok(()) => Ok(true),
+            Err(error) => {
+                self.pending_permission = Some(request);
+                Err(error)
+            }
+        }
+    }
+
+    /// Settle the pending permission request with ACP's `cancelled` outcome.
+    ///
+    /// Used on every path where the request will never receive a decision: the
+    /// turn is being stopped, the answer deadline expired, or no prompter is
+    /// installed to answer it. Like [`Self::settle_pending_permission`] this is
+    /// once-only — the state is taken, so a later answer finds nothing
+    /// pending and is rejected instead of being written on top of this outcome.
+    ///
+    /// Returns `Ok(false)` when no request was pending.
+    pub async fn settle_pending_permission_cancelled(&mut self) -> Result<bool, AcpError> {
+        let Some(request) = self.pending_permission.take() else {
+            return Ok(false);
+        };
+        let response = permission_response_cancelled(&request.request_id);
+        tracing::info!(
+            target: "acp::permission",
+            nonce = request.nonce,
+            request_id = %request.request_id,
+            session_id = %request.session_id,
+            "permission request settled cancelled"
+        );
+        match self.write_ndjson(&response).await {
+            Ok(()) => Ok(true),
+            Err(error) => {
+                self.pending_permission = Some(request);
+                Err(error)
+            }
+        }
+    }
+
+    /// Announce the pending permission request on the observer feed so a client
+    /// UI can render an answerable prompt.
+    ///
+    /// Emitted as its own kind (`permission_request`) rather than inferred from
+    /// the raw `acp_read` frame, for the same reason `control_result` exists:
+    /// the nonce is the identity a UI must echo back, and only this side knows
+    /// it. The raw frame cannot carry it, so a client that reused the JSON-RPC
+    /// id alone could answer a later request that reuses the same id.
+    fn announce_permission_request(&self, request: &PermissionRequest) {
+        let options: Vec<serde_json::Value> = request
+            .options
+            .iter()
+            .map(|option| {
+                serde_json::json!({
+                    "optionId": option.option_id,
+                    "kind": option.kind,
+                    "name": option.name,
+                })
+            })
+            .collect();
+        self.observe(
+            "permission_request",
+            serde_json::json!({
+                "nonce": request.nonce,
+                "requestId": request.request_id,
+                "sessionId": request.session_id,
+                "toolCallId": request.tool_call_id,
+                "title": request.title,
+                "options": options,
+            }),
+        );
     }
 
     /// Parse a completed prompt response and retain its optional per-turn usage.
@@ -2108,6 +3085,26 @@ fn build_prompt_params(session_id: &str, prompt_blocks: &[&str]) -> serde_json::
         "prompt": blocks,
     })
 }
+/// Build `session/prompt` params from mixed text and image content blocks.
+fn build_prompt_content_params(
+    session_id: &str,
+    prompt_blocks: &[PromptContentBlock<'_>],
+) -> serde_json::Value {
+    let blocks: Vec<serde_json::Value> = prompt_blocks
+        .iter()
+        .map(|block| match block {
+            PromptContentBlock::Text(text) => serde_json::json!({ "type": "text", "text": text }),
+            PromptContentBlock::Image { data, mime_type } => {
+                serde_json::json!({ "type": "image", "data": data, "mimeType": mime_type })
+            }
+        })
+        .collect();
+    serde_json::json!({
+        "sessionId": session_id,
+        "prompt": blocks,
+    })
+}
+
 
 /// Build `_goose/unstable/session/steer` params from one or more text
 /// content blocks plus the freshest `expectedRunId`.
@@ -2669,6 +3666,324 @@ mod tests {
         assert_eq!(prompt[0]["text"].as_str(), Some("/goal ship it"));
         assert!(prompt[0]["text"].as_str().unwrap().starts_with('/'));
         assert_eq!(prompt[1]["type"].as_str(), Some("text"));
+    }
+
+    #[test]
+    fn session_prompt_mixed_blocks_preserve_slash_command_and_serialize_image() {
+        let params = build_prompt_content_params(
+            "sess_abc123",
+            &[
+                PromptContentBlock::Text("/goal ship it"),
+                PromptContentBlock::Text("[Buzz event]\nContent: attached image"),
+                PromptContentBlock::Image {
+                    data: "aW1n",
+                    mime_type: "image/png",
+                },
+            ],
+        );
+        let prompt = params["prompt"].as_array().unwrap();
+        assert_eq!(prompt.len(), 3);
+        assert_eq!(
+            prompt[0],
+            serde_json::json!({ "type": "text", "text": "/goal ship it" })
+        );
+        assert!(
+            prompt[0]["text"]
+                .as_str()
+                .unwrap()
+                .starts_with('/'),
+            "slash-command detection must continue to see the first text block"
+        );
+        assert_eq!(
+            prompt[1],
+            serde_json::json!({
+                "type": "text",
+                "text": "[Buzz event]\nContent: attached image"
+            })
+        );
+        assert_eq!(
+            prompt[2],
+            serde_json::json!({
+                "type": "image",
+                "data": "aW1n",
+                "mimeType": "image/png"
+            })
+        );
+    }
+
+    // ── permission resolution semantics (S1) ──────────────────────────────
+    //
+    // These pin the properties the auto-answer violated: an answer resolves a
+    // request at most once, only against the request it names, and never by
+    // falling back to approval.
+
+    /// Build the wire request a real omp adapter sends. Option ids are
+    /// deliberately non-obvious, because the harness must never invent one.
+    fn permission_request_msg(nonce_id: u64) -> serde_json::Value {
+        serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": nonce_id,
+            "method": "session/request_permission",
+            "params": {
+                "sessionId": "sess-perm",
+                "toolCallId": "tool-1",
+                "title": "rm -rf /tmp/x",
+                "options": [
+                    { "optionId": "opt-allow-99", "kind": "allow_once", "name": "Allow once" },
+                    { "optionId": "opt-always-7", "kind": "allow_always", "name": "Always allow" },
+                    { "optionId": "opt-reject-42", "kind": "reject_once", "name": "Reject" }
+                ]
+            }
+        })
+    }
+
+    async fn client_with_script(script: &str) -> AcpClient {
+        spawn_script(script).await
+    }
+
+    #[tokio::test]
+    async fn permission_answer_settles_once_and_echoes_the_offered_option() {
+        // `sleep` keeps the child's stdin open long enough to observe the write.
+        let mut client = client_with_script("sleep 5").await;
+        let request = client
+            .register_permission_request(&permission_request_msg(7))
+            .expect("register");
+        assert_eq!(request.options.len(), 3);
+        assert_eq!(request.tool_call_id.as_deref(), Some("tool-1"));
+        assert!(client.has_pending_permission());
+
+        let answer = PermissionAnswer {
+            nonce: request.nonce,
+            // The always-allow id: never hardcoded, echoed from the request.
+            option_id: "opt-always-7".to_string(),
+        };
+        assert_eq!(client.settle_pending_permission(&answer).await.unwrap(), true);
+        assert!(
+            !client.has_pending_permission(),
+            "the request must be gone after it was settled"
+        );
+
+        // Exactly-once: the same answer a second time addresses nothing.
+        assert_eq!(client.settle_pending_permission(&answer).await.unwrap(), false);
+    }
+
+    #[tokio::test]
+    async fn permission_answer_with_a_stale_nonce_is_rejected_and_leaves_the_request() {
+        let mut client = client_with_script("sleep 5").await;
+        let request = client
+            .register_permission_request(&permission_request_msg(7))
+            .expect("register");
+
+        // A click that outlived its request: same JSON-RPC id, earlier nonce.
+        let stale = PermissionAnswer {
+            nonce: request.nonce + 1,
+            option_id: "opt-allow-99".to_string(),
+        };
+        assert_eq!(client.settle_pending_permission(&stale).await.unwrap(), false);
+        assert!(
+            client.has_pending_permission(),
+            "a rejected answer must leave the real request answerable"
+        );
+
+        // The real answer still works — rejection is not a dead end.
+        let real = PermissionAnswer {
+            nonce: request.nonce,
+            option_id: "opt-allow-99".to_string(),
+        };
+        assert_eq!(client.settle_pending_permission(&real).await.unwrap(), true);
+    }
+
+    #[tokio::test]
+    async fn permission_answer_with_an_unoffered_option_is_rejected() {
+        let mut client = client_with_script("sleep 5").await;
+        let request = client
+            .register_permission_request(&permission_request_msg(7))
+            .expect("register");
+
+        let fabricated = PermissionAnswer {
+            nonce: request.nonce,
+            option_id: "opt-allow-always-silently".to_string(),
+        };
+        assert_eq!(
+            client.settle_pending_permission(&fabricated).await.unwrap(),
+            false
+        );
+        assert!(client.has_pending_permission());
+
+        // `optionId` is echoed from the request, never synthesised: the formats
+        // assertion below proves the echoed value reaches the wire verbatim.
+        let real = PermissionAnswer {
+            nonce: request.nonce,
+            option_id: "opt-reject-42".to_string(),
+        };
+        assert_eq!(client.settle_pending_permission(&real).await.unwrap(), true);
+    }
+
+    #[tokio::test]
+    async fn second_concurrent_permission_request_is_a_protocol_error() {
+        let mut client = client_with_script("sleep 5").await;
+        client
+            .register_permission_request(&permission_request_msg(7))
+            .expect("register");
+        // Overwriting the first would leave the agent waiting forever, so this
+        // must fail loudly instead of silently dropping a request.
+        assert!(client
+            .register_permission_request(&permission_request_msg(8))
+            .is_err());
+        assert!(client.has_pending_permission());
+    }
+
+    #[tokio::test]
+    async fn cancel_settles_a_pending_permission_and_clears_it() {
+        let script = r#"
+            echo '{"jsonrpc":"2.0","id":1,"method":"session/request_permission","params":{"sessionId":"sess-perm","toolCallId":"t1","options":[{"optionId":"o1","kind":"allow_once"}]}}'
+            read -t 5 _reply
+            echo '{"jsonrpc":"2.0","id":1,"result":{"stopReason":"cancelled"}}'
+            sleep 2
+        "#;
+        let mut client = client_with_script(script).await;
+        client.last_prompt_id = Some(1);
+        let result = client
+            .cancel_with_cleanup_grace("sess-perm", std::time::Duration::from_secs(5))
+            .await;
+        assert!(matches!(result, Ok(StopReason::Cancelled)), "got {result:?}");
+        assert!(
+            !client.has_pending_permission(),
+            "a stopped turn must leave no pending request behind"
+        );
+    }
+
+    /// The read loop, not the caller, must write the answer: this is the whole
+    /// reason an answer channel exists instead of a pool-side write. The child
+    /// echoes back the exact NDJSON line it received, so the assertion is on
+    /// wire bytes rather than on in-process state.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn read_loop_writes_the_answered_option_for_the_same_request() {
+        let capture = std::env::temp_dir().join(format!(
+            "buzz-acp-permission-answer-{}",
+            uuid::Uuid::new_v4()
+        ));
+        let quoted = capture.to_string_lossy().to_string();
+        let script = format!(
+            r#"
+            echo '{{"jsonrpc":"2.0","id":1,"method":"session/request_permission","params":{{"sessionId":"sess-perm","toolCallId":"t1","options":[{{"optionId":"opt-allow-99","kind":"allow_once"}},{{"optionId":"opt-always-7","kind":"allow_always"}}]}}}}'
+            read -t 5 reply
+            printf '%s
+' "$reply" > '{quoted}'
+            echo '{{"jsonrpc":"2.0","id":999,"result":{{"stopReason":"end_turn"}}}}'
+            sleep 1
+            "#
+        );
+        let mut client = client_with_script(&script).await;
+        client.set_observer(Some(crate::observer::ObserverHandle::in_process()), 0);
+
+        // The answer is queued before the loop starts. It cannot be consumed
+        // early: the select arm is gated on a request being pending.
+        let (tx, rx) = tokio::sync::mpsc::channel::<PermissionAnswer>(1);
+        client.install_permission_answer_rx(rx);
+        tx.send(PermissionAnswer {
+            nonce: 1,
+            option_id: "opt-always-7".to_string(),
+        })
+        .await
+        .expect("queue the answer");
+
+        let max_dur = std::time::Duration::from_secs(10);
+        let result = client
+            .read_until_response_with_idle_timeout(
+                "sess-perm",
+                999,
+                std::time::Duration::from_secs(5),
+                tokio::time::Instant::now() + max_dur,
+                max_dur,
+            )
+            .await;
+        assert!(result.is_ok(), "prompt must complete: {result:?}");
+
+        let written = std::fs::read_to_string(&capture).expect("child captured the answer");
+        let parsed: serde_json::Value =
+            serde_json::from_str(written.trim()).expect("answer is one NDJSON line");
+        assert_eq!(parsed["id"], serde_json::json!(1), "same JSON-RPC id");
+        assert_eq!(parsed["result"]["outcome"]["outcome"], "selected");
+        assert_eq!(
+            parsed["result"]["outcome"]["optionId"],
+            "opt-always-7",
+            "the answered option id must reach the wire verbatim"
+        );
+        assert!(
+            !client.has_pending_permission(),
+            "the request is settled once the answer is written"
+        );
+        let _ = std::fs::remove_file(&capture);
+    }
+
+    /// With no observer there is no approval surface, so the request must be
+    /// refused promptly rather than holding the tool call for the deadline.
+    /// This is the path that replaces the old auto-`allow_once`.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn read_loop_settles_cancelled_when_nothing_can_answer() {
+        let capture = std::env::temp_dir().join(format!(
+            "buzz-acp-permission-unanswerable-{}",
+            uuid::Uuid::new_v4()
+        ));
+        let quoted = capture.to_string_lossy().to_string();
+        let script = format!(
+            r#"
+            echo '{{"jsonrpc":"2.0","id":1,"method":"session/request_permission","params":{{"sessionId":"sess-perm","toolCallId":"t1","options":[{{"optionId":"opt-allow-99","kind":"allow_once"}}]}}}}'
+            read -t 5 reply
+            printf '%s
+' "$reply" > '{quoted}'
+            echo '{{"jsonrpc":"2.0","id":999,"result":{{"stopReason":"end_turn"}}}}'
+            sleep 1
+            "#
+        );
+        let mut client = client_with_script(&script).await;
+        let max_dur = std::time::Duration::from_secs(10);
+        let result = client
+            .read_until_response_with_idle_timeout(
+                "sess-perm",
+                999,
+                std::time::Duration::from_secs(5),
+                tokio::time::Instant::now() + max_dur,
+                max_dur,
+            )
+            .await;
+        assert!(result.is_ok(), "prompt must complete: {result:?}");
+
+        let written = std::fs::read_to_string(&capture).expect("child captured the outcome");
+        let parsed: serde_json::Value =
+            serde_json::from_str(written.trim()).expect("one NDJSON line");
+        assert_eq!(
+            parsed["result"]["outcome"]["outcome"], "cancelled",
+            "an unanswerable request must be refused, never approved"
+        );
+        assert!(
+            parsed["result"]["outcome"].get("optionId").is_none(),
+            "a cancelled outcome carries no option"
+        );
+        let _ = std::fs::remove_file(&capture);
+    }
+
+    /// An answer arriving for a turn whose request already settled must not be
+    /// written, even though the receiver is still installed.
+    #[tokio::test]
+    async fn answer_after_settlement_writes_nothing() {
+        let mut client = client_with_script("sleep 5").await;
+        let request = client
+            .register_permission_request(&permission_request_msg(7))
+            .expect("register");
+        client
+            .settle_pending_permission_cancelled()
+            .await
+            .expect("cancel the request");
+        let late = PermissionAnswer {
+            nonce: request.nonce,
+            option_id: "opt-allow-99".to_string(),
+        };
+        assert_eq!(client.settle_pending_permission(&late).await.unwrap(), false);
+        assert!(!client.has_pending_permission());
     }
 
     #[test]
@@ -3459,6 +4774,30 @@ mod tests {
             .await;
         assert!(result.is_ok(), "expected Ok, got {result:?}");
         assert_eq!(result.unwrap()["worked"], serde_json::json!(true));
+    }
+    #[tokio::test]
+    async fn session_list_hides_raw_rpc_frames_from_observer() {
+        let script = r#"
+            read -t 2 _request
+            echo '{"jsonrpc":"2.0","id":0,"result":{"sessions":[{"sessionId":"one","cwd":"/private/work"}]}}'
+            sleep 1
+        "#;
+        let mut client = spawn_script(script).await;
+        let observer = crate::observer::ObserverHandle::in_process();
+        client.set_observer(Some(observer.clone()), 0);
+
+        let result = client
+            .session_list("/private/work")
+            .await
+            .expect("session/list response");
+
+        assert_eq!(result["sessions"][0]["cwd"], "/private/work");
+        assert!(
+            observer.snapshot().iter().all(|event| {
+                event.kind != "acp_write" && event.kind != "acp_read"
+            }),
+            "lifecycle request and response frames must not be published"
+        );
     }
 
     #[tokio::test]

@@ -22,7 +22,7 @@ use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::Arc;
 use std::time::Duration;
 
-use acp::{AcpClient, EnvVar, McpServer};
+use acp::{AcpClient, EnvVar, McpServer, PermissionAnswer};
 use anyhow::{ensure, Context, Result};
 use buzz_core::kind::{
     KIND_MEMBER_ADDED_NOTIFICATION, KIND_MEMBER_REMOVED_NOTIFICATION, KIND_STREAM_MESSAGE,
@@ -41,7 +41,8 @@ use filter::SubscriptionRule;
 use futures_util::FutureExt;
 use nostr::{PublicKey, ToBech32};
 use pool::{
-    AgentCommandResult, AgentCommandTarget, AgentPool, ControlSignal, IdleSwitchResult, OwnedAgent,
+    AgentCommandResult, AgentCommandTarget, AgentConfigReturn, AgentPool,
+    AgentSessionLifecycleResult, ConfigRouteOutcome, ControlSignal, IdleSwitchResult, OwnedAgent,
     PromptContext, PromptOutcome, PromptResult, PromptSource, SessionState, TimeoutKind,
 };
 use pool_lifecycle::PoolLifecycle;
@@ -1571,6 +1572,7 @@ fn handle_relay_observer_control_event(
     owner_pubkey_hex: &str,
     event_publisher: RelayEventPublisher,
     config: &Config,
+    prompt_context: &PromptContext,
 ) {
     // Defense-in-depth: verify signature even though the relay already checked.
     if let Err(e) = buzz_core::verify_event(&event) {
@@ -1616,8 +1618,17 @@ fn handle_relay_observer_control_event(
         Some("switch_model") => {
             handle_switch_model_control(&payload, pool, observer);
         }
+        Some("session_lifecycle") => {
+            handle_session_lifecycle_control(&payload, pool, observer, prompt_context);
+        }
         Some("dispatch_command") => {
             handle_dispatch_command_control(&payload, pool, observer, &config);
+        }
+        Some("permission_response") => {
+            handle_permission_response_control(&payload, pool, observer);
+        }
+        Some("set_session_config") => {
+            handle_set_session_config_control(&payload, pool, observer);
         }
         Some("publish_project_owner_announcements") => {
             handle_publish_project_owner_announcements_control(
@@ -1631,6 +1642,115 @@ fn handle_relay_observer_control_event(
             tracing::debug!(payload = %payload, "ignoring unknown observer control frame");
         }
     }
+}
+
+/// Handle a `permission_response` control frame (S1).
+///
+/// The target is the tuple **(ACP session id, request nonce, optionId)**. The
+/// nonce is what makes this safe: JSON-RPC ids are connection-scoped and get
+/// reused after a respawn, so a replayed frame keyed only on the request id
+/// could approve a *later* request that happens to reuse it. The client echoes
+/// the nonce it received on the `permission_request` observer frame, and the
+/// read loop rejects a mismatch.
+///
+/// Delivery goes through the in-flight task's own answer channel — never
+/// `control_tx`, whose branch cancels the turn. Every failure is reported as a
+/// `control_result`; nothing about a permission reply is dropped silently,
+/// because the operator is waiting on the outcome of their own click.
+fn handle_permission_response_control(
+    payload: &serde_json::Value,
+    pool: &mut AgentPool,
+    observer: Option<&observer::ObserverHandle>,
+) {
+    let request_id = payload
+        .get("requestId")
+        .and_then(|value| value.as_str())
+        .filter(|value| !value.trim().is_empty())
+        .unwrap_or_default()
+        .to_string();
+    let session_id = payload
+        .get("sessionId")
+        .and_then(|value| value.as_str())
+        .filter(|value| !value.trim().is_empty())
+        .map(str::to_string);
+    let option_id = payload
+        .get("optionId")
+        .and_then(|value| value.as_str())
+        .filter(|value| !value.trim().is_empty())
+        .map(str::to_string);
+    // The nonce is `u64` and must survive the relay as a JSON number; a float
+    // or a string would silently address a different request, so both are
+    // rejected rather than coerced.
+    let nonce = payload.get("nonce").and_then(serde_json::Value::as_u64);
+
+    let (Some(session_id), Some(option_id), Some(nonce)) = (session_id, option_id, nonce) else {
+        emit_permission_response_result(
+            observer,
+            &request_id,
+            None,
+            "error",
+            Some("permission_response requires sessionId, nonce and optionId"),
+        );
+        return;
+    };
+
+    let answer = PermissionAnswer { nonce, option_id };
+    match pool.send_permission_answer(&session_id, answer) {
+        Ok(()) => emit_permission_response_result(
+            observer,
+            &request_id,
+            Some(&session_id),
+            "sent",
+            None,
+        ),
+        Err(error) => {
+            let status = match error {
+                crate::pool::PermissionAnswerError::UnknownSession => "unknown_session",
+                crate::pool::PermissionAnswerError::NoActiveTurn => "no_active_request",
+                crate::pool::PermissionAnswerError::NotAnswerable => "not_answerable",
+                crate::pool::PermissionAnswerError::Undeliverable(_) => "undeliverable",
+            };
+            emit_permission_response_result(
+                observer,
+                &request_id,
+                Some(&session_id),
+                status,
+                Some(&error.to_string()),
+            );
+        }
+    }
+}
+
+fn emit_permission_response_result(
+    observer: Option<&observer::ObserverHandle>,
+    request_id: &str,
+    session_id: Option<&str>,
+    status: &str,
+    error: Option<&str>,
+) {
+    let Some(observer) = observer else {
+        return;
+    };
+    let mut frame = serde_json::json!({
+        "type": "permission_response",
+        "requestId": request_id,
+        "sessionId": session_id,
+        "status": status,
+    });
+    if let Some(error) = error {
+        frame["error"] = serde_json::Value::String(error.to_string());
+    }
+    observer.emit(
+        "control_result",
+        None,
+        &observer::ObserverContext {
+            channel_id: None,
+            session_id: session_id.map(str::to_string),
+            turn_id: None,
+            started_at: None,
+        },
+        frame,
+    );
 }
 
 fn handle_dispatch_command_control(
@@ -1751,6 +1871,561 @@ fn handle_dispatch_command_control(
         Some(scope.channel_id()),
         None,
         None,
+    );
+}
+
+/// Handle a `set_session_config` control frame — the exact-session selector
+/// write used by the per-conversation mode/model/thinking picker.
+///
+/// This is deliberately NOT `switch_model`. That frame is channel-addressed and
+/// its two paths both destroy the session (the idle path sets `desired_model`
+/// and invalidates; the busy path cancels, invalidates and requeues), which is
+/// the opposite of a one-off selector change. This arm is session-addressed and
+/// mutates the live session in place through `session/set_config_option`: no
+/// agent-level model state is touched, no session is invalidated, no prompt is
+/// cancelled, and a sibling session in the same process is unaffected.
+///
+/// Addressing mirrors `dispatch_command`: the client-supplied `sessionId` is
+/// only a lookup key, the scope is resolved from the pool's own maps, and an id
+/// that no longer resolves is refused with `stale_session` rather than retried.
+fn handle_set_session_config_control(
+    payload: &serde_json::Value,
+    pool: &mut AgentPool,
+    observer: Option<&observer::ObserverHandle>,
+) {
+    let request_id = payload
+        .get("requestId")
+        .and_then(|value| value.as_str())
+        .filter(|value| !value.trim().is_empty())
+        .unwrap_or_default()
+        .to_string();
+    let session_id = payload
+        .get("sessionId")
+        .and_then(|value| value.as_str())
+        .filter(|value| !value.trim().is_empty())
+        .map(str::to_string);
+    let category_raw = payload
+        .get("category")
+        .and_then(|value| value.as_str())
+        .unwrap_or_default();
+    let value = payload
+        .get("value")
+        .and_then(|value| value.as_str())
+        .map(str::to_string);
+
+    let Some(session_id) = session_id else {
+        emit_set_session_config_result(
+            observer,
+            &request_id,
+            None,
+            "error",
+            None,
+            Some("missing sessionId"),
+        );
+        return;
+    };
+    let Some(category) = crate::acp::ConfigCategory::parse(category_raw) else {
+        // An unknown category is refused loudly; treating it as "no selector
+        // named that" would let a desktop typo look like a successful no-op.
+        emit_set_session_config_result(
+            observer,
+            &request_id,
+            Some(&session_id),
+            "error",
+            None,
+            Some(&format!("unknown category: {category_raw}")),
+        );
+        return;
+    };
+    let Some(value) = value.filter(|v| !v.trim().is_empty()) else {
+        emit_set_session_config_result(
+            observer,
+            &request_id,
+            Some(&session_id),
+            "error",
+            None,
+            Some("missing value"),
+        );
+        return;
+    };
+
+    let route = match pool.route_session_config(&session_id, category, value.clone()) {
+        Ok(route) => route,
+        Err(AgentCommandTarget::Ambiguous) => {
+            emit_set_session_config_result(
+                observer,
+                &request_id,
+                Some(&session_id),
+                "ambiguous_target",
+                None,
+                None,
+            );
+            return;
+        }
+        Err(AgentCommandTarget::ActiveTurn) => {
+            emit_set_session_config_result(
+                observer,
+                &request_id,
+                Some(&session_id),
+                "active_turn",
+                None,
+                None,
+            );
+            return;
+        }
+        Err(AgentCommandTarget::StaleSession) => {
+            emit_set_session_config_result(
+                observer,
+                &request_id,
+                Some(&session_id),
+                "stale_session",
+                None,
+                None,
+            );
+            return;
+        }
+    };
+
+    match route {
+        // Busy: the in-flight turn's read loop writes it and resolves the ack.
+        // The result frame is emitted from a watcher so the main loop is never
+        // blocked on a selector write.
+        ConfigRouteOutcome::Busy { ack_rx } => {
+            let observer = observer.cloned();
+            let request_id = request_id.clone();
+            let session_id_for_task = session_id.clone();
+            let category_for_task = category;
+            tokio::spawn(async move {
+                let (status, error) = match ack_rx.await {
+                    Ok(Ok(_)) => ("applied", None),
+                    Ok(Err(failure)) => ("rejected", Some(failure.to_string())),
+                    // The sender dropped without answering: the turn ended mid-write
+                    // (or the client was respawned). Report it rather than hang.
+                    Err(_) => ("turn_ended", Some("no reply from the session".to_string())),
+                };
+                emit_set_session_config_result(
+                    observer.as_ref(),
+                    &request_id,
+                    Some(&session_id_for_task),
+                    status,
+                    Some(category_for_task),
+                    error.as_deref(),
+                );
+            });
+        }
+        // Idle: apply against the checked-out worker, then hand it back so the
+        // pool reclaims the slot. This path is why `route_session_config`
+        // checks the worker out instead of borrowing it.
+        ConfigRouteOutcome::Idle {
+            mut agent,
+            scope,
+            category: idle_category,
+            value: idle_value,
+        } => {
+            let return_tx = pool.config_return_tx();
+            let observer = observer.cloned();
+            let request_id = request_id.clone();
+            let session_id_for_task = session_id.clone();
+            let channel_id = scope.channel_id();
+            agent.acp.set_observer_context(observer::ObserverContext {
+                channel_id: Some(channel_id.to_string()),
+                session_id: Some(session_id_for_task.clone()),
+                turn_id: None,
+                started_at: Some(chrono::Utc::now().to_rfc3339()),
+            });
+            tokio::spawn(async move {
+                let category = idle_category;
+                let outcome = agent
+                    .acp
+                    .session_apply_config_option(&session_id_for_task, category, &idle_value)
+                    .await;
+                // Hand the worker back FIRST: failing to answer the caller must
+                // not also cost the pool its slot.
+                let _ = return_tx.send(AgentConfigReturn { agent });
+                let (status, error) = match outcome {
+                    Ok(_) => ("applied", None),
+                    Err(failure) => ("rejected", Some(failure.to_string())),
+                };
+                emit_set_session_config_result(
+                    observer.as_ref(),
+                    &request_id,
+                    Some(&session_id_for_task),
+                    status,
+                    Some(category),
+                    error.as_deref(),
+                );
+            });
+        }
+    }
+}
+
+/// Route list/load/resume/fork/close through the ACP process already owned by
+/// the direct conversation. Profile selection comes from that process
+/// (`OMP_PROFILE`); the target session's cwd comes from ACP's own session list.
+/// No caller-supplied profile or path is accepted.
+fn handle_session_lifecycle_control(
+    payload: &serde_json::Value,
+    pool: &mut AgentPool,
+    observer: Option<&observer::ObserverHandle>,
+    prompt_context: &PromptContext,
+) {
+    let request_id = payload
+        .get("requestId")
+        .and_then(serde_json::Value::as_str)
+        .filter(|value| !value.trim().is_empty())
+        .unwrap_or_default()
+        .to_string();
+    let source_session_id = payload
+        .get("sessionId")
+        .and_then(serde_json::Value::as_str)
+        .filter(|value| !value.trim().is_empty())
+        .map(str::to_string);
+    let operation = payload
+        .get("operation")
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or_default()
+        .to_string();
+    let target_session_id = payload
+        .get("targetSessionId")
+        .and_then(serde_json::Value::as_str)
+        .filter(|value| !value.trim().is_empty())
+        .map(str::to_string);
+    let Some(source_session_id) = source_session_id else {
+        emit_session_lifecycle_result(
+            observer,
+            &request_id,
+            None,
+            &operation,
+            "error",
+            Some("missing source sessionId"),
+            None,
+        );
+        return;
+    };
+    if !matches!(operation.as_str(), "list" | "load" | "resume" | "fork" | "close")
+        || (operation != "list" && target_session_id.is_none())
+    {
+        emit_session_lifecycle_result(
+            observer,
+            &request_id,
+            Some(&source_session_id),
+            &operation,
+            "error",
+            Some("unsupported operation or missing targetSessionId"),
+            None,
+        );
+        return;
+    }
+    let (mut agent, scope) = match pool.take_session_lifecycle_agent(&source_session_id) {
+        Ok(pair) => pair,
+        Err(AgentCommandTarget::ActiveTurn) => {
+            emit_session_lifecycle_result(
+                observer,
+                &request_id,
+                Some(&source_session_id),
+                &operation,
+                "active_turn",
+                Some("session cannot switch while a turn or permission is pending"),
+                None,
+            );
+            return;
+        }
+        Err(AgentCommandTarget::Ambiguous) => {
+            emit_session_lifecycle_result(
+                observer,
+                &request_id,
+                Some(&source_session_id),
+                &operation,
+                "ambiguous_target",
+                Some("session is owned by more than one managed agent"),
+                None,
+            );
+            return;
+        }
+        Err(AgentCommandTarget::StaleSession) => {
+            emit_session_lifecycle_result(
+                observer,
+                &request_id,
+                Some(&source_session_id),
+                &operation,
+                "stale_session",
+                Some("session is no longer owned by this managed agent"),
+                None,
+            );
+            return;
+        }
+    };
+    let result_tx = pool.session_lifecycle_result_tx();
+    let target_for_result = target_session_id.clone();
+    let channel_id = scope.channel_id();
+    let cwd = prompt_context.cwd.clone();
+    let mcp_servers = pool::mcp_servers_with_git_origin(
+        &prompt_context.mcp_servers,
+        Some(channel_id),
+        Some("dm"),
+        prompt_context.session_title.as_deref(),
+    );
+    if let Some(target) = target_session_id.as_deref() {
+        if (operation == "close" && target != source_session_id)
+            || !pool.lifecycle_target_is_unowned_or_in_scope(target, &scope)
+        {
+            pool.return_agent(agent);
+            emit_session_lifecycle_result(
+                observer,
+                &request_id,
+                Some(&source_session_id),
+                &operation,
+                "error",
+                Some("target session is already owned by another conversation"),
+                None,
+            );
+            return;
+        }
+    }
+    tokio::spawn(async move {
+        let outcome: Result<serde_json::Value, String> = async {
+            let sessions = agent
+                .acp
+                .session_list(&cwd)
+                .await
+                .map_err(|error| error.to_string())?;
+            let owner_session_exists = sessions
+                .get("sessions")
+                .and_then(serde_json::Value::as_array)
+                .is_some_and(|sessions| sessions.iter().any(|session| {
+                    session.get("sessionId").and_then(serde_json::Value::as_str)
+                        == Some(&source_session_id)
+                }));
+            if !owner_session_exists {
+                return Err("owner session is not available in this workspace".to_string());
+            }
+            if operation == "list" {
+                return Ok(filter_sessions_by_cwd(&sessions, &cwd));
+            }
+            let target = target_session_id.as_deref().expect("validated target id");
+            let target_in_scope = sessions
+                .get("sessions")
+                .and_then(serde_json::Value::as_array)
+                .is_some_and(|sessions| {
+                    sessions.iter().any(|session| {
+                        session.get("sessionId").and_then(serde_json::Value::as_str)
+                            == Some(target)
+                    })
+                });
+            if !target_in_scope {
+                return Err("target session is outside this profile and workspace".to_string());
+            }
+            if operation == "close" {
+                agent
+                    .acp
+                    .session_close(target)
+                    .await
+                    .map_err(|error| error.to_string())?;
+                return Ok(serde_json::json!({}));
+            }
+            match operation.as_str() {
+                "load" => agent
+                    .acp
+                    .session_load(target, &cwd, mcp_servers.clone())
+                    .await
+                    .map_err(|error| error.to_string()),
+                "resume" => agent
+                    .acp
+                    .session_resume(target, &cwd, mcp_servers.clone())
+                    .await
+                    .map_err(|error| error.to_string()),
+                "fork" => {
+                    let fork = agent
+                        .acp
+                        .session_fork(target, &cwd, mcp_servers.clone())
+                        .await
+                        .map_err(|error| error.to_string())?;
+                    let fork_id = fork
+                        .get("sessionId")
+                        .and_then(serde_json::Value::as_str)
+                        .filter(|id| !id.trim().is_empty())
+                        .ok_or_else(|| "fork response did not include sessionId".to_string())?;
+                    // Forking creates the child; loading it replays that child's
+                    // inherited transcript into the owner's direct conversation.
+                    let mut loaded = agent
+                        .acp
+                        .session_load(fork_id, &cwd, mcp_servers.clone())
+                        .await
+                        .map_err(|error| error.to_string())?;
+                    loaded["sessionId"] = serde_json::Value::String(fork_id.to_string());
+                    Ok(loaded)
+                }
+                _ => unreachable!("operation validated before spawn"),
+            }
+        }
+        .await;
+        let target_session_id = match (&outcome, operation.as_str()) {
+            (Ok(result), "fork") => result
+                .get("sessionId")
+                .and_then(serde_json::Value::as_str)
+                .map(str::to_string),
+            (Ok(_), "load" | "resume") => target_for_result,
+            (Ok(_), "close") => target_for_result,
+            _ => None,
+        };
+        if outcome.is_ok() {
+            if let Some(session_id) = target_session_id.as_deref() {
+                agent.acp.set_observer_context(observer::ObserverContext {
+                    channel_id: Some(channel_id.to_string()),
+                    session_id: Some(session_id.to_string()),
+                    turn_id: None,
+                    started_at: None,
+                });
+            }
+        }
+        let _ = result_tx.send(AgentSessionLifecycleResult {
+            agent,
+            scope,
+            source_session_id,
+            operation,
+            target_session_id,
+            request_id,
+            result: outcome,
+        });
+    });
+}
+
+fn emit_session_lifecycle_result(
+    observer: Option<&observer::ObserverHandle>,
+    request_id: &str,
+    session_id: Option<&str>,
+    operation: &str,
+    status: &str,
+    error: Option<&str>,
+    sessions: Option<serde_json::Value>,
+) {
+    let Some(observer) = observer else {
+        return;
+    };
+    let mut payload = serde_json::json!({
+        "type": "session_lifecycle",
+        "requestId": request_id,
+        "sessionId": session_id,
+        "operation": operation,
+        "status": status,
+    });
+    if let Some(error) = error {
+        payload["error"] = serde_json::Value::String(error.to_string());
+    }
+    if let Some(sessions) = sessions {
+        payload["sessions"] = sessions;
+    }
+    observer.emit(
+        "control_result",
+        None,
+        &observer::ObserverContext {
+            channel_id: None,
+            session_id: session_id.map(str::to_string),
+            turn_id: None,
+            started_at: None,
+        },
+        payload,
+    );
+}
+
+
+fn filter_sessions_by_cwd(value: &serde_json::Value, cwd: &str) -> serde_json::Value {
+    let sessions = value
+        .get("sessions")
+        .and_then(serde_json::Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter(|session| session.get("cwd").and_then(serde_json::Value::as_str) == Some(cwd))
+        .cloned()
+        .collect::<Vec<_>>();
+    serde_json::json!({ "sessions": sessions })
+}
+
+/// Remove paths and other session metadata before publishing the catalog over
+/// the observer relay. The direct owner already knows its profile/workspace.
+fn sanitize_session_list(value: &serde_json::Value) -> serde_json::Value {
+    let Some(sessions) = value.get("sessions").and_then(serde_json::Value::as_array) else {
+        return serde_json::Value::Array(Vec::new());
+    };
+    serde_json::Value::Array(
+        sessions
+            .iter()
+            .filter_map(|session| {
+                let session_id = session
+                    .get("sessionId")
+                    .and_then(serde_json::Value::as_str)?;
+                let mut item = serde_json::json!({ "sessionId": session_id });
+                for key in ["title", "updatedAt"] {
+                    if let Some(value) = session.get(key) {
+                        item[key] = value.clone();
+                    }
+                }
+                Some(item)
+            })
+            .collect(),
+    )
+}
+
+#[cfg(test)]
+mod session_lifecycle_projection_tests {
+    use super::{filter_sessions_by_cwd, sanitize_session_list};
+
+    #[test]
+    fn session_list_is_scoped_to_owner_workspace_without_publishing_paths() {
+        let sessions = serde_json::json!({
+            "sessions": [
+                { "sessionId": "owned", "cwd": "/private/project", "title": "Owned", "updatedAt": "now" },
+                { "sessionId": "other", "cwd": "/private/other", "title": "Other", "updatedAt": "later" }
+            ]
+        });
+        let owner_sessions = filter_sessions_by_cwd(&sessions, "/private/project");
+        let public = sanitize_session_list(&owner_sessions);
+        assert_eq!(public.as_array().unwrap().len(), 1);
+        assert_eq!(public[0]["sessionId"], "owned");
+        assert!(public[0].get("cwd").is_none());
+    }
+}
+
+/// Emit the terminal result frame for a `set_session_config` request.
+///
+/// Carries both `requestId` and `sessionId` (like `dispatch_command`) so the
+/// desktop can correlate a late or replayed result to the exact pick and the
+/// exact conversation. `status` is one of `applied`, `rejected`, `stale_session`,
+/// `ambiguous_target`, `active_turn`, `turn_ended`, `error` — each an explicit
+/// refusal rather than a generic failure, so the UI can say what to do next.
+fn emit_set_session_config_result(
+    observer: Option<&observer::ObserverHandle>,
+    request_id: &str,
+    session_id: Option<&str>,
+    status: &str,
+    category: Option<crate::acp::ConfigCategory>,
+    error: Option<&str>,
+) {
+    let Some(observer) = observer else {
+        return;
+    };
+    let mut payload = serde_json::json!({
+        "type": "set_session_config",
+        "requestId": request_id,
+        "sessionId": session_id,
+        "status": status,
+    });
+    if let Some(category) = category {
+        payload["category"] = serde_json::Value::String(category.as_wire_str().to_string());
+    }
+    if let Some(error) = error {
+        payload["error"] = serde_json::Value::String(error.to_string());
+    }
+    observer.emit(
+        "control_result",
+        None,
+        &observer::ObserverContext {
+            channel_id: None,
+            session_id: session_id.map(str::to_string),
+            turn_id: None,
+            started_at: None,
+        },
+        payload,
     );
 }
 
@@ -3268,6 +3943,8 @@ async fn tokio_main() -> Result<()> {
     enum PoolEvent {
         Result(Box<PromptResult>),
         Command(AgentCommandResult),
+        ConfigReturn(AgentConfigReturn),
+        SessionLifecycle(AgentSessionLifecycleResult),
         Panic(tokio::task::JoinError),
         SteerAck(SteerAckEvent),
         Wake(u32, Result<AgentPool, String>),
@@ -3414,7 +4091,8 @@ async fn tokio_main() -> Result<()> {
 
         // Borrow result_rx and join_set simultaneously via split-borrow helper.
         let pool_event: Option<PoolEvent> = {
-            let (result_rx, command_rx, join_set) = pool.rx_command_and_join_set();
+            let (result_rx, command_rx, config_return_rx, session_lifecycle_rx, join_set) =
+                pool.rx_command_and_join_set();
             tokio::select! {
                 biased;
                 // recv() returning None means all senders dropped (pool was torn down).
@@ -3428,6 +4106,15 @@ async fn tokio_main() -> Result<()> {
                 },
                 Some(result) = command_rx.recv(), if pool_ready => {
                     Some(PoolEvent::Command(result))
+                },
+                // A config write finished against a checked-out idle worker; the
+                // slot stays empty until this returns it, so the arm is what
+                // keeps the pool from leaking an agent per config write.
+                Some(returned) = config_return_rx.recv(), if pool_ready => {
+                    Some(PoolEvent::ConfigReturn(returned))
+                },
+                Some(result) = session_lifecycle_rx.recv(), if pool_ready => {
+                    Some(PoolEvent::SessionLifecycle(result))
                 },
                 // Guard: join_next() returns None immediately when JoinSet is
                 // empty, which would cause a tight spin. Only poll when there
@@ -3496,6 +4183,7 @@ async fn tokio_main() -> Result<()> {
                                     owner_hex,
                                     relay.event_publisher(),
                                     &config,
+                                    &ctx,
                                 );
                             } else {
                                 tracing::warn!("observer control frame received but no owner resolved — dropping");
@@ -4012,6 +4700,58 @@ async fn tokio_main() -> Result<()> {
         };
 
         match pool_event {
+            Some(PoolEvent::ConfigReturn(returned)) => {
+                // Reinsert the worker whose config write completed. `return_agent`
+                // re-registers the scope mappings, and the caller's own oneshot
+                // already delivered the verdict, so nothing else is owed here.
+                pool.return_agent(returned.agent);
+            }
+            Some(PoolEvent::SessionLifecycle(result)) => {
+                let status = if result.result.is_ok() {
+                    "completed"
+                } else {
+                    "error"
+                };
+                let mut payload = serde_json::json!({
+                    "type": "session_lifecycle",
+                    "requestId": result.request_id,
+                    "operation": result.operation,
+                    "sessionId": result.target_session_id
+                        .as_deref()
+                        .unwrap_or(&result.source_session_id),
+                    "status": status,
+                });
+                if let Ok(value) = &result.result {
+                    if result.operation == "list" {
+                        payload["sessions"] = sanitize_session_list(value);
+                    }
+                } else if let Err(error) = &result.result {
+                    payload["error"] = serde_json::Value::String(error.clone());
+                }
+                if let Some(observer) = observer.as_ref() {
+                    observer.emit(
+                        "control_result",
+                        None,
+                        &observer::ObserverContext {
+                            channel_id: None,
+                            session_id: Some(result.source_session_id.clone()),
+                            turn_id: None,
+                            started_at: None,
+                        },
+                        payload,
+                    );
+                }
+                pool.return_session_lifecycle_agent(result);
+                for (scope, thread_tags) in dispatch_pending(
+                    &mut pool,
+                    &mut queue,
+                    &ctx,
+                    &mut last_activity,
+                    observer.as_ref(),
+                ) {
+                    typing_channels.insert(scope, thread_tags);
+                }
+            }
             Some(PoolEvent::Command(result)) => {
                 if !remember_command_result(
                     &result.request_id,
@@ -4863,6 +5603,24 @@ fn dispatch_pending(
         agent.acp.install_steer_rx(rx);
         let steer_tx = Some(tx);
 
+        // Permission-answer seam, the sibling of the steer seam above and for
+        // the same structural reason: the prompt's read loop owns the client's
+        // writer for the whole turn, so a click can only reach it through a
+        // channel installed before the turn starts. The client needs no extra
+        // state to answer: `install_permission_answer_rx` is enough, and
+        // whether an observer is attached decides only whether the request is
+        // announced (the read loop reads `self.observer`).
+        let (permission_tx, permission_rx) = tokio::sync::mpsc::channel::<PermissionAnswer>(1);
+        agent.acp.install_permission_answer_rx(permission_rx);
+        let permission_tx = Some(permission_tx);
+        // Exact-session config writes ride their own channel, not the steer one:
+        // a selector change must not be framed as a message, cancel the turn, or
+        // start a new one. Capacity 2 tolerates a model+thinking pair dispatched
+        // together; a third concurrent write to the same turn is refused.
+        let (config_tx, config_rx) = tokio::sync::mpsc::channel::<crate::acp::SessionConfigRequest>(2);
+        agent.acp.install_config_rx(config_rx);
+        let config_tx = Some(config_tx);
+
         // Prompt text is now built inside run_prompt_task (needs async for
         // context fetching). Pass None for prompt_text; batch carries the data.
         let (control_tx, control_rx) = tokio::sync::oneshot::channel::<ControlSignal>();
@@ -4892,6 +5650,8 @@ fn dispatch_pending(
                 recoverable_batch,
                 control_tx: Some(control_tx),
                 steer_tx,
+                permission_tx,
+                config_tx,
                 successful_steer_deliveries: HashSet::new(),
             },
         );
@@ -5566,6 +6326,8 @@ fn dispatch_heartbeat(
             recoverable_batch: None,
             control_tx: None,
             steer_tx: None,
+            permission_tx: None,
+            config_tx: None,
             successful_steer_deliveries: HashSet::new(),
         },
     );
@@ -6241,6 +7003,326 @@ fn build_mcp_servers(config: &Config) -> Vec<McpServer> {
 }
 
 #[cfg(test)]
+mod set_session_config_tests {
+    use super::*;
+    use crate::acp::ConfigCategory;
+
+    /// A scripted ACP agent: answers `session/new` with `config_options`, then
+    /// replies to a `session/set_config_option` with `next_reply` (a JSON-RPC
+    /// result/error body, minus the id). Any further request is answered `{}`.
+    async fn spawn_config_acp(session_new_options: &str, set_reply: &str) -> crate::acp::AcpClient {
+        let script = format!(
+            r#"count=0
+while IFS= read -r line; do
+  count=$((count + 1))
+  id=$((count - 1))
+  if [ "$count" -eq 1 ]; then
+    printf '%s\n' '{{"jsonrpc":"2.0","id":0,"result":{{"sessionId":"sess-1","configOptions":{session_new_options}}}}}'
+  elif [ "$count" -eq 2 ]; then
+    printf '%s\n' '{{"jsonrpc":"2.0","id":'"$id"',{set_reply}}}'
+  else
+    printf '%s\n' '{{"jsonrpc":"2.0","id":'"$id"',"result":{{}}}}'
+  fi
+done"#
+        );
+        crate::acp::AcpClient::spawn("bash", &["-c".to_string(), script], &[], false)
+            .await
+            .expect("spawn scripted config ACP")
+    }
+
+    /// The three-category advertisement omp sends: the ids are the adapter's
+    /// (`thinking` for `thought_level`), which is exactly why the resolver must
+    /// go through the category and not a literal.
+    const OMP_OPTIONS: &str = r#"[{"configId":"mode","category":"mode","currentValue":"default","options":[{"value":"default"},{"value":"plan"}]},{"configId":"model","category":"model","currentValue":"lane-model","options":[{"value":"lane-model"},{"value":"other-model"}]},{"configId":"thinking","category":"thought_level","currentValue":"low","options":[{"value":"off"},{"value":"low"},{"value":"high"}]}]"#;
+
+    fn control_results(obs: &observer::ObserverHandle) -> Vec<serde_json::Value> {
+        obs.snapshot()
+            .into_iter()
+            .filter(|e| e.kind == "control_result")
+            .map(|e| e.payload)
+            .filter(|p| p.get("type").and_then(|v| v.as_str()) == Some("set_session_config"))
+            .collect()
+    }
+
+    /// Stand in for the main loop's `PoolEvent::ConfigReturn` arm.
+    ///
+    /// A config write applied against an idle worker checks that worker out, so
+    /// the slot stays empty until the main loop polls the return channel and
+    /// reinserts it. Tests must run that arm, or they assert against a pool the
+    /// loop has not yet had a chance to repair.
+    async fn settle_config_returns(pool: &mut AgentPool, observer: &observer::ObserverHandle) {
+        for _ in 0..200 {
+            tokio::task::yield_now().await;
+            pool.drain_config_returns_for_test();
+            if !control_results(observer).is_empty() {
+                // One more drain: the worker is handed back BEFORE the result
+                // frame is emitted, so the frame's arrival implies it is queued.
+                pool.drain_config_returns_for_test();
+                return;
+            }
+        }
+    }
+
+    fn frame(category: &str, value: &str, request_id: &str) -> serde_json::Value {
+        serde_json::json!({
+            "type": "set_session_config",
+            "sessionId": "sess-1",
+            "category": category,
+            "value": value,
+            "requestId": request_id,
+        })
+    }
+
+    /// A pool whose single idle worker owns `sess-1`, with the scripted agent
+    /// already having created a session (so the projection is populated).
+    async fn idle_pool(options: &str, set_reply: &str) -> (AgentPool, observer::ObserverHandle) {
+        let mut client = spawn_config_acp(options, set_reply).await;
+        // `session/new` is request #1: creating the session seeds the
+        // projection with the advertisement the resolver reads.
+        client
+            .session_new("/tmp", vec![], None, None)
+            .await
+            .expect("session/new");
+        let mut agent = OwnedAgent {
+            index: 0,
+            acp: client,
+            state: Default::default(),
+            model_capabilities: None,
+            desired_model: None,
+            model_overridden: false,
+            desired_model_request_id: None,
+            desired_model_pending_ack: false,
+            startup_effort: None,
+            startup_mode: None,
+            agent_name: "config-test-agent".into(),
+            goose_system_prompt_supported: None,
+            protocol_version: 2,
+        };
+        agent.state.sessions.insert(
+            scope::SessionScope::Conversation {
+                channel_id: Uuid::new_v4(),
+            },
+            "sess-1".into(),
+        );
+        // `from_slots` registers each slot agent's session→scope mapping, which
+        // is exactly the mapping the router resolves through.
+        let pool = AgentPool::from_slots(vec![Some(agent)]);
+        (pool, observer::ObserverHandle::in_process())
+    }
+
+    #[tokio::test]
+    async fn resolves_config_id_by_category_not_literal() {
+        let (pool, _) = idle_pool(OMP_OPTIONS, r#""result":{"ok":true}"#).await;
+        let agent = pool.agents_for_test()[0].as_ref().expect("idle agent");
+        assert_eq!(
+            agent.acp.resolve_category_config_id(ConfigCategory::ThoughtLevel),
+            Some("thinking".to_string()),
+            "thought_level must resolve to the adapter's own id (omp: `thinking`)"
+        );
+        assert_eq!(
+            agent.acp.resolve_category_config_id(ConfigCategory::Mode),
+            Some("mode".to_string())
+        );
+        assert_eq!(
+            agent.acp.resolve_category_config_id(ConfigCategory::Model),
+            Some("model".to_string())
+        );
+        assert_eq!(
+            agent
+                .acp
+                .category_option_values(ConfigCategory::ThoughtLevel),
+            vec!["off", "low", "high"],
+            "the offered list comes from the adapter, not a hardcoded enum"
+        );
+    }
+
+    #[tokio::test]
+    async fn applies_a_valid_selection_and_returns_the_worker() {
+        let (mut pool, observer) = idle_pool(OMP_OPTIONS, r#""result":{"ok":true}"#).await;
+        handle_set_session_config_control(
+            &frame("thought_level", "high", "req-1"),
+            &mut pool,
+            Some(&observer),
+        );
+        settle_config_returns(&mut pool, &observer).await;
+        let results = control_results(&observer);
+        assert_eq!(results.len(), 1, "exactly one result frame per request");
+        assert_eq!(results[0]["status"], "applied");
+        assert_eq!(results[0]["requestId"], "req-1");
+        assert_eq!(results[0]["sessionId"], "sess-1");
+        assert_eq!(results[0]["category"], "thought_level");
+        // The slot came back — the pool did not leak the checked-out worker.
+        assert!(
+            pool.agents_for_test()[0].is_some(),
+            "the worker must be returned to its slot after the write"
+        );
+    }
+
+    #[tokio::test]
+    async fn refuses_an_unadvertised_value_before_writing_anything() {
+        // The scripted agent answers ANY write with success, so a write that
+        // leaked past validation would report `applied`. The refusal therefore
+        // proves the check happened first, and that the session is untouched.
+        let (mut pool, observer) = idle_pool(OMP_OPTIONS, r#""result":{"ok":true}"#).await;
+        handle_set_session_config_control(
+            &frame("thought_level", "xhigh", "req-bad"),
+            &mut pool,
+            Some(&observer),
+        );
+        settle_config_returns(&mut pool, &observer).await;
+        let results = control_results(&observer);
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0]["status"], "rejected");
+        let error = results[0]["error"].as_str().unwrap_or_default();
+        assert!(
+            error.contains("xhigh") && error.contains("off, low, high"),
+            "the refusal names the rejected value and the offered list: {error}"
+        );
+        // No write can have happened: the agent is idle and the options it
+        // advertises still read `low`.
+        let agent = pool.agents_for_test()[0].as_ref().expect("idle agent");
+        assert_eq!(
+            agent
+                .acp
+                .category_option_values(ConfigCategory::ThoughtLevel),
+            vec!["off", "low", "high"]
+        );
+    }
+
+    #[tokio::test]
+    async fn unknown_category_and_stale_session_are_distinct_refusals() {
+        let (mut pool, observer) = idle_pool(OMP_OPTIONS, r#""result":{"ok":true}"#).await;
+        handle_set_session_config_control(
+            &frame("bogus", "high", "req-cat"),
+            &mut pool,
+            Some(&observer),
+        );
+        handle_set_session_config_control(
+            &serde_json::json!({
+                "type": "set_session_config",
+                "sessionId": "gone-session",
+                "category": "model",
+                "value": "other-model",
+                "requestId": "req-stale",
+            }),
+            &mut pool,
+            Some(&observer),
+        );
+        let results = control_results(&observer);
+        assert_eq!(results.len(), 2);
+        assert_eq!(results[0]["status"], "error");
+        assert!(
+            results[0]["error"]
+                .as_str()
+                .unwrap_or_default()
+                .contains("unknown category"),
+            "an unknown category is refused loudly, never read as a no-op"
+        );
+        assert_eq!(
+            results[1]["status"], "stale_session",
+            "an id that no longer resolves must not be retried"
+        );
+    }
+
+    #[tokio::test]
+    async fn adapter_rejection_is_reported_as_rejected() {
+        let (mut pool, observer) = idle_pool(
+            OMP_OPTIONS,
+            r#""error":{"code":-32603,"message":"Unknown ACP model: nope"}"#,
+        )
+        .await;
+        handle_set_session_config_control(
+            &frame("model", "other-model", "req-rej"),
+            &mut pool,
+            Some(&observer),
+        );
+        settle_config_returns(&mut pool, &observer).await;
+        let results = control_results(&observer);
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0]["status"], "rejected");
+        assert!(
+            results[0]["error"]
+                .as_str()
+                .unwrap_or_default()
+                .contains("Unknown ACP model"),
+            "the adapter's own words are surfaced"
+        );
+        assert_eq!(
+            results[0]["category"], "model",
+            "the result names the category that was addressed"
+        );
+    }
+
+    #[tokio::test]
+    async fn sibling_sessions_are_untouched() {
+        // Two workers, one session each. A write to sess-1 must leave the other
+        // worker — and its own projection — exactly as it was. This is the
+        // property `switch_model` does not have, which is why the picker cannot
+        // mount it.
+        let (mut pool, observer) = idle_pool(OMP_OPTIONS, r#""result":{"ok":true}"#).await;
+        let mut second = spawn_config_acp(OMP_OPTIONS, r#""result":{"ok":true}"#).await;
+        second
+            .session_new("/tmp", vec![], None, None)
+            .await
+            .expect("second session");
+        let mut second_agent = OwnedAgent {
+            index: 1,
+            acp: second,
+            state: Default::default(),
+            model_capabilities: None,
+            desired_model: None,
+            model_overridden: false,
+            desired_model_request_id: None,
+            desired_model_pending_ack: false,
+            startup_effort: None,
+            startup_mode: None,
+            agent_name: "config-test-agent".into(),
+            goose_system_prompt_supported: None,
+            protocol_version: 2,
+        };
+        second_agent.state.sessions.insert(
+            scope::SessionScope::Conversation {
+                channel_id: Uuid::new_v4(),
+            },
+            "sess-2".into(),
+        );
+        pool.push_agent_for_test(second_agent);
+
+        let before = pool.agents_for_test()[1]
+            .as_ref()
+            .unwrap()
+            .acp
+            .session_config_options_for_test();
+
+        handle_set_session_config_control(
+            &frame("thought_level", "high", "req-sib"),
+            &mut pool,
+            Some(&observer),
+        );
+        settle_config_returns(&mut pool, &observer).await;
+        let results = control_results(&observer);
+        assert_eq!(results[0]["status"], "applied");
+        assert_eq!(
+            pool.agents_for_test()[1]
+                .as_ref()
+                .unwrap()
+                .acp
+                .session_config_options_for_test(),
+            before,
+            "a write to sess-1 must not touch the sibling worker's projection"
+        );
+        assert!(
+            pool.agents_for_test()[1]
+                .as_ref()
+                .unwrap()
+                .desired_model
+                .is_none(),
+            "no agent-level model state is set by a session config write"
+        );
+    }
+}
+
+#[cfg(test)]
 mod heartbeat_base_prompt_tests {
     use super::*;
 
@@ -6385,6 +7467,8 @@ mod owner_control_command_tests {
                 recoverable_batch: None,
                 control_tx: Some(control_tx),
                 steer_tx: None,
+                permission_tx: None,
+            config_tx: None,
                 successful_steer_deliveries: HashSet::new(),
             },
         );
@@ -6506,6 +7590,8 @@ mod owner_control_command_tests {
                 recoverable_batch: None,
                 control_tx: Some(control_tx),
                 steer_tx: None,
+                permission_tx: None,
+            config_tx: None,
                 successful_steer_deliveries: HashSet::new(),
             },
         );
@@ -9814,6 +10900,8 @@ mod error_outcome_emission_tests {
                 recoverable_batch: None,
                 control_tx: None,
                 steer_tx: None,
+                permission_tx: None,
+            config_tx: None,
                 successful_steer_deliveries: HashSet::from([
                     crate::pool::SuccessfulSteerDelivery {
                         event_id: steer_event_id.into(),
@@ -9889,6 +10977,8 @@ mod error_outcome_emission_tests {
                 recoverable_batch: None,
                 control_tx: None,
                 steer_tx: None,
+                permission_tx: None,
+            config_tx: None,
                 successful_steer_deliveries: HashSet::from([
                     crate::pool::SuccessfulSteerDelivery {
                         event_id: "stale-event".into(),
@@ -10011,6 +11101,8 @@ mod error_outcome_emission_tests {
                 recoverable_batch: None,
                 control_tx: None,
                 steer_tx: None,
+                permission_tx: None,
+            config_tx: None,
                 successful_steer_deliveries: HashSet::from([
                     crate::pool::SuccessfulSteerDelivery {
                         event_id: "stale-event".into(),
@@ -10080,6 +11172,8 @@ mod error_outcome_emission_tests {
                 recoverable_batch: None,
                 control_tx: None,
                 steer_tx: None,
+                permission_tx: None,
+            config_tx: None,
                 successful_steer_deliveries: HashSet::new(),
             },
         );
@@ -10160,6 +11254,8 @@ mod error_outcome_emission_tests {
                 recoverable_batch: None,
                 control_tx: None,
                 steer_tx: None,
+                permission_tx: None,
+            config_tx: None,
                 successful_steer_deliveries: HashSet::new(),
             },
         );
@@ -10252,6 +11348,8 @@ mod error_outcome_emission_tests {
                 recoverable_batch: Some(batch),
                 control_tx: None,
                 steer_tx: None,
+                permission_tx: None,
+            config_tx: None,
                 successful_steer_deliveries: HashSet::new(),
             },
         );
@@ -10351,6 +11449,8 @@ mod error_outcome_emission_tests {
                     recoverable_batch: None,
                     control_tx: None,
                     steer_tx: None,
+                    permission_tx: None,
+            config_tx: None,
                     successful_steer_deliveries: HashSet::new(),
                 },
             );
@@ -10448,6 +11548,8 @@ mod error_outcome_emission_tests {
                     recoverable_batch: None,
                     control_tx: None,
                     steer_tx: None,
+                    permission_tx: None,
+            config_tx: None,
                     successful_steer_deliveries: HashSet::new(),
                 },
             );
@@ -10556,6 +11658,8 @@ mod error_outcome_emission_tests {
                     recoverable_batch: None,
                     control_tx: None,
                     steer_tx: None,
+                    permission_tx: None,
+            config_tx: None,
                     successful_steer_deliveries: HashSet::new(),
                 },
             );
@@ -10634,6 +11738,8 @@ mod error_outcome_emission_tests {
                 recoverable_batch: None,
                 control_tx: None,
                 steer_tx: None,
+                permission_tx: None,
+            config_tx: None,
                 successful_steer_deliveries: HashSet::new(),
             },
         );
@@ -10731,6 +11837,8 @@ mod error_outcome_emission_tests {
                 recoverable_batch: None,
                 control_tx: None,
                 steer_tx: None,
+                permission_tx: None,
+            config_tx: None,
                 successful_steer_deliveries: HashSet::new(),
             },
         );
@@ -10851,6 +11959,8 @@ mod error_outcome_emission_tests {
                 recoverable_batch: None,
                 control_tx: None,
                 steer_tx: None,
+                permission_tx: None,
+            config_tx: None,
                 successful_steer_deliveries: HashSet::new(),
             },
         );
@@ -10993,6 +12103,8 @@ mod error_outcome_emission_tests {
                 recoverable_batch: None,
                 control_tx: None,
                 steer_tx: None,
+                permission_tx: None,
+            config_tx: None,
                 successful_steer_deliveries: HashSet::new(),
             },
         );
@@ -11126,6 +12238,8 @@ mod error_outcome_emission_tests {
                 recoverable_batch: None,
                 control_tx: None,
                 steer_tx: None,
+                permission_tx: None,
+            config_tx: None,
                 successful_steer_deliveries: HashSet::new(),
             },
         );
@@ -11281,6 +12395,8 @@ mod error_outcome_emission_tests {
                 recoverable_batch: None,
                 control_tx: None,
                 steer_tx: None,
+                permission_tx: None,
+            config_tx: None,
                 successful_steer_deliveries: HashSet::new(),
             },
         );
@@ -11369,6 +12485,8 @@ mod error_outcome_emission_tests {
                 recoverable_batch: None,
                 control_tx: None,
                 steer_tx: None,
+                permission_tx: None,
+            config_tx: None,
                 successful_steer_deliveries: HashSet::new(),
             },
         );

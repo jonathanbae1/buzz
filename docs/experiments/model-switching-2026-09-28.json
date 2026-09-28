@@ -1,0 +1,33 @@
+{
+  "date": "2026-09-28",
+  "worktree": "/Users/juwonbae/Documents/buzz-wt/model-switching",
+  "checks": [
+    {
+      "command": "pnpm exec tsc --noEmit",
+      "cwd": "desktop",
+      "result": "pass",
+      "rawOutput": "(no output)"
+    },
+    {
+      "command": ". ./bin/activate-hermit && cargo check --manifest-path desktop/src-tauri/Cargo.toml",
+      "cwd": ".",
+      "result": "pass",
+      "rawOutput": "Hermit environment /Users/juwonbae/Documents/buzz-wt/model-switching activated\nFinished `dev` profile [unoptimized + debuginfo] target(s) in 0.82s"
+    },
+    {
+      "command": "node --import ./test-loader.mjs --experimental-strip-types --test src/features/agents/activeAgentTurnsStore.test.mjs",
+      "cwd": "desktop",
+      "result": "pass",
+      "rawOutput": "# tests 80\n# pass 80\n# fail 0\n# duration_ms 488.117458"
+    }
+  ],
+  "behavioralEvidence": {
+    "idleStateGating": "The picker and mode/thinking selectors receive an active-turn boolean scoped to the panel's channel; controls disable during an active turn and show explicit wait copy. Idle-live enablement is inferred from the isBusy guard and isRunning liveness condition; UI was not driven in a running app.",
+    "nativeAcceptance": "Not run."
+  },
+  "notRun": [
+    "lanes_gate rejection codes including quick:xhigh and dead id",
+    "isolated dev app launch and native acceptance checks",
+    "doctor --fast"
+  ]
+}
