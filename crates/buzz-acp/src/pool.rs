@@ -32,7 +32,8 @@ use uuid::Uuid;
 use crate::acp::{
     extract_config_option_id_by_category, extract_model_config_options, extract_model_state,
     extract_thought_level_config_id, model_in_catalog, resolve_model_switch_method, AcpClient,
-    AcpError, EnvVar, McpServer, ModelSwitchMethod, StopReason, SystemPromptTransport,
+    AcpError, EnvVar, McpServer, ModelSwitchMethod, PermissionAnswer, StopReason,
+    SystemPromptTransport,
 };
 use crate::config::{compose_scoped_session_title, DedupMode, PermissionMode};
 use crate::observer;
@@ -79,6 +80,16 @@ pub struct TaskMeta {
     /// tasks only — all prompt tasks install a steer channel regardless
     /// of the agent's name.
     pub steer_tx: Option<tokio::sync::mpsc::Sender<SteerRequest>>,
+    /// Answer channel for the in-flight task's `session/request_permission`
+    /// requests. Capacity-1; `try_send` from the main loop fails on
+    /// `Full`/`Closed`, in which case the caller reports an explicit failure
+    /// rather than silently leaving the approval unanswered.
+    ///
+    /// This is the reason a permission reply cannot ride `control_tx`: that
+    /// branch cancels the turn it would be approving. `None` for heartbeat
+    /// tasks and for prompt tasks on an agent with no observer attached to
+    /// answer requests.
+    pub permission_tx: Option<tokio::sync::mpsc::Sender<PermissionAnswer>>,
     /// Successful non-cancelling steers acknowledged while this task owned the
     /// live session. The session ID prevents a late ack from contaminating a
     /// replacement session after task return.
@@ -352,6 +363,30 @@ pub enum AgentCommandTarget {
     StaleSession,
     Ambiguous,
 }
+/// Why a permission answer could not be handed to the in-flight turn.
+///
+/// Every variant is reported to the client as an explicit `control_result`
+/// status. There is no silent drop: the operator clicked an approval button and
+/// is entitled to know whether it landed.
+#[derive(Debug, thiserror::Error)]
+pub enum PermissionAnswerError {
+    /// No worker holds this ACP session id.
+    #[error("no worker holds that ACP session")]
+    UnknownSession,
+    /// The session is known but no turn is in flight on it — the request this
+    /// answer targets has already settled.
+    #[error("no turn in flight for the target session")]
+    NoActiveTurn,
+    /// The in-flight turn has no permission answer channel: no UI is attached
+    /// to this agent, so the request cannot be answered from here.
+    #[error("this turn has no permission answer channel")]
+    NotAnswerable,
+    /// The channel refused the answer (full or closed): the previous answer is
+    /// still in flight, or the read loop has already gone.
+    #[error("permission answer channel refused the answer: {0}")]
+    Undeliverable(String),
+}
+
 pub struct AgentCommandResult {
     pub agent: OwnedAgent,
     pub request_id: String,
@@ -1087,6 +1122,43 @@ impl AgentPool {
             .ok_or_else(|| SteerError::Transport("steer_tx not installed".into()))?;
         tx.try_send(request)
             .map_err(|e| SteerError::Transport(e.to_string()))
+    }
+
+    /// Try to deliver a permission answer to the in-flight task that owns the
+    /// pending request.
+    ///
+    /// Scoped by the exact ACP session id, not by channel: the request belongs
+    /// to one session on one worker, and a channel can hold several sessions.
+    /// Returns `Ok(())` when the read loop accepted the answer, or a reason the
+    /// caller must surface — a permission reply has no silent fallback, because
+    /// the operator is waiting on the outcome of their own click.
+    ///
+    /// This deliberately does **not** touch `control_tx`: that branch cancels
+    /// the turn, which would destroy the very tool call being approved.
+    pub fn send_permission_answer(
+        &mut self,
+        session_id: &str,
+        answer: PermissionAnswer,
+    ) -> Result<(), PermissionAnswerError> {
+        // Resolve the session's scope first — `session_scopes` is the durable
+        // session→scope index and borrowing it separately keeps the task lookup
+        // below free of a double borrow of `self`.
+        let scope = self
+            .session_scopes
+            .get(session_id)
+            .cloned()
+            .ok_or(PermissionAnswerError::UnknownSession)?;
+        let meta = self
+            .task_map
+            .values_mut()
+            .find(|meta| meta.scope.as_ref() == Some(&scope))
+            .ok_or(PermissionAnswerError::NoActiveTurn)?;
+        let tx = meta
+            .permission_tx
+            .as_ref()
+            .ok_or(PermissionAnswerError::NotAnswerable)?;
+        tx.try_send(answer)
+            .map_err(|e| PermissionAnswerError::Undeliverable(e.to_string()))
     }
 
     /// Durably associate a successful steer with the exact ACP session that
@@ -2320,6 +2392,7 @@ fn send_prompt_result(
     batch: Option<FlushBatch>,
 ) {
     agent.acp.clear_steer_rx();
+    agent.acp.clear_permission_answer_rx();
     let _ = result_tx.send(PromptResult {
         agent,
         source,
@@ -7900,6 +7973,7 @@ printf '%s\n' '{{"jsonrpc":"2.0","id":0,"result":{{"stopReason":"end_turn"}}}}'"
                 recoverable_batch: None,
                 control_tx: None,
                 steer_tx: None,
+                permission_tx: None,
                 successful_steer_deliveries: HashSet::new(),
             },
         );

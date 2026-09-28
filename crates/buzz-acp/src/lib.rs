@@ -22,7 +22,7 @@ use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::Arc;
 use std::time::Duration;
 
-use acp::{AcpClient, EnvVar, McpServer};
+use acp::{AcpClient, EnvVar, McpServer, PermissionAnswer};
 use anyhow::{ensure, Context, Result};
 use buzz_core::kind::{
     KIND_MEMBER_ADDED_NOTIFICATION, KIND_MEMBER_REMOVED_NOTIFICATION, KIND_STREAM_MESSAGE,
@@ -1619,6 +1619,9 @@ fn handle_relay_observer_control_event(
         Some("dispatch_command") => {
             handle_dispatch_command_control(&payload, pool, observer, &config);
         }
+        Some("permission_response") => {
+            handle_permission_response_control(&payload, pool, observer);
+        }
         Some("publish_project_owner_announcements") => {
             handle_publish_project_owner_announcements_control(
                 &payload,
@@ -1631,6 +1634,115 @@ fn handle_relay_observer_control_event(
             tracing::debug!(payload = %payload, "ignoring unknown observer control frame");
         }
     }
+}
+
+/// Handle a `permission_response` control frame (S1).
+///
+/// The target is the tuple **(ACP session id, request nonce, optionId)**. The
+/// nonce is what makes this safe: JSON-RPC ids are connection-scoped and get
+/// reused after a respawn, so a replayed frame keyed only on the request id
+/// could approve a *later* request that happens to reuse it. The client echoes
+/// the nonce it received on the `permission_request` observer frame, and the
+/// read loop rejects a mismatch.
+///
+/// Delivery goes through the in-flight task's own answer channel — never
+/// `control_tx`, whose branch cancels the turn. Every failure is reported as a
+/// `control_result`; nothing about a permission reply is dropped silently,
+/// because the operator is waiting on the outcome of their own click.
+fn handle_permission_response_control(
+    payload: &serde_json::Value,
+    pool: &mut AgentPool,
+    observer: Option<&observer::ObserverHandle>,
+) {
+    let request_id = payload
+        .get("requestId")
+        .and_then(|value| value.as_str())
+        .filter(|value| !value.trim().is_empty())
+        .unwrap_or_default()
+        .to_string();
+    let session_id = payload
+        .get("sessionId")
+        .and_then(|value| value.as_str())
+        .filter(|value| !value.trim().is_empty())
+        .map(str::to_string);
+    let option_id = payload
+        .get("optionId")
+        .and_then(|value| value.as_str())
+        .filter(|value| !value.trim().is_empty())
+        .map(str::to_string);
+    // The nonce is `u64` and must survive the relay as a JSON number; a float
+    // or a string would silently address a different request, so both are
+    // rejected rather than coerced.
+    let nonce = payload.get("nonce").and_then(serde_json::Value::as_u64);
+
+    let (Some(session_id), Some(option_id), Some(nonce)) = (session_id, option_id, nonce) else {
+        emit_permission_response_result(
+            observer,
+            &request_id,
+            None,
+            "error",
+            Some("permission_response requires sessionId, nonce and optionId"),
+        );
+        return;
+    };
+
+    let answer = PermissionAnswer { nonce, option_id };
+    match pool.send_permission_answer(&session_id, answer) {
+        Ok(()) => emit_permission_response_result(
+            observer,
+            &request_id,
+            Some(&session_id),
+            "sent",
+            None,
+        ),
+        Err(error) => {
+            let status = match error {
+                crate::pool::PermissionAnswerError::UnknownSession => "unknown_session",
+                crate::pool::PermissionAnswerError::NoActiveTurn => "no_active_request",
+                crate::pool::PermissionAnswerError::NotAnswerable => "not_answerable",
+                crate::pool::PermissionAnswerError::Undeliverable(_) => "undeliverable",
+            };
+            emit_permission_response_result(
+                observer,
+                &request_id,
+                Some(&session_id),
+                status,
+                Some(&error.to_string()),
+            );
+        }
+    }
+}
+
+fn emit_permission_response_result(
+    observer: Option<&observer::ObserverHandle>,
+    request_id: &str,
+    session_id: Option<&str>,
+    status: &str,
+    error: Option<&str>,
+) {
+    let Some(observer) = observer else {
+        return;
+    };
+    let mut frame = serde_json::json!({
+        "type": "permission_response",
+        "requestId": request_id,
+        "sessionId": session_id,
+        "status": status,
+    });
+    if let Some(error) = error {
+        frame["error"] = serde_json::Value::String(error.to_string());
+    }
+    observer.emit(
+        "control_result",
+        None,
+        &observer::ObserverContext {
+            channel_id: None,
+            session_id: session_id.map(str::to_string),
+            turn_id: None,
+            started_at: None,
+        },
+        frame,
+    );
 }
 
 fn handle_dispatch_command_control(
@@ -4863,6 +4975,17 @@ fn dispatch_pending(
         agent.acp.install_steer_rx(rx);
         let steer_tx = Some(tx);
 
+        // Permission-answer seam, the sibling of the steer seam above and for
+        // the same structural reason: the prompt's read loop owns the client's
+        // writer for the whole turn, so a click can only reach it through a
+        // channel installed before the turn starts. The client needs no extra
+        // state to answer: `install_permission_answer_rx` is enough, and
+        // whether an observer is attached decides only whether the request is
+        // announced (the read loop reads `self.observer`).
+        let (permission_tx, permission_rx) = tokio::sync::mpsc::channel::<PermissionAnswer>(1);
+        agent.acp.install_permission_answer_rx(permission_rx);
+        let permission_tx = Some(permission_tx);
+
         // Prompt text is now built inside run_prompt_task (needs async for
         // context fetching). Pass None for prompt_text; batch carries the data.
         let (control_tx, control_rx) = tokio::sync::oneshot::channel::<ControlSignal>();
@@ -4892,6 +5015,7 @@ fn dispatch_pending(
                 recoverable_batch,
                 control_tx: Some(control_tx),
                 steer_tx,
+                permission_tx,
                 successful_steer_deliveries: HashSet::new(),
             },
         );
@@ -5566,6 +5690,7 @@ fn dispatch_heartbeat(
             recoverable_batch: None,
             control_tx: None,
             steer_tx: None,
+            permission_tx: None,
             successful_steer_deliveries: HashSet::new(),
         },
     );
@@ -6385,6 +6510,7 @@ mod owner_control_command_tests {
                 recoverable_batch: None,
                 control_tx: Some(control_tx),
                 steer_tx: None,
+                permission_tx: None,
                 successful_steer_deliveries: HashSet::new(),
             },
         );
@@ -6506,6 +6632,7 @@ mod owner_control_command_tests {
                 recoverable_batch: None,
                 control_tx: Some(control_tx),
                 steer_tx: None,
+                permission_tx: None,
                 successful_steer_deliveries: HashSet::new(),
             },
         );
@@ -9814,6 +9941,7 @@ mod error_outcome_emission_tests {
                 recoverable_batch: None,
                 control_tx: None,
                 steer_tx: None,
+                permission_tx: None,
                 successful_steer_deliveries: HashSet::from([
                     crate::pool::SuccessfulSteerDelivery {
                         event_id: steer_event_id.into(),
@@ -9889,6 +10017,7 @@ mod error_outcome_emission_tests {
                 recoverable_batch: None,
                 control_tx: None,
                 steer_tx: None,
+                permission_tx: None,
                 successful_steer_deliveries: HashSet::from([
                     crate::pool::SuccessfulSteerDelivery {
                         event_id: "stale-event".into(),
@@ -10011,6 +10140,7 @@ mod error_outcome_emission_tests {
                 recoverable_batch: None,
                 control_tx: None,
                 steer_tx: None,
+                permission_tx: None,
                 successful_steer_deliveries: HashSet::from([
                     crate::pool::SuccessfulSteerDelivery {
                         event_id: "stale-event".into(),
@@ -10080,6 +10210,7 @@ mod error_outcome_emission_tests {
                 recoverable_batch: None,
                 control_tx: None,
                 steer_tx: None,
+                permission_tx: None,
                 successful_steer_deliveries: HashSet::new(),
             },
         );
@@ -10160,6 +10291,7 @@ mod error_outcome_emission_tests {
                 recoverable_batch: None,
                 control_tx: None,
                 steer_tx: None,
+                permission_tx: None,
                 successful_steer_deliveries: HashSet::new(),
             },
         );
@@ -10252,6 +10384,7 @@ mod error_outcome_emission_tests {
                 recoverable_batch: Some(batch),
                 control_tx: None,
                 steer_tx: None,
+                permission_tx: None,
                 successful_steer_deliveries: HashSet::new(),
             },
         );
@@ -10351,6 +10484,7 @@ mod error_outcome_emission_tests {
                     recoverable_batch: None,
                     control_tx: None,
                     steer_tx: None,
+                    permission_tx: None,
                     successful_steer_deliveries: HashSet::new(),
                 },
             );
@@ -10448,6 +10582,7 @@ mod error_outcome_emission_tests {
                     recoverable_batch: None,
                     control_tx: None,
                     steer_tx: None,
+                    permission_tx: None,
                     successful_steer_deliveries: HashSet::new(),
                 },
             );
@@ -10556,6 +10691,7 @@ mod error_outcome_emission_tests {
                     recoverable_batch: None,
                     control_tx: None,
                     steer_tx: None,
+                    permission_tx: None,
                     successful_steer_deliveries: HashSet::new(),
                 },
             );
@@ -10634,6 +10770,7 @@ mod error_outcome_emission_tests {
                 recoverable_batch: None,
                 control_tx: None,
                 steer_tx: None,
+                permission_tx: None,
                 successful_steer_deliveries: HashSet::new(),
             },
         );
@@ -10731,6 +10868,7 @@ mod error_outcome_emission_tests {
                 recoverable_batch: None,
                 control_tx: None,
                 steer_tx: None,
+                permission_tx: None,
                 successful_steer_deliveries: HashSet::new(),
             },
         );
@@ -10851,6 +10989,7 @@ mod error_outcome_emission_tests {
                 recoverable_batch: None,
                 control_tx: None,
                 steer_tx: None,
+                permission_tx: None,
                 successful_steer_deliveries: HashSet::new(),
             },
         );
@@ -10993,6 +11132,7 @@ mod error_outcome_emission_tests {
                 recoverable_batch: None,
                 control_tx: None,
                 steer_tx: None,
+                permission_tx: None,
                 successful_steer_deliveries: HashSet::new(),
             },
         );
@@ -11126,6 +11266,7 @@ mod error_outcome_emission_tests {
                 recoverable_batch: None,
                 control_tx: None,
                 steer_tx: None,
+                permission_tx: None,
                 successful_steer_deliveries: HashSet::new(),
             },
         );
@@ -11281,6 +11422,7 @@ mod error_outcome_emission_tests {
                 recoverable_batch: None,
                 control_tx: None,
                 steer_tx: None,
+                permission_tx: None,
                 successful_steer_deliveries: HashSet::new(),
             },
         );
@@ -11369,6 +11511,7 @@ mod error_outcome_emission_tests {
                 recoverable_batch: None,
                 control_tx: None,
                 steer_tx: None,
+                permission_tx: None,
                 successful_steer_deliveries: HashSet::new(),
             },
         );

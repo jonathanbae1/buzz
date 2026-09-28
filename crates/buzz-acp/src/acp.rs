@@ -110,6 +110,54 @@ impl StopReason {
     }
 }
 
+/// One selectable answer on a `session/request_permission` request, as the
+/// agent advertised it. `kind` is the ACP enum (`allow_once`, `allow_always`,
+/// `reject_once`, `reject_always`); `option_id` is what an answer must echo
+/// back, and is never hardcoded because agents choose their own ids.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PermissionOption {
+    pub option_id: String,
+    pub kind: String,
+    pub name: Option<String>,
+}
+
+/// A `session/request_permission` request received from the agent and awaiting
+/// an answer from the client.
+#[derive(Debug, Clone, PartialEq)]
+pub struct PermissionRequest {
+    /// This client's connection-scoped identity. JSON-RPC ids are reusable
+    /// after a respawn, so an answer is only trusted when it carries the same
+    /// nonce as the request it claims to answer.
+    pub nonce: u64,
+    /// The JSON-RPC id to echo on the response. `serde_json::Value` because
+    /// JSON-RPC 2.0 permits both numeric and string ids from the agent.
+    pub request_id: serde_json::Value,
+    /// ACP session id, for attribution and the observer frame.
+    pub session_id: String,
+    pub tool_call_id: Option<String>,
+    pub title: Option<String>,
+    pub options: Vec<PermissionOption>,
+}
+
+/// The client's answer to one [`PermissionRequest`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PermissionAnswer {
+    /// Echoes the request's nonce, so a stale or replayed answer is rejected.
+    pub nonce: u64,
+    /// The chosen `optionId`, echoed verbatim from the request.
+    pub option_id: String,
+}
+
+/// How long a `session/request_permission` request may stay unanswered before
+/// the harness settles it `cancelled`.
+///
+/// Deliberately much shorter than the turn's hard cap
+/// (`DEFAULT_MAX_TURN_DURATION_SECS`, 2h): an approval nobody answers must not
+/// hold the turn open for two hours. `cancelled` is ACP's own "no decision"
+/// outcome, so expiry refuses the tool call — it never approves it, which is
+/// exactly what the removed auto-answer did.
+pub const PERMISSION_ANSWER_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(600);
+
 /// Errors that can occur in the ACP client.
 #[derive(Debug, thiserror::Error)]
 pub enum AcpError {
@@ -184,16 +232,28 @@ pub struct AcpClient {
     /// Monotonically increasing JSON-RPC request id counter.
     /// Harness-generated IDs are always numeric.
     next_id: u64,
-    /// The id of a `session/request_permission` request that has been received
-    /// but not yet responded to. Stored as `serde_json::Value` because JSON-RPC 2.0
-    /// permits both numeric and string IDs from the agent.
-    /// Used by [`cancel_with_cleanup`](AcpClient::cancel_with_cleanup) to send
-    /// a `cancelled` outcome before the agent returns from `session/prompt`.
-    pending_permission_id: Option<serde_json::Value>,
-    /// Whether we have already sent a response to the pending permission request.
-    /// Guards against double-response if a timeout fires after the allow_once
-    /// response was written but before `pending_permission_id` was cleared.
-    permission_responded: bool,
+    /// The `session/request_permission` request this client has received and
+    /// not yet answered. `None` means no request is outstanding — either none
+    /// ever arrived, or the only one did and has been settled exactly once.
+    ///
+    /// Replaces the former `pending_permission_id` + `permission_responded`
+    /// pair: a single `Option` *is* the once-only guard, because settling takes
+    /// the state and a second settlement finds `None`.
+    pending_permission: Option<PermissionRequest>,
+    /// Per-turn channel carrying the client's answer to the pending request into
+    /// the read loop, which owns the client's writer for the duration of a turn.
+    /// Installed by the prompt task like `steer_rx` and taken into a local in
+    /// the same way, so a late answer cannot address a request whose turn ended.
+    permission_answer_rx: Option<tokio::sync::mpsc::Receiver<PermissionAnswer>>,
+    /// Wall-clock deadline for the pending permission request, derived from the
+    /// prompter's `answer_timeout` when the request arrived. `None` when no
+    /// request is outstanding or the prompter is a policy that answers inline.
+    /// On expiry the read loop settles the request `cancelled`.
+    permission_deadline: Option<tokio::time::Instant>,
+    /// Connection-scoped nonce source for permission requests. JSON-RPC ids are
+    /// reusable, so the nonce — not the id — is what tells two requests apart
+    /// across a respawn, and an answer must quote it.
+    next_permission_nonce: u64,
     /// The JSON-RPC id of the most recently sent `session/prompt` request.
     /// Used by [`cancel_with_cleanup`] to drain the correct response.
     /// Set in [`session_prompt_with_idle_timeout`]; consumed in [`cancel_with_cleanup`].
@@ -586,8 +646,10 @@ impl AcpClient {
             stdin,
             reader: FramedRead::new(stdout, LinesCodec::new_with_max_length(MAX_LINE_SIZE)),
             next_id: 0,
-            pending_permission_id: None,
-            permission_responded: false,
+            pending_permission: None,
+            permission_answer_rx: None,
+            permission_deadline: None,
+            next_permission_nonce: 1,
             last_prompt_id: None,
             current_hard_deadline: None,
             observer: None,
@@ -833,6 +895,12 @@ impl AcpClient {
         let hard_deadline = tokio::time::Instant::now() + max_duration;
         self.current_hard_deadline = Some(hard_deadline);
 
+        // Start the turn with no permission request outstanding and no answer
+        // timer armed: both belong to a request, and any request from an
+        // earlier turn has already been settled by that turn's exit path.
+        self.pending_permission = None;
+        self.permission_deadline = None;
+
         // Mark the usage tracker as in-flight for this turn BEFORE sending the
         // prompt so that any setup notifications recorded earlier are not
         // misattributed to this turn.
@@ -990,6 +1058,51 @@ impl AcpClient {
         self.steer_rx.is_none()
     }
 
+    /// Install the prompter and answer channel that decide this turn's
+    /// `session/request_permission` requests.
+    ///
+    /// Both are per-turn and dropped with the turn: the receiver is taken into
+    /// a local by the read loop (like `steer_rx`), and the prompter is cleared
+    /// by [`Self::clear_steer_rx`]'s counterpart on the way back to the pool.
+    /// A later answer therefore lands on a channel nobody holds and is inert
+    /// rather than being written against a request from an earlier turn.
+    ///
+    /// Mirror of [`Self::install_steer_rx`]: same one-receiver-per-turn
+    /// invariant, asserted the same way.
+    pub fn install_permission_answer_rx(
+        &mut self,
+        rx: tokio::sync::mpsc::Receiver<PermissionAnswer>,
+    ) {
+        assert!(
+            self.permission_answer_rx.is_none(),
+            "install_permission_answer_rx: previous turn's receiver was not consumed — \
+             stacking receivers would misroute permission answers across turns"
+        );
+        self.permission_answer_rx = Some(rx);
+    }
+
+    /// Drop the per-turn permission answer state without consuming it.
+    ///
+    /// Called on every path that returns the agent to the pool, alongside
+    /// [`Self::clear_steer_rx`], so a turn that ends before the read loop's
+    /// `take()` cannot leave a stale prompter deciding the *next* turn's
+    /// requests with the *previous* turn's policy.
+    pub fn clear_permission_answer_rx(&mut self) {
+        self.permission_answer_rx = None;
+        self.pending_permission = None;
+        self.permission_deadline = None;
+    }
+
+    /// Returns `true` when this client has a permission request outstanding.
+    ///
+    /// Read by the S4 session-switch refusal path: a switch must not proceed
+    /// while an approval is pending, because the answer would then address a
+    /// session that is no longer bound. Not yet wired — S4 is not implemented.
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub fn has_pending_permission(&self) -> bool {
+        self.pending_permission.is_some()
+    }
+
     /// Cancel a turn cleanly, handling any pending permission request first.
     ///
     /// Steps:
@@ -1071,20 +1184,18 @@ impl AcpClient {
             AcpError::Protocol("cancel_with_cleanup called with no in-flight prompt".into())
         })?;
 
-        // Step 1: respond to any pending permission request with "cancelled",
-        // but only if we haven't already responded (guards against double-response race).
-        if let Some(perm_id) = self.pending_permission_id.clone() {
-            if !self.permission_responded {
-                let response = permission_response_cancelled(&perm_id);
-                self.write_ndjson(&response).await?;
-                tracing::debug!(
-                    target: "acp::cancel",
-                    "responded cancelled to pending permission id={perm_id}"
-                );
-            }
-            self.pending_permission_id = None;
-            self.permission_responded = false;
+        // Step 1: resolve any pending permission request with "cancelled" —
+        // the correct outcome once a turn is being stopped (a request that is
+        // never answered leaves the agent waiting on a reply that will not
+        // come). Taking the state makes this once-only by construction: a
+        // later Prompter answer finds no pending request and is rejected.
+        if self.pending_permission.is_some() {
+            self.settle_pending_permission_cancelled().await?;
         }
+        // Drop the per-turn answer state with the request it belonged to. A
+        // Stop means the operator is done with this turn, so no late answer may
+        // be applied to it, and no prompter may carry into the next turn.
+        self.clear_permission_answer_rx();
 
         // Step 2: send session/cancel notification (no id)
         self.session_cancel(session_id).await?;
@@ -1306,7 +1417,8 @@ impl AcpClient {
                         self.handle_goose_usage_update(&msg);
                     }
                     "session/request_permission" => {
-                        self.handle_permission_request(&msg).await?;
+                        let request = self.register_permission_request(&msg)?;
+                        self.open_permission_request(&request).await;
                     }
                     other => {
                         // If the unknown message has an id, it's a request expecting a reply.
@@ -1376,6 +1488,13 @@ impl AcpClient {
         // so the ack_tx oneshot is never leaked silently).
         let mut steer_rx = self.steer_rx.take();
 
+        // Same shape for the permission answer channel: the read loop owns the
+        // writer for the turn, so an answer must reach it here. Taken into a
+        // local (not borrowed off `self`) because the reader arm borrows `self`
+        // mutably; dropping it at scope exit is what makes an answer arriving
+        // after the turn ended address nothing.
+        let mut permission_rx = self.permission_answer_rx.take();
+
         // Tracks the in-flight steer write: `(request_id, transport, ack_tx)`.
         // While `Some`, the steer arm is gated off so we don't stack writes,
         // and a response matching `id` is routed to the ack_tx instead
@@ -1397,12 +1516,16 @@ impl AcpClient {
         loop {
             // Determine which deadline fires first BEFORE sleeping — this is
             // the classification we'll use on timeout, immune to scheduler jitter.
-            let idle_fires_first = idle_deadline < hard_deadline;
-            let next_deadline = if idle_fires_first {
-                idle_deadline
-            } else {
-                hard_deadline
-            };
+            // The permission answer deadline joins in only while a request is
+            // outstanding, so it cannot shorten an ordinary turn.
+            let permission_deadline = self.permission_deadline;
+            let next_deadline = [Some(idle_deadline), Some(hard_deadline), permission_deadline]
+                .into_iter()
+                .flatten()
+                .min()
+                .expect("idle and hard deadlines are always present");
+            let idle_fires_first = idle_deadline == next_deadline;
+            let permission_fires_first = permission_deadline == Some(next_deadline);
 
             // Pre-select deadline check — required by Max's review. Under
             // `biased`, a continuously-ready reader arm wins every poll and
@@ -1419,6 +1542,15 @@ impl AcpClient {
                     // normal dispatch handles redelivery).
                     let _ = ack_tx.send(crate::pool::SteerAck::PromptCompletedNeutral);
                 }
+                if permission_fires_first {
+                    // An approval nobody answered stops being an approval
+                    // waiting to happen. Settling it `cancelled` — ACP's own
+                    // "no decision" outcome — refuses the tool call and leaves
+                    // the turn running, which is the only outcome that is both
+                    // honest and non-blocking.
+                    self.settle_expired_permission().await;
+                    continue;
+                }
                 if idle_fires_first {
                     tracing::warn!("idle timeout ({idle_timeout:?}) — no agent activity");
                     return Err(AcpError::IdleTimeout(idle_timeout));
@@ -1434,6 +1566,44 @@ impl AcpClient {
             let read_result = tokio::select! {
                 biased;
                 read_result = self.reader.next() => Some(read_result),
+                // Permission-answer arm: a UI's decision for the request the
+                // permission arm below registered. Gated on there being a
+                // pending request, so an answer that outlived its request (or
+                // one sent for a different turn) cannot be written. Settling
+                // never cancels the turn — the request is answered in place,
+                // which is exactly what the pool's control branch cannot do.
+                Some(answer) = async {
+                    match permission_rx.as_mut() {
+                        Some(rx) => rx.recv().await,
+                        None => None,
+                    }
+                }, if self.pending_permission.is_some() => {
+                    match self.settle_pending_permission(&answer).await {
+                        Ok(true) => tracing::info!(
+                            target: "acp::permission",
+                            nonce = answer.nonce,
+                            option_id = %answer.option_id,
+                            "permission request settled from the client answer"
+                        ),
+                        // A rejected answer leaves the request pending, so the
+                        // next answer (or the deadline) still settles it. Loud,
+                        // because a rejected click is otherwise invisible.
+                        Ok(false) => tracing::warn!(
+                            target: "acp::permission",
+                            nonce = answer.nonce,
+                            "permission answer did not settle the pending request — ignored"
+                        ),
+                        Err(error) => {
+                            tracing::error!(
+                                target: "acp::permission",
+                                nonce = answer.nonce,
+                                "failed to write the permission answer: {error}"
+                            );
+                            return Err(error);
+                        }
+                    }
+                    None
+                }
                 // Steer arm: gated off whenever a steer write is already in
                 // flight so we don't stack two writes against the same
                 // process. The `async { steer_rx.as_mut()?.recv().await }`
@@ -1539,6 +1709,12 @@ impl AcpClient {
                     // round-trip when stdout is idle).
                     if let Some((_, _, ack_tx)) = pending_steer.take() {
                         let _ = ack_tx.send(crate::pool::SteerAck::PromptCompletedNeutral);
+                    }
+                    if permission_fires_first {
+                        // Same settlement as the pre-select check: the wakeup is
+                        // immediate here instead of one reader poll later.
+                        self.settle_expired_permission().await;
+                        continue;
                     }
                     if idle_fires_first {
                         tracing::warn!("idle timeout ({idle_timeout:?}) — no agent activity");
@@ -1754,7 +1930,8 @@ impl AcpClient {
                                 self.handle_goose_usage_update(&msg);
                             }
                             "session/request_permission" => {
-                                self.handle_permission_request(&msg).await?;
+                                let request = self.register_permission_request(&msg)?;
+                                self.open_permission_request(&request).await;
                             }
                             other => {
                                 // If the unknown message has an id, it's a request expecting a reply.
@@ -1979,90 +2156,293 @@ impl AcpClient {
         }
     }
 
-    /// Auto-approve a `session/request_permission` request from the agent.
+    /// Register a `session/request_permission` request as pending and return
+    /// the request that must be answered.
     ///
-    /// Finds the option with `kind == "allow_once"` and responds with its `optionId`.
-    /// If no `allow_once` option exists, falls back to `reject_once`.
+    /// This does **not** answer anything. The only answer paths are
+    /// [`Self::settle_pending_permission`] (the client's choice, validated)
+    /// against this request's own option list),
+    /// [`Self::settle_pending_permission_cancelled`] (the turn is stopping or
+    /// nobody could answer), and the read loop's answer/timeout arms. There is
+    /// no auto-allow fallback on any path, and a request that nobody answers
+    /// fails visibly rather than being approved.
     ///
-    /// **Critical:** Never hardcode `optionId` — always find it dynamically by `kind`.
+    /// The returned `PermissionRequest` carries a fresh `nonce`; an answer
+    /// quoting any other nonce is rejected, which is what makes a click that
+    /// outlived its request inert instead of an approval delivered to whatever
+    /// request next reuses the same connection-scoped JSON-RPC id.
     ///
-    /// The request `id` is stored as `serde_json::Value` to support both numeric
+    /// The request `id` is kept as `serde_json::Value` to support both numeric
     /// and string IDs per JSON-RPC 2.0.
-    async fn handle_permission_request(&mut self, msg: &serde_json::Value) -> Result<(), AcpError> {
-        // Extract id as a Value — JSON-RPC 2.0 allows both numeric and string IDs.
-        let id = msg
+    fn register_permission_request(
+        &mut self,
+        msg: &serde_json::Value,
+    ) -> Result<PermissionRequest, AcpError> {
+        // One request at a time: the agent blocks its tool call until it is
+        // answered, so a second concurrent request is a protocol violation.
+        // Overwriting the first would leave the agent waiting for a reply that
+        // never arrives, so this fails loudly instead of dropping it.
+        if self.pending_permission.is_some() {
+            return Err(AcpError::Protocol(
+                "session/request_permission received while another request is still pending".into(),
+            ));
+        }
+        let request_id = msg
             .get("id")
             .cloned()
             .ok_or_else(|| AcpError::Protocol("permission request missing id".into()))?;
 
-        // Store pending permission id so cancel_with_cleanup can respond to it.
-        self.pending_permission_id = Some(id.clone());
-        // Mark as not yet responded — guards against double-response race.
-        self.permission_responded = false;
-
-        let options = msg["params"]["options"]
+        let params = &msg["params"];
+        let options: Vec<PermissionOption> = params["options"]
             .as_array()
-            .ok_or_else(|| AcpError::Protocol("permission request missing options".into()))?;
+            .ok_or_else(|| AcpError::Protocol("permission request missing options".into()))?
+            .iter()
+            .filter_map(|option| {
+                Some(PermissionOption {
+                    option_id: option.get("optionId")?.as_str()?.to_string(),
+                    kind: option.get("kind")?.as_str()?.to_string(),
+                    name: option.get("name").and_then(|n| n.as_str()).map(str::to_string),
+                })
+            })
+            .collect();
+
+        let request = PermissionRequest {
+            nonce: self.next_permission_nonce,
+            request_id,
+            session_id: params
+                .get("sessionId")
+                .and_then(|s| s.as_str())
+                .unwrap_or_default()
+                .to_string(),
+            tool_call_id: params
+                .get("toolCallId")
+                .or_else(|| params.get("tool_call_id"))
+                .and_then(|t| t.as_str())
+                .map(str::to_string),
+            title: params
+                .get("title")
+                .or_else(|| params.get("message"))
+                .or_else(|| params.get("reason"))
+                .and_then(|t| t.as_str())
+                .map(str::to_string),
+            options,
+        };
+        self.next_permission_nonce += 1;
 
         tracing::debug!(
             target: "acp::permission",
-            "session/request_permission id={id}, {} options",
-            options.len()
+            nonce = request.nonce,
+            request_id = %request.request_id,
+            session_id = %request.session_id,
+            options = request.options.len(),
+            "session/request_permission received — awaiting an answer"
         );
 
-        // Find allow_once by kind — NEVER hardcode optionId.
-        let allow_once = options
-            .iter()
-            .find(|opt| opt.get("kind").and_then(|k| k.as_str()) == Some("allow_once"));
+        self.pending_permission = Some(request.clone());
+        Ok(request)
+    }
 
-        let response = if let Some(opt) = allow_once {
-            let option_id = opt["optionId"]
-                .as_str()
-                .ok_or_else(|| AcpError::Protocol("allow_once option missing optionId".into()))?;
-            tracing::info!(
-                target: "acp::permission",
-                "auto-approving permission id={id} with allow_once optionId={option_id:?}"
-            );
-            permission_response_selected(&id, option_id)
-        } else {
-            // No allow_once — fall back to reject_once.
+    /// Announce a just-registered request and arm its answer deadline.
+    ///
+    /// Called immediately after [`Self::register_permission_request`]. An
+    /// attached observer is what makes the request answerable, so that is also
+    /// the condition for announcing it; either way the deadline is armed, so a
+    /// request nobody answers settles `cancelled` instead of holding the turn
+    /// open or — as before S1 — being approved by the harness itself.
+    async fn open_permission_request(&mut self, request: &PermissionRequest) {
+        if self.observer.is_none() {
+            // Nobody can answer this. Waiting would only stall the tool call
+            // for the whole deadline, so settle it now — `cancelled` refuses
+            // the call, which is the only honest outcome when the deployment
+            // has no approval surface at all.
             tracing::warn!(
                 target: "acp::permission",
-                "no allow_once option found in permission request id={id}, falling back to reject_once"
+                nonce = request.nonce,
+                request_id = %request.request_id,
+                session_id = %request.session_id,
+                "no observer attached to answer this permission request — \
+                 settling cancelled instead of leaving the tool call waiting"
             );
-            let reject = options
-                .iter()
-                .find(|opt| opt.get("kind").and_then(|k| k.as_str()) == Some("reject_once"));
-
-            if let Some(opt) = reject {
-                let option_id = opt["optionId"].as_str().unwrap_or("reject");
-                permission_response_selected(&id, option_id)
-            } else {
-                return Err(AcpError::Protocol(
-                    "no suitable permission option found (neither allow_once nor reject_once)"
-                        .into(),
-                ));
+            self.permission_deadline = None;
+            if let Err(error) = self.settle_pending_permission_cancelled().await {
+                tracing::error!(
+                    target: "acp::permission",
+                    nonce = request.nonce,
+                    "failed to write the cancelled outcome for an unanswerable request: {error}"
+                );
             }
-        };
+            return;
+        }
+        self.permission_deadline = Some(tokio::time::Instant::now() + PERMISSION_ANSWER_TIMEOUT);
+        self.announce_permission_request(request);
+    }
 
-        // Write the response first, then mark as responded.
-        //
-        // Previous ordering (flag-before-write) was intended to guard against a
-        // double-response if a timeout fires between write and flag-set. However,
-        // the deadlock risk is worse: if write_ndjson fails (e.g. WriteTimeout),
-        // the flag would be true but no response was actually sent. Then
-        // cancel_with_cleanup would see permission_responded=true, skip sending
-        // the cancelled outcome, and the agent would hang waiting for a reply
-        // that never arrives — a guaranteed deadlock.
-        //
-        // The correct fix: set the flag AFTER a successful write. The double-
-        // response window (between write completion and flag-set) is negligibly
-        // small and bounded by a single memory store; the deadlock window was
-        // unbounded.
-        self.write_ndjson(&response).await?;
-        self.permission_responded = true;
-        self.pending_permission_id = None;
-        Ok(())
+    /// Settle an outstanding permission request whose answer deadline passed.
+    ///
+    /// `cancelled` is ACP's own "no decision" outcome, so the tool call is
+    /// refused rather than approved and the turn keeps running. Logged loudly:
+    /// an expired approval is a client that did not answer, and that is not a
+    /// state the operator should have to infer from a failed tool call.
+    async fn settle_expired_permission(&mut self) {
+        let Some(request) = self.pending_permission.as_ref() else {
+            // Nothing outstanding — the deadline was stale. Clear it so it
+            // cannot keep firing.
+            self.permission_deadline = None;
+            return;
+        };
+        let (nonce, request_id, title) = (
+            request.nonce,
+            request.request_id.clone(),
+            request.title.clone(),
+        );
+        tracing::warn!(
+            target: "acp::permission",
+            nonce,
+            request_id = %request_id,
+            title = title.as_deref().unwrap_or("<untitled>"),
+            "no answer to the permission request before its deadline — settling cancelled"
+        );
+        if let Err(error) = self.settle_pending_permission_cancelled().await {
+            tracing::error!(
+                target: "acp::permission",
+                nonce,
+                "failed to write the cancelled outcome for an expired permission request: {error}"
+            );
+        }
+        self.permission_deadline = None;
+    }
+
+    /// Settle the pending permission request with the client's answer.
+    ///
+    /// Returns `Ok(true)` when this answer was the request's one terminal
+    /// outcome and has been written to the agent. Returns `Ok(false)` when the
+    /// answer addressed nothing — no request pending, a nonce mismatch (a stale
+    /// or replayed answer), or an `option_id` this request never advertised —
+    /// in which case **nothing is written** and the pending request is left
+    /// exactly as it was, so the real answer can still settle it.
+    ///
+    /// Taking the state is what makes settlement once-only: a duplicate answer
+    /// arrives to find `None` and is rejected rather than applied.
+    pub async fn settle_pending_permission(
+        &mut self,
+        answer: &PermissionAnswer,
+    ) -> Result<bool, AcpError> {
+        let Some(request) = self.pending_permission.take() else {
+            tracing::warn!(
+                target: "acp::permission",
+                nonce = answer.nonce,
+                "permission answer rejected: no request pending"
+            );
+            return Ok(false);
+        };
+        if request.nonce != answer.nonce {
+            // Hand the request back untouched: this answer belongs to a
+            // different (earlier) request and must not settle this one.
+            tracing::warn!(
+                target: "acp::permission",
+                answer_nonce = answer.nonce,
+                pending_nonce = request.nonce,
+                "permission answer rejected: nonce does not match the pending request"
+            );
+            self.pending_permission = Some(request);
+            return Ok(false);
+        }
+        if !request
+            .options
+            .iter()
+            .any(|option| option.option_id == answer.option_id)
+        {
+            tracing::warn!(
+                target: "acp::permission",
+                nonce = answer.nonce,
+                option_id = %answer.option_id,
+                "permission answer rejected: optionId was not offered on this request"
+            );
+            self.pending_permission = Some(request);
+            return Ok(false);
+        }
+
+        let response = permission_response_selected(&request.request_id, &answer.option_id);
+        tracing::info!(
+            target: "acp::permission",
+            nonce = answer.nonce,
+            request_id = %request.request_id,
+            option_id = %answer.option_id,
+            "permission request settled with the answered option"
+        );
+        // Write before declaring settled: if the write fails there is no answer
+        // on the wire, and the request must stay answerable rather than leave
+        // the agent waiting for a reply that never arrives.
+        match self.write_ndjson(&response).await {
+            Ok(()) => Ok(true),
+            Err(error) => {
+                self.pending_permission = Some(request);
+                Err(error)
+            }
+        }
+    }
+
+    /// Settle the pending permission request with ACP's `cancelled` outcome.
+    ///
+    /// Used on every path where the request will never receive a decision: the
+    /// turn is being stopped, the answer deadline expired, or no prompter is
+    /// installed to answer it. Like [`Self::settle_pending_permission`] this is
+    /// once-only — the state is taken, so a later answer finds nothing
+    /// pending and is rejected instead of being written on top of this outcome.
+    ///
+    /// Returns `Ok(false)` when no request was pending.
+    pub async fn settle_pending_permission_cancelled(&mut self) -> Result<bool, AcpError> {
+        let Some(request) = self.pending_permission.take() else {
+            return Ok(false);
+        };
+        let response = permission_response_cancelled(&request.request_id);
+        tracing::info!(
+            target: "acp::permission",
+            nonce = request.nonce,
+            request_id = %request.request_id,
+            session_id = %request.session_id,
+            "permission request settled cancelled"
+        );
+        match self.write_ndjson(&response).await {
+            Ok(()) => Ok(true),
+            Err(error) => {
+                self.pending_permission = Some(request);
+                Err(error)
+            }
+        }
+    }
+
+    /// Announce the pending permission request on the observer feed so a client
+    /// UI can render an answerable prompt.
+    ///
+    /// Emitted as its own kind (`permission_request`) rather than inferred from
+    /// the raw `acp_read` frame, for the same reason `control_result` exists:
+    /// the nonce is the identity a UI must echo back, and only this side knows
+    /// it. The raw frame cannot carry it, so a client that reused the JSON-RPC
+    /// id alone could answer a later request that reuses the same id.
+    fn announce_permission_request(&self, request: &PermissionRequest) {
+        let options: Vec<serde_json::Value> = request
+            .options
+            .iter()
+            .map(|option| {
+                serde_json::json!({
+                    "optionId": option.option_id,
+                    "kind": option.kind,
+                    "name": option.name,
+                })
+            })
+            .collect();
+        self.observe(
+            "permission_request",
+            serde_json::json!({
+                "nonce": request.nonce,
+                "requestId": request.request_id,
+                "sessionId": request.session_id,
+                "toolCallId": request.tool_call_id,
+                "title": request.title,
+                "options": options,
+            }),
+        );
     }
 
     /// Parse a completed prompt response and retain its optional per-turn usage.
@@ -2669,6 +3049,281 @@ mod tests {
         assert_eq!(prompt[0]["text"].as_str(), Some("/goal ship it"));
         assert!(prompt[0]["text"].as_str().unwrap().starts_with('/'));
         assert_eq!(prompt[1]["type"].as_str(), Some("text"));
+    }
+
+    // ── permission resolution semantics (S1) ──────────────────────────────
+    //
+    // These pin the properties the auto-answer violated: an answer resolves a
+    // request at most once, only against the request it names, and never by
+    // falling back to approval.
+
+    /// Build the wire request a real omp adapter sends. Option ids are
+    /// deliberately non-obvious, because the harness must never invent one.
+    fn permission_request_msg(nonce_id: u64) -> serde_json::Value {
+        serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": nonce_id,
+            "method": "session/request_permission",
+            "params": {
+                "sessionId": "sess-perm",
+                "toolCallId": "tool-1",
+                "title": "rm -rf /tmp/x",
+                "options": [
+                    { "optionId": "opt-allow-99", "kind": "allow_once", "name": "Allow once" },
+                    { "optionId": "opt-always-7", "kind": "allow_always", "name": "Always allow" },
+                    { "optionId": "opt-reject-42", "kind": "reject_once", "name": "Reject" }
+                ]
+            }
+        })
+    }
+
+    async fn client_with_script(script: &str) -> AcpClient {
+        spawn_script(script).await
+    }
+
+    #[tokio::test]
+    async fn permission_answer_settles_once_and_echoes_the_offered_option() {
+        // `sleep` keeps the child's stdin open long enough to observe the write.
+        let mut client = client_with_script("sleep 5").await;
+        let request = client
+            .register_permission_request(&permission_request_msg(7))
+            .expect("register");
+        assert_eq!(request.options.len(), 3);
+        assert_eq!(request.tool_call_id.as_deref(), Some("tool-1"));
+        assert!(client.has_pending_permission());
+
+        let answer = PermissionAnswer {
+            nonce: request.nonce,
+            // The always-allow id: never hardcoded, echoed from the request.
+            option_id: "opt-always-7".to_string(),
+        };
+        assert_eq!(client.settle_pending_permission(&answer).await.unwrap(), true);
+        assert!(
+            !client.has_pending_permission(),
+            "the request must be gone after it was settled"
+        );
+
+        // Exactly-once: the same answer a second time addresses nothing.
+        assert_eq!(client.settle_pending_permission(&answer).await.unwrap(), false);
+    }
+
+    #[tokio::test]
+    async fn permission_answer_with_a_stale_nonce_is_rejected_and_leaves_the_request() {
+        let mut client = client_with_script("sleep 5").await;
+        let request = client
+            .register_permission_request(&permission_request_msg(7))
+            .expect("register");
+
+        // A click that outlived its request: same JSON-RPC id, earlier nonce.
+        let stale = PermissionAnswer {
+            nonce: request.nonce + 1,
+            option_id: "opt-allow-99".to_string(),
+        };
+        assert_eq!(client.settle_pending_permission(&stale).await.unwrap(), false);
+        assert!(
+            client.has_pending_permission(),
+            "a rejected answer must leave the real request answerable"
+        );
+
+        // The real answer still works — rejection is not a dead end.
+        let real = PermissionAnswer {
+            nonce: request.nonce,
+            option_id: "opt-allow-99".to_string(),
+        };
+        assert_eq!(client.settle_pending_permission(&real).await.unwrap(), true);
+    }
+
+    #[tokio::test]
+    async fn permission_answer_with_an_unoffered_option_is_rejected() {
+        let mut client = client_with_script("sleep 5").await;
+        let request = client
+            .register_permission_request(&permission_request_msg(7))
+            .expect("register");
+
+        let fabricated = PermissionAnswer {
+            nonce: request.nonce,
+            option_id: "opt-allow-always-silently".to_string(),
+        };
+        assert_eq!(
+            client.settle_pending_permission(&fabricated).await.unwrap(),
+            false
+        );
+        assert!(client.has_pending_permission());
+
+        // `optionId` is echoed from the request, never synthesised: the formats
+        // assertion below proves the echoed value reaches the wire verbatim.
+        let real = PermissionAnswer {
+            nonce: request.nonce,
+            option_id: "opt-reject-42".to_string(),
+        };
+        assert_eq!(client.settle_pending_permission(&real).await.unwrap(), true);
+    }
+
+    #[tokio::test]
+    async fn second_concurrent_permission_request_is_a_protocol_error() {
+        let mut client = client_with_script("sleep 5").await;
+        client
+            .register_permission_request(&permission_request_msg(7))
+            .expect("register");
+        // Overwriting the first would leave the agent waiting forever, so this
+        // must fail loudly instead of silently dropping a request.
+        assert!(client
+            .register_permission_request(&permission_request_msg(8))
+            .is_err());
+        assert!(client.has_pending_permission());
+    }
+
+    #[tokio::test]
+    async fn cancel_settles_a_pending_permission_and_clears_it() {
+        let script = r#"
+            echo '{"jsonrpc":"2.0","id":1,"method":"session/request_permission","params":{"sessionId":"sess-perm","toolCallId":"t1","options":[{"optionId":"o1","kind":"allow_once"}]}}'
+            read -t 5 _reply
+            echo '{"jsonrpc":"2.0","id":1,"result":{"stopReason":"cancelled"}}'
+            sleep 2
+        "#;
+        let mut client = client_with_script(script).await;
+        client.last_prompt_id = Some(1);
+        let result = client
+            .cancel_with_cleanup_grace("sess-perm", std::time::Duration::from_secs(5))
+            .await;
+        assert!(matches!(result, Ok(StopReason::Cancelled)), "got {result:?}");
+        assert!(
+            !client.has_pending_permission(),
+            "a stopped turn must leave no pending request behind"
+        );
+    }
+
+    /// The read loop, not the caller, must write the answer: this is the whole
+    /// reason an answer channel exists instead of a pool-side write. The child
+    /// echoes back the exact NDJSON line it received, so the assertion is on
+    /// wire bytes rather than on in-process state.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn read_loop_writes_the_answered_option_for_the_same_request() {
+        let capture = std::env::temp_dir().join(format!(
+            "buzz-acp-permission-answer-{}",
+            uuid::Uuid::new_v4()
+        ));
+        let quoted = capture.to_string_lossy().to_string();
+        let script = format!(
+            r#"
+            echo '{{"jsonrpc":"2.0","id":1,"method":"session/request_permission","params":{{"sessionId":"sess-perm","toolCallId":"t1","options":[{{"optionId":"opt-allow-99","kind":"allow_once"}},{{"optionId":"opt-always-7","kind":"allow_always"}}]}}}}'
+            read -t 5 reply
+            printf '%s
+' "$reply" > '{quoted}'
+            echo '{{"jsonrpc":"2.0","id":999,"result":{{"stopReason":"end_turn"}}}}'
+            sleep 1
+            "#
+        );
+        let mut client = client_with_script(&script).await;
+        client.set_observer(Some(crate::observer::ObserverHandle::in_process()), 0);
+
+        // The answer is queued before the loop starts. It cannot be consumed
+        // early: the select arm is gated on a request being pending.
+        let (tx, rx) = tokio::sync::mpsc::channel::<PermissionAnswer>(1);
+        client.install_permission_answer_rx(rx);
+        tx.send(PermissionAnswer {
+            nonce: 1,
+            option_id: "opt-always-7".to_string(),
+        })
+        .await
+        .expect("queue the answer");
+
+        let max_dur = std::time::Duration::from_secs(10);
+        let result = client
+            .read_until_response_with_idle_timeout(
+                "sess-perm",
+                999,
+                std::time::Duration::from_secs(5),
+                tokio::time::Instant::now() + max_dur,
+                max_dur,
+            )
+            .await;
+        assert!(result.is_ok(), "prompt must complete: {result:?}");
+
+        let written = std::fs::read_to_string(&capture).expect("child captured the answer");
+        let parsed: serde_json::Value =
+            serde_json::from_str(written.trim()).expect("answer is one NDJSON line");
+        assert_eq!(parsed["id"], serde_json::json!(1), "same JSON-RPC id");
+        assert_eq!(parsed["result"]["outcome"]["outcome"], "selected");
+        assert_eq!(
+            parsed["result"]["outcome"]["optionId"],
+            "opt-always-7",
+            "the answered option id must reach the wire verbatim"
+        );
+        assert!(
+            !client.has_pending_permission(),
+            "the request is settled once the answer is written"
+        );
+        let _ = std::fs::remove_file(&capture);
+    }
+
+    /// With no observer there is no approval surface, so the request must be
+    /// refused promptly rather than holding the tool call for the deadline.
+    /// This is the path that replaces the old auto-`allow_once`.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn read_loop_settles_cancelled_when_nothing_can_answer() {
+        let capture = std::env::temp_dir().join(format!(
+            "buzz-acp-permission-unanswerable-{}",
+            uuid::Uuid::new_v4()
+        ));
+        let quoted = capture.to_string_lossy().to_string();
+        let script = format!(
+            r#"
+            echo '{{"jsonrpc":"2.0","id":1,"method":"session/request_permission","params":{{"sessionId":"sess-perm","toolCallId":"t1","options":[{{"optionId":"opt-allow-99","kind":"allow_once"}}]}}}}'
+            read -t 5 reply
+            printf '%s
+' "$reply" > '{quoted}'
+            echo '{{"jsonrpc":"2.0","id":999,"result":{{"stopReason":"end_turn"}}}}'
+            sleep 1
+            "#
+        );
+        let mut client = client_with_script(&script).await;
+        let max_dur = std::time::Duration::from_secs(10);
+        let result = client
+            .read_until_response_with_idle_timeout(
+                "sess-perm",
+                999,
+                std::time::Duration::from_secs(5),
+                tokio::time::Instant::now() + max_dur,
+                max_dur,
+            )
+            .await;
+        assert!(result.is_ok(), "prompt must complete: {result:?}");
+
+        let written = std::fs::read_to_string(&capture).expect("child captured the outcome");
+        let parsed: serde_json::Value =
+            serde_json::from_str(written.trim()).expect("one NDJSON line");
+        assert_eq!(
+            parsed["result"]["outcome"]["outcome"], "cancelled",
+            "an unanswerable request must be refused, never approved"
+        );
+        assert!(
+            parsed["result"]["outcome"].get("optionId").is_none(),
+            "a cancelled outcome carries no option"
+        );
+        let _ = std::fs::remove_file(&capture);
+    }
+
+    /// An answer arriving for a turn whose request already settled must not be
+    /// written, even though the receiver is still installed.
+    #[tokio::test]
+    async fn answer_after_settlement_writes_nothing() {
+        let mut client = client_with_script("sleep 5").await;
+        let request = client
+            .register_permission_request(&permission_request_msg(7))
+            .expect("register");
+        client
+            .settle_pending_permission_cancelled()
+            .await
+            .expect("cancel the request");
+        let late = PermissionAnswer {
+            nonce: request.nonce,
+            option_id: "opt-allow-99".to_string(),
+        };
+        assert_eq!(client.settle_pending_permission(&late).await.unwrap(), false);
+        assert!(!client.has_pending_permission());
     }
 
     #[test]
