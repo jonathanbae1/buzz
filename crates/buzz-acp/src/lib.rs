@@ -1625,7 +1625,7 @@ fn handle_relay_observer_control_event(
             handle_dispatch_command_control(&payload, pool, observer, &config);
         }
         Some("permission_response") => {
-            handle_permission_response_control(&payload, pool, observer);
+            handle_permission_response_control(&payload, pool, observer, prompt_context);
         }
         Some("set_session_config") => {
             handle_set_session_config_control(&payload, pool, observer);
@@ -1661,6 +1661,7 @@ fn handle_permission_response_control(
     payload: &serde_json::Value,
     pool: &mut AgentPool,
     observer: Option<&observer::ObserverHandle>,
+    prompt_context: &PromptContext,
 ) {
     let request_id = payload
         .get("requestId")
@@ -1695,7 +1696,7 @@ fn handle_permission_response_control(
     };
 
     let answer = PermissionAnswer { nonce, option_id };
-    match pool.send_permission_answer(&session_id, answer) {
+    match pool.send_permission_answer(&session_id, answer, &prompt_context.live_session_scopes) {
         Ok(()) => {
             emit_permission_response_result(observer, &request_id, Some(&session_id), "sent", None)
         }
@@ -3727,6 +3728,7 @@ async fn tokio_main() -> Result<()> {
     }
 
     let ctx = Arc::new(PromptContext {
+        live_session_scopes: Default::default(),
         mcp_servers: build_mcp_servers(&config),
         initial_message: config.initial_message.clone(),
         idle_timeout: Duration::from_secs(config.idle_timeout_secs),

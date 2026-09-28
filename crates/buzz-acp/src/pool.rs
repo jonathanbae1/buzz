@@ -859,6 +859,11 @@ impl ChannelInfoResolver {
 }
 
 pub struct PromptContext {
+    /// Sessions created by in-flight turns, keyed by ACP session id. The durable
+    /// `AgentPool::session_scopes` index is refreshed only when a worker returns,
+    /// so a permission request raised during the first turn of a new session is
+    /// otherwise unroutable — and that turn cannot return until it is answered.
+    pub live_session_scopes: Arc<std::sync::Mutex<HashMap<String, SessionScope>>>,
     pub mcp_servers: Vec<McpServer>,
     pub initial_message: Option<String>,
     pub idle_timeout: Duration,
@@ -1435,15 +1440,20 @@ impl AgentPool {
         &mut self,
         session_id: &str,
         answer: PermissionAnswer,
+        live_session_scopes: &std::sync::Mutex<HashMap<String, SessionScope>>,
     ) -> Result<(), PermissionAnswerError> {
         // Resolve the session's scope first — `session_scopes` is the durable
-        // session→scope index and borrowing it separately keeps the task lookup
-        // below free of a double borrow of `self`.
-        let scope = self
-            .session_scopes
-            .get(session_id)
-            .cloned()
-            .ok_or(PermissionAnswerError::UnknownSession)?;
+        // session→scope index; a session created by the turn still in flight is
+        // only in the live registry until its worker returns.
+        let scope = match self.session_scopes.get(session_id) {
+            Some(scope) => scope.clone(),
+            None => live_session_scopes
+                .lock()
+                .map_err(|_| PermissionAnswerError::UnknownSession)?
+                .get(session_id)
+                .cloned()
+                .ok_or(PermissionAnswerError::UnknownSession)?,
+        };
         let meta = self
             .task_map
             .values_mut()
@@ -3009,6 +3019,9 @@ pub async fn run_prompt_task(
                             scope.telemetry_label()
                         );
                         agent.state.sessions.insert(scope.clone(), sid.clone());
+                        if let Ok(mut live) = ctx.live_session_scopes.lock() {
+                            live.insert(sid.clone(), scope.clone());
+                        }
                         if origin_channel_type.as_deref() == Some("dm") {
                             agent.state.dm_scopes.insert(scope.clone());
                         }
@@ -8543,6 +8556,50 @@ printf '%s\n' '{{"jsonrpc":"2.0","id":0,"result":{{"stopReason":"end_turn"}}}}'"
         );
     }
 
+    /// The first turn of a brand-new session raises its permission request
+    /// before the worker returns, so the durable index does not know the
+    /// session yet. The answer must still reach that turn through the live
+    /// registry — otherwise the turn waits on an approval it can never get.
+    #[tokio::test]
+    async fn permission_answer_reaches_a_first_turn_session_via_the_live_registry() {
+        let mut pool = AgentPool::from_slots(vec![]);
+        let scope = conv(Uuid::new_v4());
+        let (tx, mut rx) = tokio::sync::mpsc::channel::<PermissionAnswer>(1);
+        let abort = pool.join_set.spawn(async {});
+        pool.task_map_mut().insert(
+            abort.id(),
+            TaskMeta {
+                agent_index: 0,
+                channel_id: Some(scope.channel_id()),
+                scope: Some(scope.clone()),
+                turn_id: "t".into(),
+                recoverable_batch: None,
+                control_tx: None,
+                steer_tx: None,
+                permission_tx: Some(tx),
+                config_tx: None,
+                successful_steer_deliveries: HashSet::new(),
+            },
+        );
+        let live = std::sync::Mutex::new(HashMap::from([("fresh-session".to_string(), scope)]));
+        let answer = |option: &str| PermissionAnswer {
+            nonce: 7,
+            option_id: option.into(),
+        };
+
+        pool.send_permission_answer("fresh-session", answer("allow_once"), &live)
+            .expect("a session known only to the live registry is answerable");
+        assert_eq!(
+            rx.try_recv().expect("answer delivered").option_id,
+            "allow_once"
+        );
+
+        assert!(matches!(
+            pool.send_permission_answer("never-created", answer("allow_once"), &live),
+            Err(PermissionAnswerError::UnknownSession)
+        ));
+    }
+
     /// An idle agent (slot 0) holding a provider session for `scope`, so
     /// `has_session_for(scope)` is true.
     async fn idle_agent_with_session(scope: SessionScope) -> OwnedAgent {
@@ -10043,6 +10100,7 @@ printf '%s\n' '{{"jsonrpc":"2.0","id":0,"result":{{"stopReason":"end_turn"}}}}'"
     ) -> PromptContext {
         use crate::relay::RestClient;
         PromptContext {
+            live_session_scopes: Default::default(),
             mcp_servers: vec![],
             initial_message: None,
             idle_timeout: Duration::from_secs(60),
