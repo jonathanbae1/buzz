@@ -893,6 +893,59 @@ fn spawn_snapshot_instance_args_win_over_definition_args() {
     );
 }
 
+/// The omb harness is registered using Buzz's real JSON loader, then resolved
+/// through persona re-snapshot, spawn, and the prospective restart snapshot.
+#[test]
+fn omb_custom_harness_survives_persona_resnapshot() {
+    use crate::managed_agents::{
+        custom_harnesses::{registry_test_lock, warm_harness_registry_from_dir},
+        persona_events::apply_persona_snapshot,
+        resolve_effective_harness_descriptor,
+    };
+    use std::fs;
+    use tempfile::tempdir;
+
+    let _lock = registry_test_lock();
+    let dir = tempdir().unwrap();
+    fs::write(
+        dir.path().join("omb.json"),
+        include_str!("../../../tests/fixtures/custom_harnesses/omb.json"),
+    )
+    .unwrap();
+    warm_harness_registry_from_dir(Some(dir.path()));
+
+    let mut persona = persona("scout", Some("omb"), "Read-only scout.");
+    persona.env_vars.insert("OMP_PROFILE".into(), "scout".into());
+    let personas = [persona.clone()];
+    let mut rec = record();
+    rec.persona_id = Some(persona.id.clone());
+    rec.agent_command = "omp".into();
+    rec.agent_command_override = Some("omp".into());
+    rec.runtime = Some("omp".into());
+
+    apply_persona_snapshot(&mut rec, &persona);
+    assert_eq!(rec.runtime.as_deref(), Some("omb"));
+    assert_eq!(rec.agent_command, "omp", "legacy command snapshots are not pins");
+    assert_eq!(rec.agent_command_override, None);
+
+    let descriptor =
+        resolve_effective_harness_descriptor(&rec, &personas, &Default::default()).unwrap();
+    assert_eq!(
+        descriptor.command,
+        "/Users/juwonbae/.local/share/omb/omb"
+    );
+    assert_eq!(descriptor.args, ["acp"]);
+
+    let spawn_snapshot = snapshot(&rec, &personas, &[], "ws://relay", &Default::default());
+    assert_eq!(
+        spawn_snapshot["command"],
+        "/Users/juwonbae/.local/share/omb/omb"
+    );
+    assert_eq!(spawn_snapshot["args"], serde_json::json!(["acp"]));
+    assert_eq!(spawn_snapshot["env"]["OMP_PROFILE"], "scout");
+}
+
+
 // ── Parallelism cap: above-cap equivalence + cap crossing ─────────────────────
 //
 // The snapshot stores the *effective* parallelism (min(requested, harness cap))
