@@ -912,7 +912,8 @@ fn omb_custom_harness_survives_persona_resnapshot() {
     .unwrap();
     warm_harness_registry_from_dir(Some(dir.path()));
 
-    let persona = persona("scout", Some("omb"), "Read-only scout.");
+    let mut persona = persona("scout", Some("omb"), "Read-only scout.");
+    persona.env_vars.insert("OMP_PROFILE".into(), "scout".into());
     let personas = [persona.clone()];
     let mut rec = record();
     rec.persona_id = Some(persona.id.clone());
@@ -939,6 +940,7 @@ fn omb_custom_harness_survives_persona_resnapshot() {
         "/Users/juwonbae/.local/share/omb/omb"
     );
     assert_eq!(spawn_snapshot["args"], serde_json::json!(["acp"]));
+    assert_eq!(spawn_snapshot["env"]["OMP_PROFILE"], "scout");
 }
 
 
