@@ -7,6 +7,9 @@ import {
 
 type SettingsRouteSearch = {
   section?: SettingsSection;
+  model?: string;
+  lane?: string;
+  profile?: string;
 };
 
 function validateSettingsSearch(
@@ -18,6 +21,9 @@ function validateSettingsSearch(
 
   return {
     section: isSettingsSection(search.section) ? search.section : undefined,
+    model: typeof search.model === "string" ? search.model : undefined,
+    lane: typeof search.lane === "string" ? search.lane : undefined,
+    profile: typeof search.profile === "string" ? search.profile : undefined,
   };
 }
 

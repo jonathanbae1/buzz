@@ -2328,17 +2328,6 @@ fn emit_session_lifecycle_result(
     );
 }
 
-fn session_cwd<'a>(value: &'a serde_json::Value, session_id: &str) -> Option<&'a str> {
-    value
-        .get("sessions")?
-        .as_array()?
-        .iter()
-        .find(|session| {
-            session.get("sessionId").and_then(serde_json::Value::as_str) == Some(session_id)
-        })?
-        .get("cwd")?
-        .as_str()
-}
 
 fn filter_sessions_by_cwd(value: &serde_json::Value, cwd: &str) -> serde_json::Value {
     let sessions = value
@@ -2379,7 +2368,7 @@ fn sanitize_session_list(value: &serde_json::Value) -> serde_json::Value {
 
 #[cfg(test)]
 mod session_lifecycle_projection_tests {
-    use super::{filter_sessions_by_cwd, sanitize_session_list, session_cwd};
+    use super::{filter_sessions_by_cwd, sanitize_session_list};
 
     #[test]
     fn session_list_is_scoped_to_owner_workspace_without_publishing_paths() {
@@ -2389,8 +2378,6 @@ mod session_lifecycle_projection_tests {
                 { "sessionId": "other", "cwd": "/private/other", "title": "Other", "updatedAt": "later" }
             ]
         });
-        assert_eq!(session_cwd(&sessions, "owned"), Some("/private/project"));
-        assert_eq!(session_cwd(&sessions, "missing"), None);
         let owner_sessions = filter_sessions_by_cwd(&sessions, "/private/project");
         let public = sanitize_session_list(&owner_sessions);
         assert_eq!(public.as_array().unwrap().len(), 1);

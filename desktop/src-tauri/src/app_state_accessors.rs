@@ -19,25 +19,25 @@ impl AppState {
         self.huddle_state.lock().map_err(|e| e.to_string())
     }
 
-    pub fn get_session_cache(&self, key: &ManagedAgentRuntimeKey) -> Option<SessionConfigCache> {
-        self.session_config_cache.lock().ok()?.get(key).cloned()
+    pub fn get_session_cache(&self, key: &ManagedAgentRuntimeKey, session_id: &str) -> Option<SessionConfigCache> {
+        self.session_config_cache.lock().ok()?.get(&(key.clone(), session_id.to_string())).cloned()
     }
 
-    pub fn put_session_cache(&self, key: ManagedAgentRuntimeKey, cache: SessionConfigCache) {
+    pub fn put_session_cache(&self, key: ManagedAgentRuntimeKey, session_id: String, cache: SessionConfigCache) {
         if let Ok(mut map) = self.session_config_cache.lock() {
-            map.insert(key, cache);
+            map.insert((key, session_id), cache);
         }
     }
 
     pub fn clear_agent_session_cache(&self, key: &ManagedAgentRuntimeKey) {
         if let Ok(mut map) = self.session_config_cache.lock() {
-            map.remove(key);
+            map.retain(|(runtime_key, _), _| runtime_key != key);
         }
     }
 
     pub fn clear_agent_session_caches(&self, pubkey: &str) {
         if let Ok(mut map) = self.session_config_cache.lock() {
-            map.retain(|key, _| key.pubkey != pubkey);
+            map.retain(|(key, _), _| key.pubkey != pubkey);
         }
     }
 

@@ -239,7 +239,10 @@ export function ManagedAgentSessionPanel({
       ) : null}
       {latestSessionId ? (
         <SessionConfigControls
-          agentPubkey={agent.pubkey}
+          agent={agent}
+          channelId={channelId}
+          isBusy={stopTargets.length > 0}
+          isRunning={hasObserver}
           sessionId={latestSessionId}
         />
       ) : null}

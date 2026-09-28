@@ -4775,6 +4775,30 @@ mod tests {
         assert!(result.is_ok(), "expected Ok, got {result:?}");
         assert_eq!(result.unwrap()["worked"], serde_json::json!(true));
     }
+    #[tokio::test]
+    async fn session_list_hides_raw_rpc_frames_from_observer() {
+        let script = r#"
+            read -t 2 _request
+            echo '{"jsonrpc":"2.0","id":0,"result":{"sessions":[{"sessionId":"one","cwd":"/private/work"}]}}'
+            sleep 1
+        "#;
+        let mut client = spawn_script(script).await;
+        let observer = crate::observer::ObserverHandle::in_process();
+        client.set_observer(Some(observer.clone()), 0);
+
+        let result = client
+            .session_list("/private/work")
+            .await
+            .expect("session/list response");
+
+        assert_eq!(result["sessions"][0]["cwd"], "/private/work");
+        assert!(
+            observer.snapshot().iter().all(|event| {
+                event.kind != "acp_write" && event.kind != "acp_read"
+            }),
+            "lifecycle request and response frames must not be published"
+        );
+    }
 
     #[tokio::test]
     async fn keepalive_resets_idle_past_deadline() {

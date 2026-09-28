@@ -8770,6 +8770,35 @@ printf '%s\n' '{{"jsonrpc":"2.0","id":0,"result":{{"stopReason":"end_turn"}}}}'"
         );
         pool.return_agent(agent);
     }
+    #[tokio::test]
+    async fn lifecycle_requires_a_server_verified_dm_scope() {
+        let scope = conv(Uuid::new_v4());
+        let agent = idle_agent_with_session(scope).await;
+        let mut pool = AgentPool::from_slots(vec![Some(agent)]);
+
+        assert!(matches!(
+            pool.take_session_lifecycle_agent("sess"),
+            Err(AgentCommandTarget::StaleSession)
+        ));
+    }
+
+    #[tokio::test]
+    async fn lifecycle_rejects_sessions_bound_to_another_conversation() {
+        let dm_scope = conv(Uuid::new_v4());
+        let other_scope = conv(Uuid::new_v4());
+        let mut dm_agent = idle_agent_with_session(dm_scope.clone()).await;
+        dm_agent.state.dm_scopes.insert(dm_scope.clone());
+        let mut other_agent = idle_agent_with_session(other_scope.clone()).await;
+        other_agent.index = 1;
+        other_agent
+            .state
+            .sessions
+            .insert(other_scope.clone(), "other".into());
+        let pool = AgentPool::from_slots(vec![Some(dm_agent), Some(other_agent)]);
+
+        assert!(pool.lifecycle_target_is_unowned_or_in_scope("sess", &dm_scope));
+        assert!(!pool.lifecycle_target_is_unowned_or_in_scope("other", &dm_scope));
+    }
 
     #[test]
     fn test_rotate_after_natural_completion_invalidates_channel_state() {

@@ -1,20 +1,15 @@
 import { ChevronDown } from "lucide-react";
 import { toast } from "sonner";
-
-import { Spinner } from "@/shared/ui/spinner";
 import React from "react";
-import { useQueryClient } from "@tanstack/react-query";
+import { useNavigate } from "@tanstack/react-router";
 
-import type { AgentModelsResponse, ManagedAgent } from "@/shared/api/types";
-import { getAgentModels, updateManagedAgent } from "@/shared/api/tauri";
-import { switchManagedAgentModel } from "@/shared/api/agentControl";
-import { awaitLiveSwitchOutcome } from "@/features/agents/lib/liveSwitchOutcome";
+import type {
+  AcpConfigOptionValue,
+  ManagedAgent,
+  RuntimeConfigSurface,
+} from "@/shared/api/types";
+import { setSessionConfigOption } from "@/shared/api/agentControl";
 import { subscribeControlResults } from "@/features/agents/observerRelayStore";
-import { useActiveAgentTurns } from "@/features/agents/activeAgentTurnsStore";
-import {
-  useAgentConfigSurface,
-  managedAgentsQueryKey,
-} from "@/features/agents/hooks";
 import { Button } from "@/shared/ui/button";
 import {
   DropdownMenu,
@@ -23,276 +18,152 @@ import {
   DropdownMenuRadioItem,
   DropdownMenuTrigger,
 } from "@/shared/ui/dropdown-menu";
-import { resolveModelLabel } from "@/features/agents/lib/formatAgentModelLabel";
 
 export function ModelPicker({
   agent,
+  channelId,
+  sessionId,
+  configSurface,
+  isRunning,
+  isBusy,
   onModelChanged,
 }: {
-  agent: ManagedAgent;
+  agent: Pick<ManagedAgent, "pubkey" | "name">;
+  channelId: string;
+  sessionId: string;
+  configSurface: RuntimeConfigSurface;
+  isRunning: boolean;
+  isBusy: boolean;
   onModelChanged?: () => void;
 }) {
-  const [modelsData, setModelsData] =
-    React.useState<AgentModelsResponse | null>(null);
-  const [loading, setLoading] = React.useState(false);
-  const [error, setError] = React.useState<string | null>(null);
   const [saving, setSaving] = React.useState(false);
-  const [needsRestart, setNeedsRestart] = React.useState(false);
-  const [hasRequestedModels, setHasRequestedModels] = React.useState(false);
+  const [message, setMessage] = React.useState<string | null>(null);
+  const navigate = useNavigate();
+  const options = configSurface.modelOptions ?? [];
+  const selectedModel = configSurface.normalized.model?.value ?? "";
+  const laneKey = configSurface.ompProfile?.modelLane;
+  const profile = configSurface.ompProfile?.selectedName;
 
-  const { data: configSurface } = useAgentConfigSurface(agent.pubkey);
-  const queryClient = useQueryClient();
-
-  const isRunning = agent.status === "running" || agent.status === "deployed";
-  const activeTurns = useActiveAgentTurns(agent.pubkey);
-  // A live switch rides the agent's running session(s) instead of persisting a
-  // new default. It applies only to a persona-linked running agent with at
-  // least one active turn — those are the channels the desktop can name in the
-  // `switch_model` frame (the ModelPicker has no other channel context). The
-  // harness then routes each named channel itself: a channel still mid-turn
-  // cancel-switch-requeues; one that finished between send and receipt takes
-  // the idle invalidate-and-reapply path. A persona-linked agent that is
-  // running but wholly idle has no nameable channel here, so it falls through
-  // to persisting the default (the only reachable lever from this surface).
-  const isLiveSwitch =
-    agent.personaId !== null && isRunning && activeTurns.length > 0;
-
-  const fetchModels = React.useCallback(async () => {
-    setLoading(true);
-    setError(null);
-    try {
-      const data = await getAgentModels(agent.pubkey);
-      setModelsData(data);
-    } catch (err) {
-      setError(err instanceof Error ? err.message : String(err));
-    } finally {
-      setLoading(false);
-    }
-  }, [agent.pubkey]);
-
-  const handleOpenChange = React.useCallback(
-    (open: boolean) => {
-      if (!open || loading || modelsData) {
-        return;
-      }
-
-      setHasRequestedModels(true);
-      void fetchModels();
-    },
-    [fetchModels, loading, modelsData],
-  );
-
-  const currentValue = agent.model ?? modelsData?.agentDefaultModel ?? "";
-  const displayLabel = agent.model
-    ? resolveModelLabel(agent.model, null, agent.provider)
-    : modelsData?.agentDefaultModel
-      ? `${resolveModelLabel(modelsData.agentDefaultModel, null, agent.provider)} (default)`
-      : hasRequestedModels && loading
-        ? "Loading..."
-        : "Auto";
-
-  // Provenance label shown only for post-spawn agents where the model origin
-  // is known from the config surface and the source is not a user-explicit
-  // Buzz setting (which is already self-evident from the picker state).
-  const modelOriginLabel = React.useMemo(() => {
-    const origin = configSurface?.normalized.model?.origin;
-    if (!origin || origin === "buzzExplicit") return null;
-    const labels: Record<string, string> = {
-      acpNativeRead: "from ACP",
-      acpConfigOption: "from ACP config",
-      envVar: "from env",
-      configFile: "from config file",
-      personaDefault: "template default",
-      runtimeOverride: "live override",
-    };
-    return labels[origin] ?? null;
-  }, [configSurface]);
-
-  // Send a live `switch_model` frame to each channel the agent is working in
-  // and wait for the harness to acknowledge. A single `unsupported_model`
-  // (model unavailable) or `failure` (adapter refused) result rejects the whole
-  // pick immediately. The busy-path `sent` ack is provisional (the adapter
-  // isn't consulted until the requeued session); success is confirmed only by a
-  // real positive terminal frame from every channel, and if none arrives before
-  // the timeout the pick resolves `"pending"` (accepted, apply deferred).
-  const sendLiveSwitch = React.useCallback(
+  const applyModel = React.useCallback(
     (modelId: string) => {
-      const channelIds = activeTurns.map((turn) => turn.channelId);
-      // Opaque per-pick correlator. The harness echoes it on the immediate ack
-      // and the late terminal frame, so a five-minute reconnect replay of an
-      // earlier pick's result cannot settle this one.
       const requestId = crypto.randomUUID();
-      return awaitLiveSwitchOutcome({
-        requestId,
-        channelIds,
-        subscribe: (listener) =>
-          subscribeControlResults(agent.pubkey, listener),
-        sendSwitches: async () => {
-          await Promise.all(
-            channelIds.map((channelId) =>
-              switchManagedAgentModel(
-                agent.pubkey,
-                channelId,
-                modelId,
-                requestId,
-              ),
-            ),
-          );
-        },
-        // No positive terminal in time: resolve `"pending"`. The override still
-        // rides the requeued/next session; we just can't confirm synchronously,
-        // and must not claim a success that hasn't happened.
-        scheduleTimeout: (onTimeout) => {
-          const timeout = window.setTimeout(onTimeout, 8_000);
-          return () => window.clearTimeout(timeout);
-        },
+      return new Promise<"applied" | "rejected" | "failed" | "pending">((resolve) => {
+        let unsubscribe = () => {};
+        const timeout = window.setTimeout(() => {
+          unsubscribe();
+          resolve("pending");
+        }, 8_000);
+        unsubscribe = subscribeControlResults(agent.pubkey, (frame) => {
+          if (
+            frame.type !== "set_session_config" ||
+            frame.category !== "model" ||
+            frame.requestId !== requestId ||
+            frame.sessionId !== sessionId
+          ) {
+            return;
+          }
+          if (frame.status !== "applied" && frame.status !== "rejected") return;
+          window.clearTimeout(timeout);
+          unsubscribe();
+          resolve(frame.status);
+        });
+        void setSessionConfigOption(
+          agent.pubkey,
+          sessionId,
+          "model",
+          modelId,
+          requestId,
+        ).catch(() => {
+          window.clearTimeout(timeout);
+          unsubscribe();
+          resolve("failed");
+        });
       });
     },
-    [activeTurns, agent.pubkey],
+    [agent.pubkey, sessionId],
   );
 
   const handleModelChange = async (modelId: string) => {
     setSaving(true);
-    setError(null);
+    setMessage(null);
     try {
-      if (isLiveSwitch) {
-        const outcome = await sendLiveSwitch(modelId);
-        if (outcome === "ambiguous") {
-          toast.error(
-            "Couldn't switch all sessions — a channel has multiple agent sessions. Stop and restart the agent with the new model.",
-          );
-          return;
-        }
-        if (outcome === "unsupported") {
-          toast.error("That model isn't available for this agent.");
-          return;
-        }
-        if (outcome === "failed") {
-          toast.error(
-            "Couldn't switch models — the agent kept its current model.",
-          );
-          return;
-        }
-        if (outcome === "not_delivered") {
-          // The switch never reached a session: the turn was already ending, or
-          // no active turn remained by the time the harness received it. Nothing
-          // was applied and nothing rides a later session — tell the truth.
-          toast.error(
-            "Couldn't switch models — the agent wasn't running a turn to switch.",
-          );
-          return;
-        }
-        if (outcome === "pending") {
-          // The switch was accepted but its apply is deferred to the next
-          // session (the agent is mid-turn) and didn't confirm before the
-          // fallback timeout. Tell the truth instead of claiming success.
-          toast.info(
-            "Model switch pending — applies when the current turn finishes.",
-          );
-          onModelChanged?.();
-          return;
-        }
-        toast.success("Model switched for this session.");
+      const outcome = await applyModel(modelId);
+      if (outcome === "failed" || outcome === "rejected") {
+        setMessage(outcome === "rejected" ? "The session rejected this model change." : "The model change could not be sent.");
+      } else if (outcome === "pending") {
+        setMessage("Waiting for the session to confirm the model change.");
+      } else {
+        toast.success("Model changed for this session.");
         onModelChanged?.();
-        return;
       }
-
-      // Non-live path (idle, stopped, or non-persona): persist the default.
-      await updateManagedAgent({
-        pubkey: agent.pubkey,
-        model: modelId === modelsData?.agentDefaultModel ? null : modelId,
-      });
-      void queryClient.invalidateQueries({ queryKey: managedAgentsQueryKey });
-      if (isRunning) {
-        setNeedsRestart(true);
-      }
-      onModelChanged?.();
-    } catch (err) {
-      setError(err instanceof Error ? err.message : String(err));
+    } catch (error) {
+      setMessage(error instanceof Error ? error.message : String(error));
     } finally {
       setSaving(false);
     }
   };
 
+  const navigateToLaneEditor = () => {
+    if (!laneKey || !selectedModel) return;
+    void navigate({
+      to: "/settings",
+      search: {
+        section: "agents",
+        lane: laneKey,
+        model: selectedModel,
+        profile: profile ?? undefined,
+      },
+    });
+  };
+
   return (
     <span className="inline-flex items-center gap-1.5">
-      <DropdownMenu modal={false} onOpenChange={handleOpenChange}>
+      <DropdownMenu modal={false}>
         <DropdownMenuTrigger asChild>
           <Button
             className="h-7 max-w-full justify-start gap-1.5 rounded-full border border-border/50 bg-muted/45 px-2.5 text-xs font-medium text-foreground shadow-none hover:bg-muted/70"
-            disabled={saving}
+            disabled={saving || options.length === 0 || !channelId || !isRunning || isBusy}
             size="sm"
             type="button"
             variant="ghost"
           >
-            <span className="truncate">{displayLabel}</span>
-            {modelOriginLabel ? (
-              <span className="shrink-0 text-2xs text-muted-foreground/70">
-                ({modelOriginLabel})
-              </span>
-            ) : null}
+            <span className="truncate">
+              {options.find((option) => option.value === selectedModel)?.displayName ?? selectedModel ?? "Model"}
+            </span>
             <ChevronDown className="h-4 w-4 text-muted-foreground" />
           </Button>
         </DropdownMenuTrigger>
-        <DropdownMenuContent
-          align="start"
-          className="max-h-64 min-w-48 overflow-y-auto"
-          onCloseAutoFocus={(event) => event.preventDefault()}
-        >
-          {loading ? (
-            <div className="flex items-center gap-2 px-3 py-2 text-sm text-muted-foreground">
-              <Spinner className="h-4 w-4 border-2" />
-              Loading models...
-            </div>
-          ) : error ? (
-            <div className="space-y-2 px-3 py-2 text-sm">
-              <p className="text-destructive">Failed to load models.</p>
-              <button
-                className="text-xs text-muted-foreground underline underline-offset-2 hover:text-foreground"
-                onClick={() => {
-                  setHasRequestedModels(true);
-                  void fetchModels();
-                }}
-                type="button"
-              >
-                Retry
-              </button>
-            </div>
-          ) : !modelsData ? (
-            <div className="px-3 py-2 text-sm text-muted-foreground">
-              Open to load available models.
-            </div>
-          ) : !modelsData.supportsSwitching ? (
-            <div className="px-3 py-2 text-sm text-muted-foreground">
-              {agent.model ? (
-                <>
-                  <p className="font-medium text-foreground">
-                    {resolveModelLabel(agent.model, null, agent.provider)}
-                  </p>
-                  <p className="mt-0.5 text-xs">
-                    This runtime does not support switching models.
-                  </p>
-                </>
-              ) : (
-                "This agent uses the runtime's default model."
-              )}
-            </div>
-          ) : (
-            <DropdownMenuRadioGroup
-              onValueChange={handleModelChange}
-              value={currentValue}
-            >
-              {modelsData.models.map((model) => (
-                <DropdownMenuRadioItem key={model.id} value={model.id}>
-                  {resolveModelLabel(model.id, model.name, agent.provider)}
-                </DropdownMenuRadioItem>
-              ))}
-            </DropdownMenuRadioGroup>
-          )}
+        <DropdownMenuContent align="start" className="max-h-64 min-w-48 overflow-y-auto">
+          <DropdownMenuRadioGroup onValueChange={handleModelChange} value={selectedModel}>
+            {options.map((option: AcpConfigOptionValue) => (
+              <DropdownMenuRadioItem key={option.value} value={option.value}>
+                {option.displayName ?? option.value}
+              </DropdownMenuRadioItem>
+            ))}
+          </DropdownMenuRadioGroup>
         </DropdownMenuContent>
       </DropdownMenu>
-      {needsRestart ? (
-        <span className="text-2xs text-warning">restart to apply</span>
+      {laneKey && selectedModel ? (
+        <>
+          <Button disabled={saving || !isRunning || isBusy} onClick={navigateToLaneEditor} size="sm" type="button" variant="ghost">
+            Make this the lane
+          </Button>
+          <span className="text-xs text-muted-foreground">This session only.</span>
+        </>
+      ) : null}
+      {!isRunning ? (
+        <span className="text-xs text-muted-foreground" role="status">
+          Start the agent to switch models for this session.
+        </span>
+      ) : isBusy ? (
+        <span className="text-xs text-muted-foreground" role="status">
+          Wait for the current turn to finish before changing this session.
+        </span>
+      ) : null}
+      {message ? (
+        <span className="text-xs text-muted-foreground" role="status">
+          {message}
+        </span>
       ) : null}
     </span>
   );
