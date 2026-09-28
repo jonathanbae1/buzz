@@ -58,6 +58,7 @@ pub(super) fn sample_record() -> ManagedAgentRecord {
         source_team_persona_slug: None,
         catalog_source: None,
         team_catalog_source: None,
+        deployment_identity: None,
         definition_respond_to: None,
         definition_respond_to_allowlist: Vec::new(),
         definition_parallelism: None,
@@ -177,6 +178,7 @@ pub(super) fn sample_persona() -> AgentDefinition {
         source_team_persona_slug: Some("test-slug".to_string()),
         catalog_source: None,
         team_catalog_source: None,
+        deployment_identity: None,
         env_vars: BTreeMap::from([("KEY".to_string(), "value".to_string())]),
         respond_to: None,
         respond_to_allowlist: Vec::new(),
@@ -407,6 +409,7 @@ fn content_matches_nip_ap_vector() {
         source_team_persona_slug: None,
         catalog_source: None,
         team_catalog_source: None,
+        deployment_identity: None,
         env_vars: BTreeMap::new(),
         respond_to: None,
         respond_to_allowlist: Vec::new(),
@@ -446,7 +449,9 @@ fn round_trip_minimal_persona() {
         parallelism: None,
         created_at: "2025-01-01T00:00:00Z".to_string(),
         updated_at: "2025-01-01T00:00:00Z".to_string(),
-    };
+    
+deployment_identity: None,
+};
 
     let builder = build_persona_event(&record).unwrap();
     let keys = nostr::Keys::generate();
@@ -545,7 +550,9 @@ fn quad_absent_definition_hash_stable_across_activation() {
         parallelism: None,
         created_at: "2026-01-01T00:00:00Z".to_string(),
         updated_at: "2026-01-01T00:00:00Z".to_string(),
-    };
+    
+deployment_identity: None,
+};
     let live = persona_event_content(&record);
     // The reserved-era projection: identical fields, quad hardcoded off.
     let reserved_era = PersonaEventContent {
@@ -591,7 +598,10 @@ fn persona_from_event_content_for_test(content: PersonaEventContent) -> AgentDef
         parallelism: content.parallelism,
         created_at: "2026-01-01T00:00:00Z".to_string(),
         updated_at: "2026-01-01T00:00:00Z".to_string(),
-    }
+    
+deployment_identity: None,
+}
+
 }
 
 #[test]

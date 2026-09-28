@@ -69,6 +69,7 @@ fn make_agent(
         source_team_persona_slug: None,
         catalog_source: None,
         team_catalog_source: None,
+        deployment_identity: None,
         relay_mesh: None,
         effort_level: None,
         session_mode: None,

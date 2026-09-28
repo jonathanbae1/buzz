@@ -41,6 +41,7 @@ fn refresh_builtin_agent_avatars_updates_seeded_values_and_preserves_customizati
         source_team_persona_slug: None,
         catalog_source: None,
         team_catalog_source: None,
+        deployment_identity: None,
         env_vars: Default::default(),
         respond_to: None,
         respond_to_allowlist: Vec::new(),

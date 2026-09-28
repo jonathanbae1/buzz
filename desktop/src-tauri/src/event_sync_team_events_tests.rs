@@ -169,6 +169,7 @@ fn stale_inbound_head(
         is_builtin: false,
         shared: false,
         catalog_source: None,
+        preset_source: None,
         source_dir: None,
         is_symlink: false,
         symlink_target: None,

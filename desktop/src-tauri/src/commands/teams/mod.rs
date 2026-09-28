@@ -445,6 +445,7 @@ pub async fn create_team(input: CreateTeamRequest, app: AppHandle) -> Result<Tea
             // scoped 30178 head. A new team has no catalog head yet.
             shared: false,
             catalog_source: None,
+            preset_source: None,
             source_dir: None,
             is_symlink: false,
             symlink_target: None,

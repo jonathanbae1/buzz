@@ -842,6 +842,7 @@ fn apply_inbound_team(teams: &mut Vec<TeamRecord>, d_tag: String, inbound: TeamE
             // Owner-device sync, not a catalog add: the team is this owner's
             // own, so it has no foreign publication to attribute.
             catalog_source: None,
+            preset_source: None,
             source_dir: None,
             is_symlink: false,
             symlink_target: None,

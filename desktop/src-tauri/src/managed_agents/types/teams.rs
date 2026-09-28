@@ -5,7 +5,7 @@ use std::path::PathBuf;
 
 use serde::{Deserialize, Serialize};
 
-use super::TeamCatalogSource;
+use super::{TeamCatalogSource, TeamPresetSource};
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct TeamRecord {
@@ -30,6 +30,15 @@ pub struct TeamRecord {
     /// makes a repeated add idempotent instead of minting a second team.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub catalog_source: Option<TeamCatalogSource>,
+    /// Provenance of a team a deployment preset created.
+    ///
+    /// The first-party analogue of `catalog_source`: the copy carries a fresh
+    /// local id, so `(slug, version)` is the only link back to the preset that
+    /// created it, and the only thing that can answer "is this preset already
+    /// deployed". Reconcile by slug — never by display name, and never by
+    /// `is_builtin`, which is auto-seeded by id and not opt-in.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub preset_source: Option<TeamPresetSource>,
     /// Absolute path to the team's backing directory (if directory-backed).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub source_dir: Option<PathBuf>,

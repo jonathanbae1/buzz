@@ -77,6 +77,7 @@ pub async fn create_persona(
             // Team-publication provenance is set only by
             // `add_team_from_catalog`, never by an ordinary create.
             team_catalog_source: None,
+            deployment_identity: None,
             env_vars: input.env_vars,
             respond_to: None,
             respond_to_allowlist: Vec::new(),

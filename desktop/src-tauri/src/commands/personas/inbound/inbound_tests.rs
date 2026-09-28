@@ -26,6 +26,7 @@ fn local_in_app() -> AgentDefinition {
         source_team_persona_slug: None,
         catalog_source: None,
         team_catalog_source: None,
+        deployment_identity: None,
         env_vars: BTreeMap::from([("API_KEY".to_string(), "secret".to_string())]),
         respond_to: None,
         respond_to_allowlist: Vec::new(),
@@ -61,7 +62,10 @@ fn inbound_for(d_tag: &str, display_name: &str) -> AgentDefinition {
         parallelism: None,
         created_at: "2025-06-01T00:00:00Z".to_string(),
         updated_at: "2025-06-01T00:00:00Z".to_string(),
-    }
+    
+deployment_identity: None,
+}
+
 }
 
 #[test]
@@ -219,6 +223,7 @@ fn local_agent() -> ManagedAgentRecord {
         source_team_persona_slug: None,
         catalog_source: None,
         team_catalog_source: None,
+        deployment_identity: None,
         definition_respond_to: None,
         definition_respond_to_allowlist: Vec::new(),
         definition_parallelism: None,
@@ -419,6 +424,7 @@ fn local_team() -> TeamRecord {
         is_builtin: false,
         shared: false,
         catalog_source: None,
+        preset_source: None,
         source_dir: Some(std::path::PathBuf::from("/local/team/dir")),
         is_symlink: true,
         symlink_target: Some("/external".to_string()),
