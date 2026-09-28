@@ -104,6 +104,17 @@ export function useAppNavigation() {
     [commitNavigation],
   );
 
+  const goAgentTasks = React.useCallback(
+    (behavior?: NavigationBehavior) =>
+      commitNavigation(
+        {
+          to: "/agent-tasks",
+        },
+        behavior,
+      ),
+    [commitNavigation],
+  );
+
   const goProfile = React.useCallback(
     (pubkey: string, behavior?: NavigationBehavior) =>
       commitNavigation(
@@ -464,6 +475,7 @@ export function useAppNavigation() {
     goEditWorkflow,
     goForumPost,
     goHome,
+    goAgentTasks,
     goNewMessage,
     goNewWorkflow,
     goNewWorkflowForChannel,

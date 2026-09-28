@@ -873,6 +873,13 @@ pub fn run() {
             tray_menu::take_tray_actions,
             #[cfg(target_os = "macos")]
             tray_menu::update_tray_agent_activity,
+            // M1 private task board: reads and managed-intent writes against the central
+            // agentmemory store. The bearer stays in Rust; see commands/agent_tasks.rs.
+            commands::agent_tasks_status,
+            commands::agent_tasks_list,
+            commands::agent_tasks_assign,
+            commands::agent_tasks_register_dispatch,
+            commands::agent_tasks_get,
         ])
         .build(tauri::generate_context!())
         .expect("error while building tauri application");

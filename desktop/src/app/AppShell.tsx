@@ -145,6 +145,7 @@ export function AppShell() {
   const queryClient = useQueryClient();
   useManagedAgentRuntimeReconciliation(communitiesHook.communities); // sync storage snapshot
   const {
+    goAgentTasks,
     goAgents,
     goChannel,
     goHome,
@@ -890,6 +891,7 @@ export function AppShell() {
                           onSelectHome={() => void goHome()}
                           onSelectProjects={() => void goProjects()}
                           onSelectPulse={() => void goPulse()}
+                          onSelectTasks={() => void goAgentTasks()}
                           onSelectSettings={handleOpenSettings}
                           onSelectWorkflows={() => void goWorkflows()}
                           onSetPresenceStatus={(status) =>

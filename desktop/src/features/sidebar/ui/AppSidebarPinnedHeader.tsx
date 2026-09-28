@@ -1,4 +1,4 @@
-import { Activity, Bot, Folders, Inbox, Zap } from "lucide-react";
+import { Activity, Bot, Folders, Inbox, ListChecks, Zap } from "lucide-react";
 
 import { TopbarSearch } from "@/features/search/ui/TopbarSearch";
 import { SidebarProjectsSection } from "@/features/sidebar/ui/SidebarProjectsSection";
@@ -21,7 +21,8 @@ type SidebarSelectedView =
   | "agents"
   | "workflows"
   | "pulse"
-  | "projects";
+  | "projects"
+  | "agent-tasks";
 
 type AppSidebarPinnedHeaderProps = {
   channelLabels: Record<string, string>;
@@ -45,6 +46,7 @@ type AppSidebarPrimaryMenuProps = {
   onSelectHome: () => void;
   onSelectProjects: () => void;
   onSelectPulse: () => void;
+  onSelectTasks: () => void;
   onSelectWorkflows: () => void;
   projectsOverviewActive: boolean;
   selectedView: SidebarSelectedView;
@@ -95,6 +97,7 @@ export function AppSidebarPrimaryMenu({
   onSelectHome,
   onSelectProjects,
   onSelectPulse,
+  onSelectTasks,
   onSelectWorkflows,
   projectsOverviewActive,
   selectedView,
@@ -138,6 +141,20 @@ export function AppSidebarPrimaryMenu({
               >
                 <Activity className="h-4 w-4" />
                 <SidebarMenuLabel>Pulse</SidebarMenuLabel>
+              </SidebarMenuButton>
+            </SidebarMenuItem>
+          </FeatureGate>
+          <FeatureGate feature="agentTasks">
+            <SidebarMenuItem>
+              <SidebarMenuButton
+                data-testid="open-agent-tasks-view"
+                isActive={selectedView === "agent-tasks"}
+                onClick={onSelectTasks}
+                tooltip="Tasks"
+                type="button"
+              >
+                <ListChecks className="h-4 w-4" />
+                <SidebarMenuLabel>Tasks</SidebarMenuLabel>
               </SidebarMenuButton>
             </SidebarMenuItem>
           </FeatureGate>

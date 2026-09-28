@@ -11,6 +11,7 @@ type ViewLoadingFallbackKind =
   | "forum"
   | "projects"
   | "pulse"
+  | "tasks"
   | "workflows";
 
 type ViewLoadingFallbackProps = {
@@ -412,7 +413,7 @@ export function ViewLoadingFallback({
       {kind === "forum" ? (
         <ForumLoadingBody hasHeader={shouldShowChannelHeader} />
       ) : null}
-      {kind === "pulse" ? (
+      {kind === "pulse" || kind === "tasks" ? (
         <ChannelLoadingBody hasHeader={shouldShowChannelHeader} />
       ) : null}
     </div>
