@@ -136,7 +136,6 @@ export default defineConfig({
         "**/project-commit-detail.spec.ts",
         "**/project-empty-state-alignment.spec.ts",
         "**/wiki-pane.spec.ts",
-        "**/zz-diag.spec.ts",
         "**/project-inbox.spec.ts",
         "**/projects-v3-screenshots.spec.ts",
         "**/project-issue-comments.spec.ts",
