@@ -560,7 +560,6 @@ export type GitBashPrerequisite = {
   installHint: string;
 };
 
-
 export type AcpAvailabilityStatus =
   | "available"
   | "adapter_missing"

@@ -78,7 +78,8 @@ const FILTERS: { id: Filter; label: string }[] = [
 
 function matches(row: TaskRow, filter: Filter): boolean {
   if (filter === "all") return true;
-  if (filter === "blocked") return row.readiness === "blocked" || row.readiness === "needs_review";
+  if (filter === "blocked")
+    return row.readiness === "blocked" || row.readiness === "needs_review";
   if (filter === "ready") return row.readiness === "ready";
   if (filter === "running") return row.readiness === "running";
   return row.readiness === "terminal";
@@ -105,10 +106,14 @@ function StoreErrorPanel({ error }: { error: TaskError }) {
       <p className="font-medium text-rose-300">{title}</p>
       <p className="mt-1 text-muted-foreground">{error.message}</p>
       {error.host ? (
-        <p className="mt-2 font-mono text-xs text-muted-foreground">store: {error.host}</p>
+        <p className="mt-2 font-mono text-xs text-muted-foreground">
+          store: {error.host}
+        </p>
       ) : null}
       {error.contract ? (
-        <p className="mt-1 font-mono text-xs text-muted-foreground">contract: {error.contract}</p>
+        <p className="mt-1 font-mono text-xs text-muted-foreground">
+          contract: {error.contract}
+        </p>
       ) : null}
     </div>
   );
@@ -147,12 +152,12 @@ export function AgentTasksPane() {
   }, [refresh]);
 
   const rows = React.useMemo(
-    () => (board?.tasks ?? []).filter(row => matches(row, filter)),
+    () => (board?.tasks ?? []).filter((row) => matches(row, filter)),
     [board, filter],
   );
   // A detail refresh is authoritative: the selected row is re-derived from the current list
   // rather than held as its own copy.
-  const selected = rows.find(row => row.id === selectedId) ?? rows[0] ?? null;
+  const selected = rows.find((row) => row.id === selectedId) ?? rows[0] ?? null;
 
   const identityQuery = useIdentityQuery();
   const channelsQuery = useChannelsQuery();
@@ -161,18 +166,31 @@ export function AgentTasksPane() {
   const targetPubkey = selected?.assignmentTarget?.startsWith("buzz:")
     ? selected.assignmentTarget.slice("buzz:".length).toLowerCase()
     : null;
-  const { events: liveEvents } = useObserverEvents(Boolean(targetPubkey), targetPubkey);
+  const { events: liveEvents } = useObserverEvents(
+    Boolean(targetPubkey),
+    targetPubkey,
+  );
   const activeTurns = useActiveAgentTurns(targetPubkey);
   const ownPubkey = identityQuery.data?.pubkey?.toLowerCase() ?? null;
-  const directChannel = channelsQuery.data?.find(channel =>
-    channel.channelType === "dm" &&
-    channel.participantPubkeys.length === 2 &&
-    channel.participantPubkeys.some(pubkey => pubkey.toLowerCase() === targetPubkey) &&
-    (!ownPubkey || channel.participantPubkeys.some(pubkey => pubkey.toLowerCase() === ownPubkey)),
-  ) ?? null;
+  const directChannel =
+    channelsQuery.data?.find(
+      (channel) =>
+        channel.channelType === "dm" &&
+        channel.participantPubkeys.length === 2 &&
+        channel.participantPubkeys.some(
+          (pubkey) => pubkey.toLowerCase() === targetPubkey,
+        ) &&
+        (!ownPubkey ||
+          channel.participantPubkeys.some(
+            (pubkey) => pubkey.toLowerCase() === ownPubkey,
+          )),
+    ) ?? null;
   const directChannelId = directChannel?.id ?? null;
   useLoadArchivedObserverEvents(Boolean(directChannelId), directChannelId);
-  const archivedEvents = useArchivedChannelEvents(targetPubkey, directChannelId);
+  const archivedEvents = useArchivedChannelEvents(
+    targetPubkey,
+    directChannelId,
+  );
   const sessionId = React.useMemo(() => {
     if (!directChannelId) return null;
     return deriveLatestSessionId(
@@ -229,19 +247,26 @@ export function AgentTasksPane() {
         return;
       }
       if (row.readiness !== "ready") {
-        setNotice(`Run refused: this action is ${READINESS_LABEL[row.readiness].toLowerCase()}.`);
+        setNotice(
+          `Run refused: this action is ${READINESS_LABEL[row.readiness].toLowerCase()}.`,
+        );
         return;
       }
       const pubkey = match[1].toLowerCase();
       const agent = managedAgentsQuery.data?.find(
-        item => item.pubkey.toLowerCase() === pubkey,
+        (item) => item.pubkey.toLowerCase() === pubkey,
       );
-      if (!agent || (agent.status !== "running" && agent.status !== "deployed")) {
+      if (
+        !agent ||
+        (agent.status !== "running" && agent.status !== "deployed")
+      ) {
         setNotice("Run refused: the assigned managed agent is unavailable.");
         return;
       }
       if (activeTurns.length > 0) {
-        setNotice("Run refused: the assigned agent already has an active turn.");
+        setNotice(
+          "Run refused: the assigned agent already has an active turn.",
+        );
         return;
       }
       if (!identityQuery.data || !directChannel || !sessionId) {
@@ -264,7 +289,9 @@ export function AgentTasksPane() {
           typeof registration !== "object" ||
           (registration as Record<string, unknown>)["success"] !== true
         ) {
-          throw new Error("The task store did not confirm dispatch registration.");
+          throw new Error(
+            "The task store did not confirm dispatch registration.",
+          );
         }
         const prompt = [
           `M1W ${row.id} ${requestId}`,
@@ -280,11 +307,15 @@ export function AgentTasksPane() {
           mentionPubkeys: [pubkey],
           transport: "http",
         });
-        setNotice(`Run sent to ${agent.name}. Request ${requestId}. Refreshing the attempt projection.`);
+        setNotice(
+          `Run sent to ${agent.name}. Request ${requestId}. Refreshing the attempt projection.`,
+        );
         await refresh();
       } catch (thrown) {
         const message =
-          thrown instanceof Error ? thrown.message : toTaskError(thrown).message;
+          thrown instanceof Error
+            ? thrown.message
+            : toTaskError(thrown).message;
         setNotice(`Run delivery unknown for request ${requestId}: ${message}`);
         await refresh();
       } finally {
@@ -343,7 +374,7 @@ export function AgentTasksPane() {
       ) : null}
 
       <div className="flex items-center gap-1 border-b border-border/60 px-6 py-2">
-        {FILTERS.map(item => (
+        {FILTERS.map((item) => (
           <button
             key={item.id}
             type="button"
@@ -363,7 +394,9 @@ export function AgentTasksPane() {
       </div>
 
       {notice ? (
-        <div className="border-b border-border/60 px-6 py-2 text-xs text-muted-foreground">{notice}</div>
+        <div className="border-b border-border/60 px-6 py-2 text-xs text-muted-foreground">
+          {notice}
+        </div>
       ) : null}
 
       <div className="flex min-h-0 flex-1">
@@ -375,11 +408,11 @@ export function AgentTasksPane() {
           ) : null}
           {!error && !loading && rows.length === 0 ? (
             <li className="p-6 text-sm text-muted-foreground">
-              No actions in this view. The store answered and returned none, which is different from an
-              unreachable store.
+              No actions in this view. The store answered and returned none,
+              which is different from an unreachable store.
             </li>
           ) : null}
-          {rows.map(row => (
+          {rows.map((row) => (
             <li key={row.id}>
               <button
                 type="button"
@@ -391,18 +424,22 @@ export function AgentTasksPane() {
                 }
               >
                 <span className="flex items-center gap-2">
-                  <span className={READINESS_TONE[row.readiness]}>
-                    ●
+                  <span className={READINESS_TONE[row.readiness]}>●</span>
+                  <span className="truncate text-sm font-medium">
+                    {row.title}
                   </span>
-                  <span className="truncate text-sm font-medium">{row.title}</span>
                   <span className="ml-auto shrink-0 text-xs text-muted-foreground">
                     P{row.priority}
                   </span>
                 </span>
                 <span className="mt-1 flex items-center gap-2 text-xs text-muted-foreground">
-                  <span className={READINESS_TONE[row.readiness]}>{READINESS_LABEL[row.readiness]}</span>
+                  <span className={READINESS_TONE[row.readiness]}>
+                    {READINESS_LABEL[row.readiness]}
+                  </span>
                   {row.assignmentTarget ? (
-                    <span className="truncate font-mono">{row.assignmentTarget}</span>
+                    <span className="truncate font-mono">
+                      {row.assignmentTarget}
+                    </span>
                   ) : (
                     <span>unassigned</span>
                   )}
@@ -416,9 +453,16 @@ export function AgentTasksPane() {
           {loading && !board ? (
             <ViewLoadingFallback kind="tasks" />
           ) : selected ? (
-            <TaskDetail row={selected} busy={busy} onAssign={handleAssign} onRun={handleRun} />
+            <TaskDetail
+              row={selected}
+              busy={busy}
+              onAssign={handleAssign}
+              onRun={handleRun}
+            />
           ) : (
-            <p className="text-sm text-muted-foreground">Select an action to see its detail.</p>
+            <p className="text-sm text-muted-foreground">
+              Select an action to see its detail.
+            </p>
           )}
         </section>
       </div>
@@ -426,7 +470,13 @@ export function AgentTasksPane() {
   );
 }
 
-function Field({ label, children }: { label: string; children: React.ReactNode }) {
+function Field({
+  label,
+  children,
+}: {
+  label: string;
+  children: React.ReactNode;
+}) {
   return (
     <div className="grid grid-cols-[8rem_1fr] gap-2 py-1.5 text-sm">
       <dt className="text-muted-foreground">{label}</dt>
@@ -451,13 +501,17 @@ function TaskDetail({
       <div>
         <h2 className="text-base font-semibold">{row.title}</h2>
         {row.description ? (
-          <p className="mt-1 text-sm text-muted-foreground">{row.description}</p>
+          <p className="mt-1 text-sm text-muted-foreground">
+            {row.description}
+          </p>
         ) : null}
       </div>
 
       <dl className="rounded-lg border border-border/60 p-3">
         <Field label="Readiness">
-          <span className={READINESS_TONE[row.readiness]}>{READINESS_LABEL[row.readiness]}</span>
+          <span className={READINESS_TONE[row.readiness]}>
+            {READINESS_LABEL[row.readiness]}
+          </span>
         </Field>
         <Field label="Status">
           <span className="font-mono">{row.status}</span>
@@ -465,11 +519,15 @@ function TaskDetail({
         {row.assignmentTarget ? (
           <Field label="Assigned to">
             <span className="font-mono">{row.assignmentTarget}</span>
-            <span className="ml-2 text-xs text-muted-foreground">revision {row.assignmentRevision}</span>
+            <span className="ml-2 text-xs text-muted-foreground">
+              revision {row.assignmentRevision}
+            </span>
           </Field>
         ) : (
           <Field label="Assigned to">
-            <span className="text-muted-foreground">no intent (revision {row.assignmentRevision})</span>
+            <span className="text-muted-foreground">
+              no intent (revision {row.assignmentRevision})
+            </span>
           </Field>
         )}
         {row.dispatch ? (
@@ -495,7 +553,7 @@ function TaskDetail({
         {row.blockers.length > 0 ? (
           <Field label="Blocked by">
             <ul className="space-y-0.5">
-              {row.blockers.map(blocker => (
+              {row.blockers.map((blocker) => (
                 <li key={blocker} className="font-mono text-xs">
                   {blocker}
                 </li>
@@ -506,7 +564,7 @@ function TaskDetail({
         {row.reasons.length > 0 ? (
           <Field label="Why">
             <ul className="space-y-0.5 text-xs text-muted-foreground">
-              {row.reasons.map(reason => (
+              {row.reasons.map((reason) => (
                 <li key={reason}>{reason}</li>
               ))}
             </ul>
@@ -534,7 +592,9 @@ function TaskDetail({
         <button
           type="button"
           disabled={busy || row.readiness === "terminal"}
-          onClick={() => void onAssign(row, row.assignmentTarget ?? "buzz:worker")}
+          onClick={() =>
+            void onAssign(row, row.assignmentTarget ?? "buzz:worker")
+          }
           className="rounded-md border border-border px-3 py-1.5 text-xs hover:bg-accent disabled:opacity-50"
         >
           Assign to worker
@@ -558,9 +618,10 @@ function TaskDetail({
       </div>
 
       <p className="text-xs text-muted-foreground">
-        Run requires a ready action, the assigned managed agent's initialized idle direct session,
-        and the compatible task contract. Dispatch is registered before the ordinary direct-message
-        prompt is sent; refresh shows the authoritative request and lease projection.
+        Run requires a ready action, the assigned managed agent's initialized
+        idle direct session, and the compatible task contract. Dispatch is
+        registered before the ordinary direct-message prompt is sent; refresh
+        shows the authoritative request and lease projection.
       </p>
     </div>
   );

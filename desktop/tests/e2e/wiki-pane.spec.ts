@@ -72,7 +72,7 @@ const WIKI_PAGES: Record<string, string> = {
     "```",
     "",
     "```json",
-    "{ \"a\": 1 }",
+    '{ "a": 1 }',
     "```",
     "",
     "```toml",
@@ -169,7 +169,9 @@ async function openWiki(page: import("@playwright/test").Page) {
     timeout: 30_000,
   });
   await page.getByTestId("open-wiki-view").click();
-  await expect(page.getByTestId("wiki-screen")).toBeVisible({ timeout: 15_000 });
+  await expect(page.getByTestId("wiki-screen")).toBeVisible({
+    timeout: 15_000,
+  });
 }
 
 test.describe.configure({ timeout: 60_000 });
@@ -280,9 +282,9 @@ test.describe("wiki pane", () => {
       "upstream",
       "captured",
     ]) {
-      await expect(view.locator(`[data-provenance-marker="${kind}"]`)).toHaveCount(
-        1,
-      );
+      await expect(
+        view.locator(`[data-provenance-marker="${kind}"]`),
+      ).toHaveCount(1);
     }
     // The full original citation is preserved on the chip, not rewritten.
     await expect(
@@ -375,7 +377,9 @@ test.describe("wiki pane", () => {
     await page.getByTestId("wiki-page-capture.md").click();
     await expect(page.getByTestId("wiki-page-view-capture.md")).toBeVisible();
 
-    const commands = await page.evaluate(() => window.__BUZZ_E2E_COMMANDS__ ?? []);
+    const commands = await page.evaluate(
+      () => window.__BUZZ_E2E_COMMANDS__ ?? [],
+    );
     // Named exactly: every registered verb that would mutate the checkout. A
     // substring sweep would also match unrelated boot commands (`create_auth_event`),
     // which is a false positive, not a finding.
@@ -388,9 +392,9 @@ test.describe("wiki pane", () => {
       "stage_project_local_repository",
       "commit_project_local_repository",
     ];
-    expect(commands.filter((command) => writeCommands.includes(command))).toEqual(
-      [],
-    );
+    expect(
+      commands.filter((command) => writeCommands.includes(command)),
+    ).toEqual([]);
     expect(commands).toContain("get_project_local_repo_tracked_paths");
     // The read path the pane actually uses.
     expect(commands).toContain("get_project_local_repo_document_content");
@@ -422,7 +426,9 @@ test.describe("wiki pane", () => {
     // No sync command in either direction is ever issued from this pane.
     // No bridge between the wiki and either memory plane exists in either
     // direction: neither the engram reads nor any agentmemory call is issued.
-    const commands = await page.evaluate(() => window.__BUZZ_E2E_COMMANDS__ ?? []);
+    const commands = await page.evaluate(
+      () => window.__BUZZ_E2E_COMMANDS__ ?? [],
+    );
     expect(
       commands.filter((command) => /engram|agentmemory/i.test(command)),
     ).toEqual([]);
@@ -433,7 +439,9 @@ test.describe("wiki pane", () => {
     expect(chrome).not.toContain("Last captured");
   });
 
-  test("A10 root-confined artifact link, both interactions", async ({ page }) => {
+  test("A10 root-confined artifact link, both interactions", async ({
+    page,
+  }) => {
     await seedWikiCheckout(page, {
       documents: {
         ...WIKI_PAGES,

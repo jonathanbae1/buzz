@@ -158,7 +158,9 @@ const knownAgentPubkeys = new Set<string>();
 const knownAgentsBySubscription = new Map<string, Set<string>>();
 const pendingUnknownAgentFrames: RelayEvent[] = [];
 // Callback invoked when a session's ACP config projection changes.
-let onSessionConfigCaptured: ((pubkey: string, sessionId: string) => void) | null = null;
+let onSessionConfigCaptured:
+  | ((pubkey: string, sessionId: string) => void)
+  | null = null;
 
 export function setSessionConfigCapturedCallback(
   cb: ((pubkey: string, sessionId: string) => void) | null,
@@ -500,22 +502,35 @@ function captureAvailableCommands(
 }
 function captureSessionConfigUpdate(agentPubkey: string, event: ObserverEvent) {
   if (event.kind !== "acp_read") return;
-  const payload = typeof event.payload === "object" && event.payload !== null
-    ? event.payload as Record<string, unknown>
-    : null;
+  const payload =
+    typeof event.payload === "object" && event.payload !== null
+      ? (event.payload as Record<string, unknown>)
+      : null;
   if (payload?.method !== "session/update") return;
-  const params = typeof payload.params === "object" && payload.params !== null
-    ? payload.params as Record<string, unknown>
-    : null;
-  const update = typeof params?.update === "object" && params.update !== null
-    ? params.update as Record<string, unknown>
-    : null;
-  if (update?.sessionUpdate !== "config_option_update" || !Array.isArray(update.configOptions)) return;
-  const sessionId = event.sessionId ?? (typeof params?.sessionId === "string" ? params.sessionId : null);
+  const params =
+    typeof payload.params === "object" && payload.params !== null
+      ? (payload.params as Record<string, unknown>)
+      : null;
+  const update =
+    typeof params?.update === "object" && params.update !== null
+      ? (params.update as Record<string, unknown>)
+      : null;
+  if (
+    update?.sessionUpdate !== "config_option_update" ||
+    !Array.isArray(update.configOptions)
+  )
+    return;
+  const sessionId =
+    event.sessionId ??
+    (typeof params?.sessionId === "string" ? params.sessionId : null);
   if (!sessionId) return;
-  void putAgentSessionConfig(agentPubkey, sessionId, { configOptions: update.configOptions })
+  void putAgentSessionConfig(agentPubkey, sessionId, {
+    configOptions: update.configOptions,
+  })
     .then(() => onSessionConfigCaptured?.(agentPubkey, sessionId))
-    .catch((error) => console.error("Failed to persist session config update", error));
+    .catch((error) =>
+      console.error("Failed to persist session config update", error),
+    );
 }
 
 // Per-event processing shared by every event a live frame carries (one for a
@@ -576,9 +591,15 @@ function processLiveObserverEvents(
     if (parsed.kind === "session_config_captured") {
       markAgentSessionCommandCatalogsStale(agentPubkey);
       if (parsed.sessionId) {
-        void putAgentSessionConfig(agentPubkey, parsed.sessionId, parsed.payload)
+        void putAgentSessionConfig(
+          agentPubkey,
+          parsed.sessionId,
+          parsed.payload,
+        )
           .then(() => onSessionConfigCaptured?.(agentPubkey, parsed.sessionId!))
-          .catch((error) => console.error("Failed to persist captured session config", error));
+          .catch((error) =>
+            console.error("Failed to persist captured session config", error),
+          );
       }
     } else if (parsed.kind === "control_result") {
       dispatchControlResult(agentPubkey, parsed.payload, parsed.channelId);

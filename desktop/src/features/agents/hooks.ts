@@ -952,10 +952,15 @@ export function useManagedAgentLogQuery(
   });
 }
 
-export const agentConfigSurfaceQueryKey = (pubkey: string, sessionId?: string | null) =>
-  ["agent-config-surface", pubkey, sessionId ?? null] as const;
+export const agentConfigSurfaceQueryKey = (
+  pubkey: string,
+  sessionId?: string | null,
+) => ["agent-config-surface", pubkey, sessionId ?? null] as const;
 
-export function useAgentConfigSurface(pubkey: string | null, sessionId?: string | null) {
+export function useAgentConfigSurface(
+  pubkey: string | null,
+  sessionId?: string | null,
+) {
   const refetchInterval = useFocusedRefetchInterval(30_000);
   return useQuery({
     queryKey: agentConfigSurfaceQueryKey(pubkey ?? "", sessionId),

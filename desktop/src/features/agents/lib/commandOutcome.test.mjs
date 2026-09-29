@@ -17,11 +17,7 @@ const frame = (status, overrides = {}) => ({
 
 test("sent is acceptance, not a terminal command outcome", () => {
   assert.equal(
-    isAgentSessionCommandTerminalFrame(
-      frame("sent"),
-      "request-1",
-      "session-1",
-    ),
+    isAgentSessionCommandTerminalFrame(frame("sent"), "request-1", "session-1"),
     false,
   );
   assert.equal(getAgentSessionCommandTerminalStatus(frame("sent")), null);

@@ -44,7 +44,8 @@ export function SessionConfigControls({
             return;
           }
           if (frame.status === "applied") resolve("Updated for this session");
-          else reject(new Error(frame.error ?? frame.status.replaceAll("_", " ")));
+          else
+            reject(new Error(frame.error ?? frame.status.replaceAll("_", " ")));
         });
         timeout = window.setTimeout(
           () => reject(new Error("No confirmation received")),
@@ -70,8 +71,17 @@ export function SessionConfigControls({
 
   const mode = surface?.modeOptions ?? [];
   const thinking = surface?.effortOptions ?? [];
-  const hasModelPicker = Boolean(surface?.modelConfigId && surface.modelOptions?.length && surface.ompProfile && channelId);
-  if (!sessionId || (!hasModelPicker && mode.length === 0 && thinking.length === 0)) return null;
+  const hasModelPicker = Boolean(
+    surface?.modelConfigId &&
+      surface.modelOptions?.length &&
+      surface.ompProfile &&
+      channelId,
+  );
+  if (
+    !sessionId ||
+    (!hasModelPicker && mode.length === 0 && thinking.length === 0)
+  )
+    return null;
 
   return (
     <div className="mt-3 flex flex-wrap items-center gap-3 rounded-lg border border-border/60 bg-muted/20 px-3 py-2">

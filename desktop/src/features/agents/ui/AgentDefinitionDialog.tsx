@@ -183,7 +183,9 @@ export function AgentDefinitionDialog({
       (runtime.trim() === "omp" || initialValues?.runtime?.trim() === "omp"),
   });
   const rosterDeployPlanQuery = useRosterDeployPreviewQuery({
-    enabled: open && (runtime.trim() === "omp" || initialValues?.runtime?.trim() === "omp"),
+    enabled:
+      open &&
+      (runtime.trim() === "omp" || initialValues?.runtime?.trim() === "omp"),
   });
   const [isAvatarUploadPending, setIsAvatarUploadPending] =
     React.useState(false);
@@ -535,13 +537,19 @@ export function AgentDefinitionDialog({
       .map((entry) => entry.name) ?? [],
   );
   const ompProfileOptions = React.useMemo(() => {
-    const options: PersonaDropdownOption[] = [{ label: "Default (inherit)", value: "" }];
+    const options: PersonaDropdownOption[] = [
+      { label: "Default (inherit)", value: "" },
+    ];
     if (ompProfileCatalogQuery.data?.state === "configured") {
       options.push(
         ...ompProfileCatalogQuery.data.entries.map((entry) => ({
-          label: entry.name === "default" ? "default (machine fallback)" : entry.name,
+          label:
+            entry.name === "default"
+              ? "default (machine fallback)"
+              : entry.name,
           value: entry.name,
-          disabled: profileActivationUnavailable || gatedProfileNames.has(entry.name),
+          disabled:
+            profileActivationUnavailable || gatedProfileNames.has(entry.name),
         })),
       );
     } else if (ompProfileSelection.length > 0) {
@@ -563,7 +571,13 @@ export function AgentDefinitionDialog({
       });
     }
     return options;
-  }, [ompProfileCatalogQuery.data, ompProfileNames, ompProfileSelection, profileActivationUnavailable, gatedProfileNames]);
+  }, [
+    ompProfileCatalogQuery.data,
+    ompProfileNames,
+    ompProfileSelection,
+    profileActivationUnavailable,
+    gatedProfileNames,
+  ]);
   const canSubmit =
     canSubmitPersonaDialog({ displayName, isPending }) &&
     (!isCreateMode || runtime.trim().length > 0) &&

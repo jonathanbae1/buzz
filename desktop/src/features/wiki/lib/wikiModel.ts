@@ -93,7 +93,9 @@ export function resolveWikiLink(input: {
   const resolved = normalizeRelative(fromDir, rawPath);
   if (resolved === null) return { kind: "unresolved" };
   if (resolved.length === 0) {
-    return heading ? { kind: "document", href: "", heading } : { kind: "unresolved" };
+    return heading
+      ? { kind: "document", href: "", heading }
+      : { kind: "unresolved" };
   }
 
   if (pages.includes(resolved)) {
@@ -101,7 +103,8 @@ export function resolveWikiLink(input: {
   }
   // Tracked but outside the collection: a root-confined artifact. Only files
   // the checkout actually tracks qualify, so a typo cannot mint a link.
-  if (trackedPaths.includes(resolved)) return { kind: "artifact", path: resolved };
+  if (trackedPaths.includes(resolved))
+    return { kind: "artifact", path: resolved };
   return { kind: "unresolved" };
 }
 
@@ -109,7 +112,10 @@ export function resolveWikiLink(input: {
  * Join a relative href against a directory, refusing to climb past the
  * checkout root. Returns `null` for anything that escapes or is absolute.
  */
-export function normalizeRelative(fromDir: string, href: string): string | null {
+export function normalizeRelative(
+  fromDir: string,
+  href: string,
+): string | null {
   if (href.startsWith("/")) return null;
   const segments = fromDir.length > 0 ? fromDir.split("/") : [];
   for (const segment of href.split("/")) {

@@ -42,8 +42,12 @@ export function WikiScreen() {
   const [includeCode, setIncludeCode] = React.useState(false);
   const [debouncedQuery, setDebouncedQuery] = React.useState("");
   const [artifactPath, setArtifactPath] = React.useState<string | null>(null);
-  const [pendingHeading, setPendingHeading] = React.useState<string | null>(null);
-  const [missingHeading, setMissingHeading] = React.useState<string | null>(null);
+  const [pendingHeading, setPendingHeading] = React.useState<string | null>(
+    null,
+  );
+  const [missingHeading, setMissingHeading] = React.useState<string | null>(
+    null,
+  );
   const contentRef = React.useRef<HTMLDivElement | null>(null);
 
   // Keystroke-rate parsing is wasteful: a query bypasses the parse cache by
@@ -66,7 +70,9 @@ export function WikiScreen() {
     () => collection.pages.find((page) => page.path === activePath) ?? null,
     [activePath, collection.pages],
   );
-  const pageDirectoryOfActive = activePage ? pageDirectory(activePage.path) : WIKI_DIR;
+  const pageDirectoryOfActive = activePage
+    ? pageDirectory(activePage.path)
+    : WIKI_DIR;
 
   const handleNavigate = React.useCallback((path: string, heading?: string) => {
     setActivePath(path);
@@ -85,12 +91,15 @@ export function WikiScreen() {
     [collection.pages, collection.trackedPaths, pageDirectoryOfActive],
   );
 
-  const handleOpenCitation = React.useCallback((path: string, line?: number) => {
-    // A citation showing `path:12` is a line-level reference into the artifact
-    // preview; `line` orients the preview and is never dropped.
-    setArtifactPath(path);
-    setPendingHeading(line === undefined ? null : `L${line}`);
-  }, []);
+  const handleOpenCitation = React.useCallback(
+    (path: string, line?: number) => {
+      // A citation showing `path:12` is a line-level reference into the artifact
+      // preview; `line` orients the preview and is never dropped.
+      setArtifactPath(path);
+      setPendingHeading(line === undefined ? null : `L${line}`);
+    },
+    [],
+  );
 
   const handleOpenArtifact = React.useCallback(
     (path: string, action: "preview" | "editor") => {
@@ -123,7 +132,8 @@ export function WikiScreen() {
   }, [pendingHeading, activePage]);
 
   const results = React.useMemo(
-    () => (includeCode ? searchWikiCorpus(collection.pages, debouncedQuery) : []),
+    () =>
+      includeCode ? searchWikiCorpus(collection.pages, debouncedQuery) : [],
     [collection.pages, debouncedQuery, includeCode],
   );
 

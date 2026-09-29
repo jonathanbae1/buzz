@@ -51,7 +51,12 @@ export type OmpLanePreview = {
   revision: string;
   diff: string;
   problems: OmpLaneProblem[];
-  resolved: Array<{ key: string; model: string; effort: string | null; source: string }>;
+  resolved: Array<{
+    key: string;
+    model: string;
+    effort: string | null;
+    source: string;
+  }>;
   affectedProfiles: string[];
   runningAgents: Array<Record<string, unknown>>;
   host: OmpHostIdentity;
@@ -60,7 +65,12 @@ export type OmpLanePreview = {
 export type OmpLaneSaveOutcome = {
   source: "notAttempted" | "written" | "failed";
   profiles: Array<{ profile: string; state: string; detail: string | null }>;
-  records: Array<{ profile: string; record: string; state: string; detail: string | null }>;
+  records: Array<{
+    profile: string;
+    record: string;
+    state: string;
+    detail: string | null;
+  }>;
   backups: string | null;
   recovery: string[];
   stdout: string;
@@ -108,7 +118,9 @@ export function saveOmpLanes(
   return invokeTauri("save_omp_lanes", { repoPath, lanes, revision });
 }
 
-export function getOmpLaneRepoStatus(repoPath: string): Promise<OmpLaneRepoStatus> {
+export function getOmpLaneRepoStatus(
+  repoPath: string,
+): Promise<OmpLaneRepoStatus> {
   return invokeTauri("get_omp_lane_repo_status", { repoPath });
 }
 

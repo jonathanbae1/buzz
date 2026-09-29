@@ -71,10 +71,7 @@ export type MarkdownRuntime = {
    * through the local content reader, with an *Open in editor* action. The
    * action is explicit so the anchor never encodes one into a path prefix.
    */
-  onOpenDocumentArtifact?: (
-    path: string,
-    action: "preview" | "editor",
-  ) => void;
+  onOpenDocumentArtifact?: (path: string, action: "preview" | "editor") => void;
   /**
    * Decide whether a `(source: path:line)` citation resolves to exactly one
    * tracked file. Supplied by the caller, which is the only party that knows
@@ -160,10 +157,7 @@ export type MarkdownProps = {
   /** Navigate to another document in the same collection (document surface). */
   onOpenDocumentLink?: (href: string, heading?: string) => void;
   /** Open a root-confined artifact outside the collection (document surface). */
-  onOpenDocumentArtifact?: (
-    path: string,
-    action: "preview" | "editor",
-  ) => void;
+  onOpenDocumentArtifact?: (path: string, action: "preview" | "editor") => void;
   /**
    * Decide whether a `(source: path:line)` citation resolves to exactly one
    * tracked file. Supplied by the caller, which is the only party that knows

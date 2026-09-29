@@ -71,9 +71,7 @@ export function rosterCandidatesAvailableToEntry(
   plan: RosterDeployPlan,
   entryName: string,
 ): RosterCandidate[] {
-  const entry = plan.entries.find(
-    (candidate) => candidate.name === entryName,
-  );
+  const entry = plan.entries.find((candidate) => candidate.name === entryName);
   if (!entry) return [];
 
   const claimedElsewhere = new Set(
@@ -107,8 +105,7 @@ export function updateRosterMapping(
     entry.via === "userMap" &&
     entry.personaId !== null;
   const wasUnmapped = entry?.verdict === "unmapped";
-  const wasCreated =
-    entry?.verdict === "create" && entry.candidates.length > 0;
+  const wasCreated = entry?.verdict === "create" && entry.candidates.length > 0;
   if (!entry || (!wasMapped && !wasUnmapped && !wasCreated)) return plan;
 
   const plannedCandidate = candidate
@@ -138,9 +135,7 @@ export function updateRosterMapping(
   }
 
   const adopt =
-    plan.counts.adopt +
-    Number(plannedCandidate !== null) -
-    Number(wasMapped);
+    plan.counts.adopt + Number(plannedCandidate !== null) - Number(wasMapped);
   const create = plan.counts.create - Number(wasCreated);
   const unmapped =
     plan.counts.unmapped +

@@ -69,10 +69,7 @@ type UnifiedAgentsSectionProps = {
   rosterDeployPlan: RosterDeployPlan | null;
   onPreviewRosterDeploy: () => void;
   onApplyRosterDeploy: () => void;
-  onMapRosterProfile: (
-    name: string,
-    candidate: RosterCandidate | null,
-  ) => void;
+  onMapRosterProfile: (name: string, candidate: RosterCandidate | null) => void;
   onCreateRosterProfile: (name: string) => void;
   onDismissRosterDeployPlan: () => void;
   personasError: Error | null;
@@ -316,7 +313,9 @@ function OmpProfileRoster({
     >
       <div className="flex flex-wrap items-start justify-between gap-3">
         <div>
-          <h2 className="text-sm font-semibold text-foreground">omp profiles</h2>
+          <h2 className="text-sm font-semibold text-foreground">
+            omp profiles
+          </h2>
           <p className="text-xs text-muted-foreground">
             Installed profiles are separate from personas and running instances.
           </p>
@@ -359,16 +358,16 @@ function OmpProfileRoster({
           Team presets
         </h3>
         {teamPresetsLoading ? (
-          <p className="text-sm text-muted-foreground">
-            Loading team presets…
-          </p>
+          <p className="text-sm text-muted-foreground">Loading team presets…</p>
         ) : null}
         {teamPresetsError ? (
           <p className="text-sm text-destructive">
             Team presets could not be loaded.
           </p>
         ) : null}
-        {!teamPresetsLoading && !teamPresetsError && teamPresets.length === 0 ? (
+        {!teamPresetsLoading &&
+        !teamPresetsError &&
+        teamPresets.length === 0 ? (
           <p className="text-sm text-muted-foreground">
             No team presets are available.
           </p>
@@ -415,12 +414,7 @@ function OmpProfileRoster({
             <h3 className="text-xs font-semibold uppercase tracking-wide text-muted-foreground">
               Deployment preview
             </h3>
-            <Button
-              onClick={onDismiss}
-              size="sm"
-              type="button"
-              variant="ghost"
-            >
+            <Button onClick={onDismiss} size="sm" type="button" variant="ghost">
               Close
             </Button>
           </div>
@@ -463,9 +457,7 @@ function OmpProfileRoster({
                     </span>
                   ) : null}
                 </div>
-                <p className="text-xs text-muted-foreground">
-                  {entry.message}
-                </p>
+                <p className="text-xs text-muted-foreground">{entry.message}</p>
                 {canResolveMapping ? (
                   <div className="flex flex-wrap items-center gap-2">
                     <label className="block text-xs">
@@ -474,9 +466,7 @@ function OmpProfileRoster({
                         className="ml-2 rounded border border-border bg-background p-1"
                         data-testid={`roster-map-${entry.name}`}
                         value={
-                          entry.via === "userMap"
-                            ? entry.personaId ?? ""
-                            : ""
+                          entry.via === "userMap" ? (entry.personaId ?? "") : ""
                         }
                         onChange={(event) => {
                           const candidate = candidates.find(
@@ -534,7 +524,8 @@ function OmpProfileRoster({
           ))}
           {plan.sharedMembers.map((member) => (
             <p className="text-xs text-muted-foreground" key={member.personaId}>
-              {member.displayName} is shared by {member.presetSlugs.join(" and ")}.
+              {member.displayName} is shared by{" "}
+              {member.presetSlugs.join(" and ")}.
             </p>
           ))}
           {plan.applyBlocked ? (

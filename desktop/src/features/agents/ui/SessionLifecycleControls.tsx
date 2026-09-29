@@ -24,7 +24,9 @@ export function SessionLifecycleControls({
 }) {
   const { data: agents } = useManagedAgentsQuery({ enabled });
   const agent = agents?.find((item) => item.pubkey === agentPubkey);
-  const [sessions, setSessions] = React.useState<AgentSessionLifecycleEntry[]>([]);
+  const [sessions, setSessions] = React.useState<AgentSessionLifecycleEntry[]>(
+    [],
+  );
   const [selectedId, setSelectedId] = React.useState("");
   const [pending, setPending] = React.useState<LifecycleOperation | null>(null);
   const [message, setMessage] = React.useState<string | null>(null);
@@ -40,21 +42,23 @@ export function SessionLifecycleControls({
       let unsubscribe: (() => void) | undefined;
       let timeout: number | undefined;
       try {
-        const framePromise = new Promise<ControlResultFrame>((resolve, reject) => {
-          unsubscribe = subscribeControlResults(agentPubkey, (frame) => {
-            if (
-              frame.type === "session_lifecycle" &&
-              frame.requestId === requestId &&
-              frame.operation === operation
-            ) {
-              resolve(frame);
-            }
-          });
-          timeout = window.setTimeout(
-            () => reject(new Error("Session operation timed out")),
-            RESULT_TIMEOUT_MS,
-          );
-        });
+        const framePromise = new Promise<ControlResultFrame>(
+          (resolve, reject) => {
+            unsubscribe = subscribeControlResults(agentPubkey, (frame) => {
+              if (
+                frame.type === "session_lifecycle" &&
+                frame.requestId === requestId &&
+                frame.operation === operation
+              ) {
+                resolve(frame);
+              }
+            });
+            timeout = window.setTimeout(
+              () => reject(new Error("Session operation timed out")),
+              RESULT_TIMEOUT_MS,
+            );
+          },
+        );
         await controlManagedAgentSession(
           agentPubkey,
           sessionId,
@@ -72,7 +76,7 @@ export function SessionLifecycleControls({
           setSelectedId((current) =>
             nextSessions.some((item) => item.sessionId === current)
               ? current
-              : nextSessions[0]?.sessionId ?? "",
+              : (nextSessions[0]?.sessionId ?? ""),
           );
         } else if (operation === "close") {
           setSessions((current) =>
@@ -81,7 +85,9 @@ export function SessionLifecycleControls({
           setSelectedId("");
           setMessage("Session closed");
         } else if (operation === "fork" && frame.sessionId) {
-          const parent = sessions.find((item) => item.sessionId === targetSessionId);
+          const parent = sessions.find(
+            (item) => item.sessionId === targetSessionId,
+          );
           const fork: AgentSessionLifecycleEntry = {
             sessionId: frame.sessionId,
             title: parent?.title ? `Fork of ${parent.title}` : "Forked session",
@@ -91,7 +97,9 @@ export function SessionLifecycleControls({
           setSelectedId(fork.sessionId);
           setMessage("Fork opened in this direct conversation");
         } else {
-          setMessage(operation === "load" ? "Session loaded" : "Session resumed");
+          setMessage(
+            operation === "load" ? "Session loaded" : "Session resumed",
+          );
         }
       } catch (error) {
         setMessage(error instanceof Error ? error.message : String(error));
@@ -108,7 +116,9 @@ export function SessionLifecycleControls({
 
   const profile = agent?.envVars?.OMP_PROFILE?.trim() || "default";
   const workspace =
-    agent?.spawnedWithWorkspacePath ?? agent?.workspacePath ?? "runtime default";
+    agent?.spawnedWithWorkspacePath ??
+    agent?.workspacePath ??
+    "runtime default";
 
   return (
     <section
@@ -143,7 +153,8 @@ export function SessionLifecycleControls({
           >
             {sessions.map((item) => (
               <option key={item.sessionId} value={item.sessionId}>
-                {item.title || item.sessionId} · {item.updatedAt || "unknown date"}
+                {item.title || item.sessionId} ·{" "}
+                {item.updatedAt || "unknown date"}
               </option>
             ))}
           </select>
@@ -164,7 +175,10 @@ export function SessionLifecycleControls({
         </>
       ) : null}
       {message ? (
-        <span className="basis-full text-xs text-muted-foreground" role="status">
+        <span
+          className="basis-full text-xs text-muted-foreground"
+          role="status"
+        >
           {message}
         </span>
       ) : null}

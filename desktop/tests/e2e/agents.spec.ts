@@ -264,9 +264,7 @@ test("omp roster requires unique mappings and supports explicit creation", async
   const apply = plan.getByRole("button", { name: "Apply deployment plan" });
   await expect(apply).toBeDisabled();
   await reviewer.selectOption("existing-omp-a");
-  await expect(
-    scout.locator('option[value="existing-omp-a"]'),
-  ).toHaveCount(0);
+  await expect(scout.locator('option[value="existing-omp-a"]')).toHaveCount(0);
   const createScout = plan.getByTestId("roster-create-scout");
   await expect(createScout).toBeVisible();
   await reviewer.selectOption("");
@@ -2932,9 +2930,13 @@ test("omp roster deployment repeats without duplicates or overwriting edits", as
   const roster = page.getByTestId("omp-profile-roster");
   await roster.getByRole("button", { name: "Preview deployment" }).click();
   const firstPlan = page.getByTestId("roster-deploy-plan");
-  await firstPlan.getByTestId("roster-map-reviewer").selectOption("existing-omp-a");
+  await firstPlan
+    .getByTestId("roster-map-reviewer")
+    .selectOption("existing-omp-a");
   await firstPlan.getByTestId("roster-create-scout").click();
-  await firstPlan.getByRole("button", { name: "Apply deployment plan" }).click();
+  await firstPlan
+    .getByRole("button", { name: "Apply deployment plan" })
+    .click();
   await expect(page.getByText("Applied 4 deployment changes.")).toBeVisible();
 
   const afterFirstApply = await invokeTauri<
@@ -2954,7 +2956,11 @@ test("omp roster deployment repeats without duplicates or overwriting edits", as
   const secondPlan = await invokeTauri<{
     entries: Array<{ name: string; verdict: string }>;
   }>(page, "preview_roster_deploy");
-  expect(secondPlan.entries.filter((entry) => ["coder", "reviewer", "scout"].includes(entry.name))).toEqual(
+  expect(
+    secondPlan.entries.filter((entry) =>
+      ["coder", "reviewer", "scout"].includes(entry.name),
+    ),
+  ).toEqual(
     expect.arrayContaining([
       expect.objectContaining({ name: "coder", verdict: "unchanged" }),
       expect.objectContaining({ name: "reviewer", verdict: "unchanged" }),
@@ -2978,19 +2984,28 @@ test("omp roster deployment repeats without duplicates or overwriting edits", as
   const editedPlan = await invokeTauri<{
     entries: Array<{ name: string; verdict: string }>;
   }>(page, "preview_roster_deploy");
-  expect(editedPlan.entries.find((entry) => entry.name === "reviewer")?.verdict).toBe(
-    "unchanged",
-  );
+  expect(
+    editedPlan.entries.find((entry) => entry.name === "reviewer")?.verdict,
+  ).toBe("unchanged");
   const editRedeploy = await invokeTauri<{
     applied: Array<{ name: string }>;
   }>(page, "apply_roster_deploy", { input: { plan: editedPlan } });
   expect(editRedeploy.applied).toEqual([]);
 
   const afterEditRedeploy = await invokeTauri<
-    Array<{ id: string; display_name: string; system_prompt: string; env_vars?: Record<string, string> }>
+    Array<{
+      id: string;
+      display_name: string;
+      system_prompt: string;
+      env_vars?: Record<string, string>;
+    }>
   >(page, "list_personas");
-  expect(afterEditRedeploy.map((persona) => persona.id).sort()).toEqual(deployedIds);
-  expect(afterEditRedeploy.find((persona) => persona.id === "existing-omp-a")).toMatchObject({
+  expect(afterEditRedeploy.map((persona) => persona.id).sort()).toEqual(
+    deployedIds,
+  );
+  expect(
+    afterEditRedeploy.find((persona) => persona.id === "existing-omp-a"),
+  ).toMatchObject({
     display_name: "Edited reviewer",
     system_prompt: "User-edited prompt must survive redeployment.",
     env_vars: { OMP_PROFILE: "reviewer" },

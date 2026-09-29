@@ -16,7 +16,10 @@ test("an alias lane resolves to the concrete model that carries its effort choic
 });
 
 test("chained aliases resolve through every hop", () => {
-  assert.equal(resolveLaneModel("@orchestrator", lanes), "anthropic/claude-opus-5-5");
+  assert.equal(
+    resolveLaneModel("@orchestrator", lanes),
+    "anthropic/claude-opus-5-5",
+  );
 });
 
 test("an unknown alias and an alias cycle are unresolved instead of looping", () => {

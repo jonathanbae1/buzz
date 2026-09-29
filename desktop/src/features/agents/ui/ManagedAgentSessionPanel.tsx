@@ -121,14 +121,10 @@ export function ManagedAgentSessionPanel({
         },
       });
       setStopMessage(
-        outcome === "sent"
-          ? "Stop requested"
-          : outcome.replaceAll("_", " "),
+        outcome === "sent" ? "Stop requested" : outcome.replaceAll("_", " "),
       );
     } catch (error) {
-      setStopMessage(
-        error instanceof Error ? error.message : String(error),
-      );
+      setStopMessage(error instanceof Error ? error.message : String(error));
     } finally {
       setStopPending(false);
     }

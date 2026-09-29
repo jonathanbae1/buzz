@@ -467,19 +467,17 @@ export function usePersonaActions() {
     if (!rosterDeployPlan || applyRosterDeployMutation.isPending) return;
     clearFeedback("library");
     try {
-      const result = await applyRosterDeployMutation.mutateAsync(
-        rosterDeployPlan,
-      );
+      const result =
+        await applyRosterDeployMutation.mutateAsync(rosterDeployPlan);
       setRosterDeployPlan(result.refreshed);
-      const successes = result.applied.filter((entry) =>
-        entry.outcome === "created" ||
-        entry.outcome === "adopted" ||
-        entry.outcome === "teamCreated",
+      const successes = result.applied.filter(
+        (entry) =>
+          entry.outcome === "created" ||
+          entry.outcome === "adopted" ||
+          entry.outcome === "teamCreated",
       );
       const changeLabel =
-        successes.length === 1
-          ? "deployment change"
-          : "deployment changes";
+        successes.length === 1 ? "deployment change" : "deployment changes";
       const issues = result.applied.filter(
         (entry) =>
           entry.outcome !== "created" &&
@@ -496,14 +494,14 @@ export function usePersonaActions() {
         setPersonaErrorMessage(
           issues.length > 0
             ? issues
-                .map((entry) => `${entry.name}: ${entry.reason ?? entry.outcome}`)
+                .map(
+                  (entry) => `${entry.name}: ${entry.reason ?? entry.outcome}`,
+                )
                 .join(" ")
             : "The plan changed before apply. Review the refreshed plan.",
         );
       } else if (successes.length > 0) {
-        setPersonaNoticeMessage(
-          `Applied ${successes.length} ${changeLabel}.`,
-        );
+        setPersonaNoticeMessage(`Applied ${successes.length} ${changeLabel}.`);
       } else {
         setPersonaNoticeMessage("The deployment plan is up to date.");
       }
@@ -527,9 +525,7 @@ export function usePersonaActions() {
   }
 
   function createRosterProfile(name: string) {
-    setRosterDeployPlan((current) =>
-      resolveRosterProfileAsNew(current, name),
-    );
+    setRosterDeployPlan((current) => resolveRosterProfileAsNew(current, name));
   }
 
   function prepareCreate() {

@@ -1,4 +1,12 @@
-import { Activity, BookOpen, Bot, Folders, Inbox, ListChecks, Zap } from "lucide-react";
+import {
+  Activity,
+  BookOpen,
+  Bot,
+  Folders,
+  Inbox,
+  ListChecks,
+  Zap,
+} from "lucide-react";
 
 import { TopbarSearch } from "@/features/search/ui/TopbarSearch";
 import { SidebarProjectsSection } from "@/features/sidebar/ui/SidebarProjectsSection";

@@ -163,7 +163,10 @@ export async function registerAgentTaskDispatch(input: {
 export function isTaskError(value: unknown): value is TaskError {
   if (value === null || typeof value !== "object") return false;
   const candidate = value as Record<string, unknown>;
-  return typeof candidate["kind"] === "string" && typeof candidate["message"] === "string";
+  return (
+    typeof candidate["kind"] === "string" &&
+    typeof candidate["message"] === "string"
+  );
 }
 
 /** Normalize anything thrown by the bridge into a TaskError for display. */

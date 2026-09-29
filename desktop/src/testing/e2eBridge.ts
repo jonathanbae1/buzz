@@ -9223,7 +9223,11 @@ function createMockRosterDeployPlan(): RosterDeployPlan {
       ...entry("scout", "unmapped", "Choose an agent or deploy a new one."),
       candidates,
     },
-    entry("designer", "unavailable", "Profile activation proof is unavailable."),
+    entry(
+      "designer",
+      "unavailable",
+      "Profile activation proof is unavailable.",
+    ),
   ].map((rosterEntry) => {
     if (rosterEntry.verdict === "unavailable") return rosterEntry;
     const selectorHolders = mockPersonas.filter(
@@ -9274,10 +9278,7 @@ function createMockRosterDeployPlan(): RosterDeployPlan {
   };
   for (const rosterEntry of entries) {
     counts[rosterEntry.verdict] += 1;
-    if (
-      rosterEntry.verdict === "create" ||
-      rosterEntry.verdict === "adopt"
-    ) {
+    if (rosterEntry.verdict === "create" || rosterEntry.verdict === "adopt") {
       counts.applyable += 1;
     }
   }
@@ -9302,17 +9303,14 @@ function createMockRosterDeployPlan(): RosterDeployPlan {
         slug: "build",
         name: "Build",
         version: "1",
-        verdict: buildTeam
-          ? "unchanged"
-          : buildReady
-            ? "create"
-            : "blocked",
+        verdict: buildTeam ? "unchanged" : buildReady ? "create" : "blocked",
         teamId: buildTeam?.id ?? null,
         members: buildMembers.map((profile) => {
           const entry = entries.find((candidate) => candidate.name === profile);
           return {
             profile,
-            personaId: entry?.verdict === "create" ? null : (entry?.personaId ?? null),
+            personaId:
+              entry?.verdict === "create" ? null : (entry?.personaId ?? null),
             displayName: entry?.personaDisplayName ?? null,
             message: entry?.message ?? "Profile is unavailable.",
           };
@@ -9331,7 +9329,6 @@ function createMockRosterDeployPlan(): RosterDeployPlan {
     applyBlocked: counts.unmapped > 0 || counts.conflict > 0,
   };
 }
-
 
 function cloneMockTeam(team: RawTeam): RawTeam {
   return { ...team, persona_ids: [...team.persona_ids] };
@@ -13141,9 +13138,7 @@ export function maybeInstallE2eTauriMocks() {
             path,
             content: documents[path] ?? null,
             unavailable_reason:
-              documents[path] === null
-                ? "file exceeds the preview size"
-                : null,
+              documents[path] === null ? "file exceeds the preview size" : null,
           };
         }
         const contents = window.__BUZZ_E2E_PROJECT_REPO_FILE_CONTENTS__ ?? {};
@@ -13980,7 +13975,8 @@ export function maybeInstallE2eTauriMocks() {
           {
             slug: "build",
             name: "Build",
-            description: "Implementation, review and reconnaissance for shipping work.",
+            description:
+              "Implementation, review and reconnaissance for shipping work.",
             members: ["coder", "reviewer", "scout"],
           },
           {
@@ -14268,7 +14264,9 @@ export function maybeInstallE2eTauriMocks() {
           contract: seed?.contract ?? null,
           serviceVersion: available ? "0.9.28-m1.1" : null,
           managedAvailable: available,
-          managedUnavailableReason: available ? null : "M1 contract unavailable",
+          managedUnavailableReason: available
+            ? null
+            : "M1 contract unavailable",
           error: null,
         };
       }
@@ -14292,7 +14290,7 @@ export function maybeInstallE2eTauriMocks() {
           expectedRevision: number;
         };
         const seed = activeConfig?.mock?.agentTasks;
-        const row = seed?.tasks.find(task => task.id === input.actionId);
+        const row = seed?.tasks.find((task) => task.id === input.actionId);
         if (!row || row.assignmentRevision !== input.expectedRevision) {
           throw new Error("task assignment revision changed");
         }

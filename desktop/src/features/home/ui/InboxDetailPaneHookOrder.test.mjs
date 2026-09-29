@@ -109,15 +109,17 @@ before(async () => {
   ({ render, cleanup } = await import("@testing-library/react"));
   ({ HuddleProvider } = await import("@/features/huddle/HuddleContext.tsx"));
   ({ TooltipProvider } = await import("@/shared/ui/tooltip.tsx"));
-  ({ UpdaterProvider } = await import("@/features/settings/hooks/UpdaterProvider.tsx"));
-  ({ CommunitiesProvider } = await import("@/features/communities/useCommunities.tsx"));
-  ({ QueryClient, QueryClientProvider } = await import("@tanstack/react-query"));
-  ({
-    createMemoryHistory,
-    createRootRoute,
-    createRouter,
-    RouterProvider,
-  } = await import("@tanstack/react-router"));
+  ({ UpdaterProvider } = await import(
+    "@/features/settings/hooks/UpdaterProvider.tsx"
+  ));
+  ({ CommunitiesProvider } = await import(
+    "@/features/communities/useCommunities.tsx"
+  ));
+  ({ QueryClient, QueryClientProvider } = await import(
+    "@tanstack/react-query"
+  ));
+  ({ createMemoryHistory, createRootRoute, createRouter, RouterProvider } =
+    await import("@tanstack/react-router"));
   ({ InboxDetailPane } = await import("./InboxDetailPane.tsx"));
   const rootRoute = createRootRoute({
     component: function TestRoot() {

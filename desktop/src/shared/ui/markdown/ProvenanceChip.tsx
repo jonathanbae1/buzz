@@ -22,8 +22,7 @@ import {
 const MARKER_STYLE: Record<ParsedProvenance["kind"], string> = {
   // Cobalt `#1d4ed8`/`#60a5fa` — `docs/DESIGN.md` binds it to "CURRENT (proven
   // facts)", which is exactly what `(source: …)` asserts.
-  source:
-    "border-blue-500/30 bg-blue-500/10 text-blue-700 dark:text-blue-300",
+  source: "border-blue-500/30 bg-blue-500/10 text-blue-700 dark:text-blue-300",
   // Vermilion `#c22d15`/`#ff6b52` — "PLANNED; NOT IMPLEMENTED" in DESIGN.md,
   // and a `(decision)` is by definition reversible.
   decision: "border-destructive/40 bg-destructive/10 text-destructive",
@@ -75,7 +74,8 @@ export function ProvenanceChip({
     );
   }
 
-  const label = parsed.kind === "source" && parsed.path ? parsed.path : parsed.raw;
+  const label =
+    parsed.kind === "source" && parsed.path ? parsed.path : parsed.raw;
   // A citation navigates only when the caller's resolver found exactly one
   // tracked file for it. Zero or several matches stays inert: the full citation
   // is still shown, so the reader sees the source without a click that could
@@ -85,7 +85,9 @@ export function ProvenanceChip({
       ? resolveSource(parsed.path, parsed.line)
       : ({ navigable: false } as const);
   const canNavigate =
-    resolution.navigable && onOpenSource !== undefined && parsed.kind === "source";
+    resolution.navigable &&
+    onOpenSource !== undefined &&
+    parsed.kind === "source";
 
   if (canNavigate && resolution.navigable) {
     return (

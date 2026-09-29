@@ -72,8 +72,7 @@ export function normalizeAvailableCommands(
     const subcommands = normalizeSubcommands(
       meta?.["dev.ohmybuzz/subcommands"],
     );
-    const inputSchema =
-      "input" in record ? record.input : record.inputSchema;
+    const inputSchema = "input" in record ? record.input : record.inputSchema;
     commands.push({
       name,
       ...(readString(record.description)
@@ -120,13 +119,17 @@ export function getAgentSessionCommandCatalog(
 export function findAgentSessionCommand(
   agentPubkey: string | null | undefined,
   commandName: string,
-): { command: AgentSessionCommand; catalog: AgentSessionCommandCatalog } | null {
+): {
+  command: AgentSessionCommand;
+  catalog: AgentSessionCommandCatalog;
+} | null {
   if (!agentPubkey) return null;
   const normalizedAgent = normalizePubkey(agentPubkey);
   const normalizedCommand = commandName.replace(/^\/+/, "").toLowerCase();
-  let result:
-    | { command: AgentSessionCommand; catalog: AgentSessionCommandCatalog }
-    | null = null;
+  let result: {
+    command: AgentSessionCommand;
+    catalog: AgentSessionCommandCatalog;
+  } | null = null;
   for (const catalog of catalogs.values()) {
     if (catalog.agentPubkey !== normalizedAgent) continue;
     const command = catalog.commands.find(
@@ -212,10 +215,7 @@ export async function dispatchAgentSessionCommand(input: {
   acknowledged?: boolean;
 }> {
   if (input.enabled === false) return { status: "disabled" };
-  if (
-    input.candidateAgentPubkeys &&
-    input.candidateAgentPubkeys.length > 1
-  ) {
+  if (input.candidateAgentPubkeys && input.candidateAgentPubkeys.length > 1) {
     return { status: "ambiguous_target" };
   }
   if (!input.agentPubkey) return { status: "no_agent" };
@@ -257,7 +257,9 @@ export async function dispatchAgentSessionCommand(input: {
   let unsubscribe = () => {};
   if (input.onTerminal) {
     unsubscribe = subscribeControlResults(input.agentPubkey, (frame) => {
-      if (!isAgentSessionCommandTerminalFrame(frame, requestId, input.sessionId)) {
+      if (
+        !isAgentSessionCommandTerminalFrame(frame, requestId, input.sessionId)
+      ) {
         return;
       }
       unsubscribe();

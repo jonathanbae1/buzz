@@ -960,7 +960,11 @@ export async function putAgentSessionConfig(
   sessionId: string,
   payload: unknown,
 ): Promise<void> {
-  return invokeTauri<void>("put_agent_session_config", { pubkey, sessionId, payload });
+  return invokeTauri<void>("put_agent_session_config", {
+    pubkey,
+    sessionId,
+    payload,
+  });
 }
 
 /** File-layer config for a runtime (e.g. `~/.config/goose/config.yaml`). */

@@ -15,7 +15,11 @@ function plan({ applyBlocked = false, applyable = 1, teams = [] } = {}) {
 
 function rosterPlan() {
   const candidates = [
-    { personaId: "persona-a", displayName: "Agent A", expectedDigest: "digest-a" },
+    {
+      personaId: "persona-a",
+      displayName: "Agent A",
+      expectedDigest: "digest-a",
+    },
   ];
   const entry = (name) => ({
     name,
@@ -46,7 +50,12 @@ function rosterPlan() {
         verdict: "blocked",
         teamId: null,
         members: [
-          { profile: "reviewer", personaId: null, displayName: null, message: "" },
+          {
+            profile: "reviewer",
+            personaId: null,
+            displayName: null,
+            message: "",
+          },
           { profile: "scout", personaId: null, displayName: null, message: "" },
         ],
         message: "Needs profile mappings.",
@@ -75,7 +84,10 @@ test("apply is disabled before preview and while mutations are pending", () => {
 });
 
 test("apply uses the backend plan's blocked state and applyable count", () => {
-  assert.equal(isRosterApplyDisabled(plan({ applyBlocked: true }), false), true);
+  assert.equal(
+    isRosterApplyDisabled(plan({ applyBlocked: true }), false),
+    true,
+  );
   assert.equal(isRosterApplyDisabled(plan({ applyable: 0 }), false), true);
   assert.equal(isRosterApplyDisabled(plan(), false), false);
   assert.equal(
@@ -105,7 +117,10 @@ test("profile mappings stay unique, can be cleared, and resolve by creating", ()
   const mappedReviewer = updateRosterMapping(initial, "reviewer", agentA);
   assert.equal(mappedReviewer.counts.adopt, 1);
   assert.equal(mappedReviewer.counts.unmapped, 1);
-  assert.deepEqual(rosterCandidatesAvailableToEntry(mappedReviewer, "scout"), []);
+  assert.deepEqual(
+    rosterCandidatesAvailableToEntry(mappedReviewer, "scout"),
+    [],
+  );
   assert.strictEqual(
     updateRosterMapping(mappedReviewer, "scout", agentA),
     mappedReviewer,
