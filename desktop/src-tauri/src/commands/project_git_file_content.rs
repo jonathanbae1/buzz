@@ -29,10 +29,7 @@ pub(crate) fn read_preview_content(
     path: &str,
     size: Option<u64>,
 ) -> Option<String> {
-    match read_preview_file(repo_dir, path, size) {
-        Ok(content) => Some(content),
-        Err(_) => None,
-    }
+    read_preview_file(repo_dir, path, size).ok()
 }
 
 /// Read one file from a checkout, refusing anything that escapes the root.

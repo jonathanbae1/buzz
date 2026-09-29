@@ -915,7 +915,9 @@ fn omb_custom_harness_survives_persona_resnapshot() {
     warm_harness_registry_from_dir(Some(dir.path()));
 
     let mut persona = persona("scout", Some("omb"), "Read-only scout.");
-    persona.env_vars.insert("OMP_PROFILE".into(), "scout".into());
+    persona
+        .env_vars
+        .insert("OMP_PROFILE".into(), "scout".into());
     let personas = [persona.clone()];
     let mut rec = record();
     rec.persona_id = Some(persona.id.clone());
@@ -925,15 +927,15 @@ fn omb_custom_harness_survives_persona_resnapshot() {
 
     apply_persona_snapshot(&mut rec, &persona);
     assert_eq!(rec.runtime.as_deref(), Some("omb"));
-    assert_eq!(rec.agent_command, "omp", "legacy command snapshots are not pins");
+    assert_eq!(
+        rec.agent_command, "omp",
+        "legacy command snapshots are not pins"
+    );
     assert_eq!(rec.agent_command_override, None);
 
     let descriptor =
         resolve_effective_harness_descriptor(&rec, &personas, &Default::default()).unwrap();
-    assert_eq!(
-        descriptor.command,
-        "/Users/juwonbae/.local/share/omb/omb"
-    );
+    assert_eq!(descriptor.command, "/Users/juwonbae/.local/share/omb/omb");
     assert_eq!(descriptor.args, ["acp"]);
 
     let spawn_snapshot = snapshot(&rec, &personas, &[], "ws://relay", &Default::default());
@@ -944,7 +946,6 @@ fn omb_custom_harness_survives_persona_resnapshot() {
     assert_eq!(spawn_snapshot["args"], serde_json::json!(["acp"]));
     assert_eq!(spawn_snapshot["env"]["OMP_PROFILE"], "scout");
 }
-
 
 // ── Parallelism cap: above-cap equivalence + cap crossing ─────────────────────
 //

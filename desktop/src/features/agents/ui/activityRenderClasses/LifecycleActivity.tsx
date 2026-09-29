@@ -26,9 +26,9 @@ function permissionOutcomeTone(outcome: string): "approve" | "deny" | "cancel" {
 
 function PermissionActivity(props: ActivityRenderClassItemProps) {
   const { item } = props;
-  if (item.type !== "lifecycle") return null;
   const [submitting, setSubmitting] = React.useState(false);
   const [error, setError] = React.useState<string | null>(null);
+  if (item.type !== "lifecycle") return null;
   const request = item.permissionRequest;
   const outcome = item.outcome;
   const tone = outcome ? permissionOutcomeTone(outcome) : null;
@@ -86,11 +86,17 @@ function PermissionActivity(props: ActivityRenderClassItemProps) {
       data-testid="transcript-lifecycle-item"
       title={formatTranscriptTimestampTitle(item.timestamp)}
     >
-      {tone === "approve" ? <CheckCircle2 className="mr-1.5 inline h-3.5 w-3.5" /> : null}
-      {tone === "deny" ? <XCircle className="mr-1.5 inline h-3.5 w-3.5" /> : null}
+      {tone === "approve" ? (
+        <CheckCircle2 className="mr-1.5 inline h-3.5 w-3.5" />
+      ) : null}
+      {tone === "deny" ? (
+        <XCircle className="mr-1.5 inline h-3.5 w-3.5" />
+      ) : null}
       {!tone ? <ShieldCheck className="mr-1.5 inline h-3.5 w-3.5" /> : null}
       <span className="font-medium">{item.title}</span>
-      {detail ? <div className="mt-1 whitespace-pre-wrap opacity-80">{detail}</div> : null}
+      {detail ? (
+        <div className="mt-1 whitespace-pre-wrap opacity-80">{detail}</div>
+      ) : null}
       {outcome ? <div className="mt-1 font-medium">{outcome}</div> : null}
       {request && !outcome ? (
         <div className="mt-2 flex flex-wrap gap-1.5">
@@ -162,4 +168,3 @@ export function LifecycleActivity(props: ActivityRenderClassItemProps) {
     </ActivityRow>
   );
 }
-
