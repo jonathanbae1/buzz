@@ -490,8 +490,7 @@ fn unavailability(contract: Option<&str>) -> Option<String> {
 /// whole job is to describe the configuration, including a configuration the client refuses to
 /// USE. Reporting `configured: false` for a perfectly configured but insecure URL would hide the
 /// real problem behind the wrong message.
-#[tauri::command]
-pub fn agent_tasks_status() -> StoreStatus {
+pub fn agent_tasks_status_blocking() -> StoreStatus {
     let url = configured_url();
     let Some(raw_url) = url else {
         return StoreStatus {
@@ -578,8 +577,7 @@ pub fn agent_tasks_status() -> StoreStatus {
 }
 
 /// List the project's actions with their assignment, lease and readiness projection.
-#[tauri::command]
-pub fn agent_tasks_list() -> Result<TaskBoard, TaskError> {
+pub fn agent_tasks_list_blocking() -> Result<TaskBoard, TaskError> {
     let store = resolve_store()?;
     let health = health_payload(&store)?;
     let contract = health
@@ -623,8 +621,7 @@ pub fn agent_tasks_list() -> Result<TaskBoard, TaskError> {
 }
 
 /// Set or clear assignment INTENT, or cancel. Writes intent only and dispatches nothing.
-#[tauri::command]
-pub fn agent_tasks_assign(
+pub fn agent_tasks_assign_blocking(
     action_id: String,
     target_agent_id: Option<String>,
     expected_revision: Option<i64>,
@@ -647,8 +644,7 @@ pub fn agent_tasks_assign(
 }
 
 /// Register the dispatch BEFORE anything is sent to a worker.
-#[tauri::command]
-pub fn agent_tasks_register_dispatch(
+pub fn agent_tasks_register_dispatch_blocking(
     action_id: String,
     request_id: String,
     session_id: String,
@@ -670,8 +666,7 @@ pub fn agent_tasks_register_dispatch(
 }
 
 /// Read one action's authoritative state, used to reconcile an uncertain dispatch.
-#[tauri::command]
-pub fn agent_tasks_get(action_id: String) -> Result<Value, TaskError> {
+pub fn agent_tasks_get_blocking(action_id: String) -> Result<Value, TaskError> {
     let store = resolve_store()?;
     send(
         &store,
@@ -704,7 +699,7 @@ mod probe {
             return;
         }
         let url = std::env::var("AGENTMEMORY_URL").unwrap();
-        let status = agent_tasks_status();
+        let status = agent_tasks_status_blocking();
         assert!(
             status.configured,
             "a configured store must report configured=true"
@@ -717,14 +712,14 @@ mod probe {
 
         if url.starts_with("https://") {
             if status.managed_available {
-                let board = agent_tasks_list().expect("a compatible store must list");
+                let board = agent_tasks_list_blocking().expect("a compatible store must list");
                 eprintln!("rows = {}", board.tasks.len());
             } else {
                 assert!(
                     status.managed_unavailable_reason.is_some(),
                     "unavailability must carry a reason"
                 );
-                let error = agent_tasks_list().expect_err("managed work must be refused");
+                let error = agent_tasks_list_blocking().expect_err("managed work must be refused");
                 assert!(
                     matches!(
                         error.kind,
@@ -747,7 +742,7 @@ mod probe {
             !status.managed_available,
             "plain HTTP must never be managed-available"
         );
-        let error = agent_tasks_list().expect_err("plain HTTP must be refused");
+        let error = agent_tasks_list_blocking().expect_err("plain HTTP must be refused");
         assert!(
             matches!(error.kind, TaskErrorKind::InsecureUrl),
             "plain HTTP must classify as InsecureUrl, got {:?}: {}",
@@ -771,4 +766,84 @@ mod probe {
         std::env::remove_var("AGENTMEMORY_URL");
         std::env::remove_var("AGENTMEMORY_SECRET");
     }
+}
+
+// Tauri runs synchronous commands on the main thread, so each blocking store,
+// file or git call above is dispatched to the blocking pool; otherwise a slow
+// request freezes the whole window.
+#[tauri::command]
+pub async fn agent_tasks_status() -> StoreStatus {
+    tauri::async_runtime::spawn_blocking(agent_tasks_status_blocking)
+        .await
+        .unwrap_or_else(|error| panic!("agent_tasks_status worker failed: {error}"))
+}
+
+#[tauri::command]
+pub async fn agent_tasks_list() -> Result<TaskBoard, TaskError> {
+    tauri::async_runtime::spawn_blocking(agent_tasks_list_blocking)
+        .await
+        .unwrap_or_else(|error| {
+            Err(TaskError::new(
+                TaskErrorKind::Protocol,
+                format!("task store worker failed: {error}"),
+                None,
+                None,
+            ))
+        })
+}
+
+#[tauri::command]
+pub async fn agent_tasks_assign(
+    action_id: String,
+    target_agent_id: Option<String>,
+    expected_revision: Option<i64>,
+    cancel: Option<bool>,
+) -> Result<Value, TaskError> {
+    tauri::async_runtime::spawn_blocking(move || {
+        agent_tasks_assign_blocking(action_id, target_agent_id, expected_revision, cancel)
+    })
+    .await
+    .unwrap_or_else(|error| {
+        Err(TaskError::new(
+            TaskErrorKind::Protocol,
+            format!("task store worker failed: {error}"),
+            None,
+            None,
+        ))
+    })
+}
+
+#[tauri::command]
+pub async fn agent_tasks_register_dispatch(
+    action_id: String,
+    request_id: String,
+    session_id: String,
+    expected_revision: i64,
+) -> Result<Value, TaskError> {
+    tauri::async_runtime::spawn_blocking(move || {
+        agent_tasks_register_dispatch_blocking(action_id, request_id, session_id, expected_revision)
+    })
+    .await
+    .unwrap_or_else(|error| {
+        Err(TaskError::new(
+            TaskErrorKind::Protocol,
+            format!("task store worker failed: {error}"),
+            None,
+            None,
+        ))
+    })
+}
+
+#[tauri::command]
+pub async fn agent_tasks_get(action_id: String) -> Result<Value, TaskError> {
+    tauri::async_runtime::spawn_blocking(move || agent_tasks_get_blocking(action_id))
+        .await
+        .unwrap_or_else(|error| {
+            Err(TaskError::new(
+                TaskErrorKind::Protocol,
+                format!("task store worker failed: {error}"),
+                None,
+                None,
+            ))
+        })
 }

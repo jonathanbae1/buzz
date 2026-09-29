@@ -1,4 +1,5 @@
 mod omp_lanes;
+mod omp_lanes_commands;
 
 mod agent_access;
 mod agent_auth;
@@ -115,7 +116,7 @@ pub use mesh_llm::*;
 pub use messages::*;
 pub use notifications::*;
 pub use observer_archive::*;
-pub use omp_lanes::*;
+pub use omp_lanes_commands::*;
 pub use os_idle::*;
 pub use pairing::*;
 pub use personas::*;

@@ -230,6 +230,7 @@ impl RoutingLock {
             .map_err(|e| format!("cannot create {}: {e}", parent.display()))?;
         let file = OpenOptions::new()
             .create(true)
+            .truncate(false)
             .read(true)
             .write(true)
             .open(&path)
@@ -417,6 +418,7 @@ fn parse_profile_records(text: &str) -> Result<(Value, Value), String> {
     }
     Ok((roles, agents))
 }
+
 #[cfg(test)]
 mod profile_record_tests {
     use super::parse_profile_records;
@@ -435,7 +437,7 @@ mod profile_record_tests {
 }
 #[cfg(test)]
 mod lane_commit_tests {
-    use super::{commit_omp_lanes, hash};
+    use super::{commit_omp_lanes_blocking, hash};
     use std::{
         fs,
         path::{Path, PathBuf},
@@ -511,7 +513,7 @@ mod lane_commit_tests {
             b"{\"schemaVersion\":1,\"lanes\":{\"quick\":{}}}\n",
         )
         .unwrap();
-        let refusal = commit_omp_lanes(stale.display().to_string(), hash(&prior));
+        let refusal = commit_omp_lanes_blocking(stale.display().to_string(), hash(&prior));
         assert_eq!(
             refusal.unwrap().refused.as_deref(),
             Some("revision_changed")
@@ -526,7 +528,7 @@ mod lane_commit_tests {
         .unwrap();
         git(&committed, &["add", "profiles/lanes.json"]);
         git(&committed, &["commit", "-qm", "terminal edit"]);
-        let refusal = commit_omp_lanes(committed.display().to_string(), hash(&prior));
+        let refusal = commit_omp_lanes_blocking(committed.display().to_string(), hash(&prior));
         assert_eq!(
             refusal.unwrap().refused.as_deref(),
             Some("revision_changed")
@@ -535,14 +537,14 @@ mod lane_commit_tests {
         let detached = scratch_repo(&root.join("detached"));
         let revision = hash(&fs::read(detached.join("profiles/lanes.json")).unwrap());
         git(&detached, &["checkout", "--detach", "-q"]);
-        let refusal = commit_omp_lanes(detached.display().to_string(), revision);
+        let refusal = commit_omp_lanes_blocking(detached.display().to_string(), revision);
         assert_eq!(refusal.unwrap().refused.as_deref(), Some("detached_head"));
 
         let staged = scratch_repo(&root.join("staged"));
         fs::write(staged.join("unrelated.txt"), "keep staged").unwrap();
         git(&staged, &["add", "unrelated.txt"]);
         let revision = hash(&fs::read(staged.join("profiles/lanes.json")).unwrap());
-        let refusal = commit_omp_lanes(staged.display().to_string(), revision).unwrap();
+        let refusal = commit_omp_lanes_blocking(staged.display().to_string(), revision).unwrap();
         assert_eq!(refusal.refused.as_deref(), Some("unrelated_staged_changes"));
         let staged_names = Command::new("git")
             .args(["diff", "--cached", "--name-only"])
@@ -572,7 +574,7 @@ mod lane_commit_tests {
         )
         .unwrap();
         let revision = hash(&fs::read(hooked.join("profiles/lanes.json")).unwrap());
-        let refusal = commit_omp_lanes(hooked.display().to_string(), revision).unwrap();
+        let refusal = commit_omp_lanes_blocking(hooked.display().to_string(), revision).unwrap();
         assert_eq!(refusal.refused.as_deref(), Some("hook_failed"));
         assert!(refusal.output.contains("intentional-hook-failure"));
     }
@@ -737,7 +739,7 @@ done
         drop(RoutingLock::acquire().expect("existing unlocked lock file must be reusable"));
 
         fs::write(
-            &lanes_path(&repo),
+            lanes_path(&repo),
             br#"{"schemaVersion":1,"lanes":{"advisor":{"model":"m","effort":"low"}}}"#,
         )
         .unwrap();
@@ -770,7 +772,7 @@ done
 
         for args in [vec!["--models-only"], vec![]] {
             fs::write(
-                &lanes_path(&repo),
+                lanes_path(&repo),
                 br#"{"schemaVersion":1,"lanes":{"advisor":{"model":"m","effort":"low"}}}"#,
             )
             .unwrap();
@@ -1090,8 +1092,7 @@ fn resolved_lanes(value: &Value) -> Vec<OmpLaneResolved> {
     result
 }
 
-#[tauri::command]
-pub fn get_omp_lane_editor_state() -> OmpLaneEditorState {
+pub fn get_omp_lane_editor_state_blocking() -> OmpLaneEditorState {
     let state = (|| -> Result<_, String> {
         let (sidecar, repo) = read_sidecar(None)?;
         let current_bytes = fs::read(lanes_path(&repo)).map_err(|e| e.to_string())?;
@@ -1125,8 +1126,7 @@ pub fn get_omp_lane_editor_state() -> OmpLaneEditorState {
     }
 }
 
-#[tauri::command]
-pub fn get_omp_model_catalog(repo_path: String) -> Result<OmpModelCatalog, String> {
+pub fn get_omp_model_catalog_blocking(repo_path: String) -> Result<OmpModelCatalog, String> {
     let repo = PathBuf::from(repo_path);
     let (sidecar, resolved_repo) = read_sidecar(Some(&repo))?;
     if resolved_repo != repo {
@@ -1189,8 +1189,7 @@ pub fn get_omp_model_catalog(repo_path: String) -> Result<OmpModelCatalog, Strin
     })
 }
 
-#[tauri::command]
-pub fn preview_omp_lanes(
+pub fn preview_omp_lanes_blocking(
     repo_path: String,
     lanes: Vec<OmpLaneEntry>,
 ) -> Result<OmpLanePreview, String> {
@@ -1237,8 +1236,7 @@ pub fn preview_omp_lanes(
 ///
 /// This command never writes the source file; the caller must continue through
 /// preview_omp_lanes and save_omp_lanes for validation and explicit confirmation.
-#[tauri::command]
-pub fn prepare_omp_lane_model_change(
+pub fn prepare_omp_lane_model_change_blocking(
     repo_path: String,
     lane_key: String,
     model: String,
@@ -1265,8 +1263,7 @@ pub fn prepare_omp_lane_model_change(
     Ok(lanes)
 }
 
-#[tauri::command]
-pub fn save_omp_lanes(
+pub fn save_omp_lanes_blocking(
     repo_path: String,
     lanes: Vec<OmpLaneEntry>,
     revision: String,
@@ -1407,8 +1404,7 @@ fn refusal(code: &str, output: String, branch: Option<String>) -> OmpLaneCommitO
     }
 }
 
-#[tauri::command]
-pub fn get_omp_lane_repo_status(repo_path: String) -> Result<OmpLaneRepoStatus, String> {
+pub fn get_omp_lane_repo_status_blocking(repo_path: String) -> Result<OmpLaneRepoStatus, String> {
     let repo = PathBuf::from(repo_path);
     let path = lanes_path(&repo);
     let revision = fs::read(&path).ok().map(|bytes| hash(&bytes));
@@ -1468,8 +1464,7 @@ fn status_paths(repo: &Path) -> Vec<String> {
         .collect()
 }
 
-#[tauri::command]
-pub fn commit_omp_lanes(
+pub fn commit_omp_lanes_blocking(
     repo_path: String,
     revision: String,
 ) -> Result<OmpLaneCommitOutcome, String> {
