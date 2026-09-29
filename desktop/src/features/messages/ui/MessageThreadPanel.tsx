@@ -51,11 +51,14 @@ import { useStableSendToChannel } from "./useStableSendToChannel";
 import { useAnchoredScroll } from "./useAnchoredScroll";
 import { selectDeferredListRenderState } from "@/features/messages/lib/timelineSnapshot";
 import { selectThreadRowHighlight } from "@/features/messages/lib/threadReplyHighlight";
+import type { ComposerCommandTarget } from "./useComposerCommandPicker";
 
 type MessageThreadPanelProps = ThreadPanelLayoutProps & {
   channel: Channel | null;
   channelId: string | null;
   channelName: string;
+  /** Managed agents this thread addresses, for composer slash commands. */
+  commandTarget?: ComposerCommandTarget | null;
   currentPubkey?: string;
   disabled?: boolean;
   firstUnreadReplyId?: string | null;
@@ -147,6 +150,7 @@ export function MessageThreadPanel({
   channelId,
   channelName,
   columnMaxWidthPx,
+  commandTarget = null,
   currentPubkey,
   disabled = false,
   firstUnreadReplyId,
@@ -839,6 +843,7 @@ export function MessageThreadPanel({
               channelId={channelId}
               channelName={channelName}
               channelType={channel?.channelType ?? null}
+              commandTarget={commandTarget}
               containerClassName={cn(
                 THREAD_PANEL_COMPOSER_GUTTER_CLASS,
                 "pb-0",

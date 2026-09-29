@@ -71,6 +71,7 @@ import { isWelcomeExperienceChannel as isWelcomeExperience } from "@/features/on
 import { useIsThreadPanelOverlay } from "@/shared/hooks/use-mobile";
 import { channelChrome } from "@/shared/layout/chromeLayout";
 import { cn } from "@/shared/lib/cn";
+import { threadCommandCandidates } from "@/features/messages/lib/threadCommandCandidates";
 const HUDDLE_TRANSCRIPT_ROOT_STYLE = {
   "--buzz-channel-content-top-padding": "0rem",
   "--channel-top-chrome-height": "0.25rem",
@@ -293,11 +294,23 @@ export const ChannelPane = React.memo(function ChannelPane({
             .map((agent) => agent.pubkey)
             .filter((pubkey) => knownAgentPubkeys.has(pubkey.toLowerCase()));
     return { candidateAgentPubkeys: [...new Set(candidates)] };
+  }, [activeChannel, activityAgents, currentPubkey, knownAgentPubkeys]);
+  const threadCommandTarget = React.useMemo(() => {
+    if (!threadHeadMessage) return null;
+    if (activeChannel?.channelType === "dm") return commandTarget;
+    return {
+      candidateAgentPubkeys: threadCommandCandidates(
+        threadHeadMessage,
+        threadMessages.map((entry) => entry.message),
+        knownAgentPubkeys,
+      ),
+    };
   }, [
-    activeChannel,
-    activityAgents,
-    currentPubkey,
+    activeChannel?.channelType,
+    commandTarget,
     knownAgentPubkeys,
+    threadHeadMessage,
+    threadMessages,
   ]);
   const handleSendMessage = React.useCallback(
     async (
@@ -863,6 +876,7 @@ export const ChannelPane = React.memo(function ChannelPane({
                 channel={activeChannel}
                 channelId={activeChannel?.id ?? null}
                 channelName={activeChannel?.name ?? "channel"}
+                commandTarget={threadCommandTarget}
                 currentPubkey={currentPubkey}
                 disabled={isComposerDisabled}
                 editTarget={threadEditTarget}

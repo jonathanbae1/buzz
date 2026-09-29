@@ -31,22 +31,18 @@ test("command filtering uses advertised names without synthesizing entries", () 
     { name: "/orchestrator", description: "Delegated pass" },
     { name: "skill:inspect", description: "Advertised skill" },
   ];
-  assert.deepEqual(
-    filterAgentSessionCommands(commands, "skill"),
-    [commands[2]],
-  );
+  assert.deepEqual(filterAgentSessionCommands(commands, "skill"), [
+    commands[2],
+  ]);
   assert.equal(normalizeCommandName("/ORCHESTRATOR"), "orchestrator");
 });
 
 test("leading generated mention prefixes are preserved while parsing commands", () => {
-  assert.deepEqual(
-    parseLeadingCommand("@Agent ", "@Agent "),
-    null,
-  );
-  assert.deepEqual(
-    parseLeadingCommand("@Agent /quick hello", "@Agent "),
-    { name: "quick", arguments: "hello" },
-  );
+  assert.deepEqual(parseLeadingCommand("@Agent ", "@Agent "), null);
+  assert.deepEqual(parseLeadingCommand("@Agent /quick hello", "@Agent "), {
+    name: "quick",
+    arguments: "hello",
+  });
 });
 
 test("command metadata carries declarative subcommands into the picker", () => {

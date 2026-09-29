@@ -51,6 +51,10 @@ import { ComposerAttachments, DropZoneOverlay } from "./ComposerAttachments";
 import { focusMentionOptionsTrigger } from "./MentionAutocomplete";
 import { MessageComposerAutocompletes } from "./MessageComposerAutocompletes";
 import { useComposerCommandPicker } from "./useComposerCommandPicker";
+import {
+  isBareModelCommand,
+  useComposerSessionModelPicker,
+} from "./ComposerSessionModelPicker";
 import { ComposerDockToolbar } from "./ComposerDockToolbar";
 import { ComposerUploadProgressPill } from "./ComposerUploadProgressPill";
 import { NonMemberMentionDialog } from "./NonMemberMentionDialog";
@@ -477,6 +481,12 @@ function MessageComposerImpl({
     target: commandTarget,
   });
   commandQueryUpdateRef.current = commandPicker.updateQuery;
+  const sessionModelPicker = useComposerSessionModelPicker({
+    agentPubkey: promptHistoryAgentPubkey,
+    channelId,
+    profiles,
+    sessionId: commandPicker.sessionId,
+  });
   commandPickerOpenRef.current = commandPicker.isCommandOpen;
   const {
     announcement: addressLockAnnouncement,
@@ -663,6 +673,20 @@ function MessageComposerImpl({
           return;
         }
       } else {
+        if (
+          sessionModelPicker.isAvailable &&
+          isBareModelCommand(
+            trimmed,
+            implicitAgentMentionProvenance.getPrefix(),
+          )
+        ) {
+          commandPicker.dismiss();
+          sessionModelPicker.open();
+          setComposerContent("");
+          richText.clearContent();
+          setPreviewContent("");
+          return;
+        }
         const commandResult =
           await commandPicker.dispatchSelectedCommand(trimmed);
         if (commandResult.handled) {
@@ -1029,6 +1053,7 @@ function MessageComposerImpl({
                 {commandPicker.dispatchError}
               </div>
             ) : null}
+            {sessionModelPicker.element}
             {commandPicker.dispatchNotice ? (
               <div
                 aria-live="polite"

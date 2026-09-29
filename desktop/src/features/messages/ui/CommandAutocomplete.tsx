@@ -93,7 +93,9 @@ export const CommandAutocomplete = React.memo(function CommandAutocomplete({
           onMouseDown={(event) => event.preventDefault()}
           ref={listRef}
           role="listbox"
-          aria-label={query ? `Agent commands matching ${query}` : "Agent commands"}
+          aria-label={
+            query ? `Agent commands matching ${query}` : "Agent commands"
+          }
           style={POPOVER_SHADOW_STYLE}
         >
           {activeCommand ? (
@@ -178,7 +180,10 @@ export const CommandAutocomplete = React.memo(function CommandAutocomplete({
                 role="option"
                 type="button"
               >
-                <TerminalSquare aria-hidden className="mt-0.5 size-4 shrink-0" />
+                <TerminalSquare
+                  aria-hidden
+                  className="mt-0.5 size-4 shrink-0"
+                />
                 <span className="min-w-0">
                   <span className="block font-mono font-medium">
                     {commandDisplayName(command.name)}

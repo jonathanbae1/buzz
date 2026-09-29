@@ -32,9 +32,7 @@ export function promptHistoryStorageKey(
   agentPubkey: string | null | undefined,
 ): string | null {
   const normalizedPubkey = agentPubkey?.trim().toLowerCase();
-  return normalizedPubkey
-    ? `${STORAGE_KEY_PREFIX}:${normalizedPubkey}`
-    : null;
+  return normalizedPubkey ? `${STORAGE_KEY_PREFIX}:${normalizedPubkey}` : null;
 }
 
 export function getPromptHistoryDirection(
@@ -119,10 +117,10 @@ export function usePromptHistory(storageKey: string | null): {
           ? cachedHistoryRef.current.prompts
           : [];
       const current = readPromptHistory(storageKey) ?? cached;
-      const next = [prompt, ...current.filter((entry) => entry !== prompt)].slice(
-        0,
-        MAX_PROMPTS,
-      );
+      const next = [
+        prompt,
+        ...current.filter((entry) => entry !== prompt),
+      ].slice(0, MAX_PROMPTS);
       try {
         localStorage.setItem(storageKey, JSON.stringify(next));
       } catch {

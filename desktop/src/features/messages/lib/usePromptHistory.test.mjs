@@ -52,11 +52,15 @@ test("history navigation shortcuts stay separate from edit-last and reload", asy
   assert.equal(getPromptHistoryDirection(keyEvent("ArrowUp")), null);
   assert.equal(getPromptHistoryDirection(keyEvent("ArrowDown")), null);
   assert.equal(
-    getPromptHistoryDirection(keyEvent("ArrowUp", { altKey: true, ctrlKey: true })),
+    getPromptHistoryDirection(
+      keyEvent("ArrowUp", { altKey: true, ctrlKey: true }),
+    ),
     null,
   );
   assert.equal(
-    getPromptHistoryDirection(keyEvent("ArrowUp", { altKey: true, defaultPrevented: true })),
+    getPromptHistoryDirection(
+      keyEvent("ArrowUp", { altKey: true, defaultPrevented: true }),
+    ),
     null,
   );
   assert.equal(
@@ -122,10 +126,22 @@ test("history navigation restores the current draft and stops after manual edits
     result.current.recordSentPrompt("newest prompt");
   });
 
-  assert.equal(result.current.navigate("older", "unfinished draft"), "newest prompt");
-  assert.equal(result.current.navigate("older", "newest prompt"), "older prompt");
-  assert.equal(result.current.navigate("older", "older prompt"), "older prompt");
-  assert.equal(result.current.navigate("newer", "older prompt"), "newest prompt");
+  assert.equal(
+    result.current.navigate("older", "unfinished draft"),
+    "newest prompt",
+  );
+  assert.equal(
+    result.current.navigate("older", "newest prompt"),
+    "older prompt",
+  );
+  assert.equal(
+    result.current.navigate("older", "older prompt"),
+    "older prompt",
+  );
+  assert.equal(
+    result.current.navigate("newer", "older prompt"),
+    "newest prompt",
+  );
   assert.equal(
     result.current.navigate("newer", "newest prompt"),
     "unfinished draft",
@@ -134,7 +150,10 @@ test("history navigation restores the current draft and stops after manual edits
 
   assert.equal(result.current.navigate("older", "draft"), "newest prompt");
   act(() => result.current.observeComposerText("edited prompt"));
-  assert.equal(result.current.navigate("older", "edited prompt"), "newest prompt");
+  assert.equal(
+    result.current.navigate("older", "edited prompt"),
+    "newest prompt",
+  );
   assert.equal(
     result.current.navigate("newer", "newest prompt"),
     "edited prompt",

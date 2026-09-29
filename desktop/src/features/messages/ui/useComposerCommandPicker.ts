@@ -11,9 +11,7 @@ import {
   getAgentSessionCommandCatalogStatus,
   subscribeAgentSessionCommandCatalog,
 } from "@/features/agents/ui/agentSessionCommandCatalog";
-import {
-  formatAgentSessionCommandTerminalNotice,
-} from "@/features/agents/lib/commandOutcome";
+import { formatAgentSessionCommandTerminalNotice } from "@/features/agents/lib/commandOutcome";
 import type {
   AgentSessionCommand,
   AgentSessionCommandCatalogStatus,
@@ -153,9 +151,7 @@ function statusMessage({
   return null;
 }
 
-function dispatchStatusMessage(
-  result: ComposerCommandDispatchResult,
-): string {
+function dispatchStatusMessage(result: ComposerCommandDispatchResult): string {
   switch (result.status) {
     case "active_turn":
       return "This agent is already handling a turn. The draft was kept.";
@@ -229,10 +225,8 @@ export function useComposerCommandPicker({
   const subscribeCatalog = React.useCallback(
     (listener: () => void) => {
       if (!agentPubkey || !sessionId) return () => {};
-      return subscribeAgentSessionCommandCatalog(
-        agentPubkey,
-        sessionId,
-        () => listener(),
+      return subscribeAgentSessionCommandCatalog(agentPubkey, sessionId, () =>
+        listener(),
       );
     },
     [agentPubkey, sessionId],
@@ -271,10 +265,7 @@ export function useComposerCommandPicker({
     (text: string, cursor: number) => {
       draftContentRef.current = text;
       const beforeCursor = text.slice(0, cursor);
-      const commandDraft = parseLeadingCommand(
-        text,
-        implicitMentionPrefix,
-      );
+      const commandDraft = parseLeadingCommand(text, implicitMentionPrefix);
       const commandStartOffset =
         implicitMentionPrefix && text.startsWith(implicitMentionPrefix)
           ? implicitMentionPrefix.length
@@ -471,10 +462,7 @@ export function useComposerCommandPicker({
           onTerminal: (frame) => {
             const requestId = frame.requestId;
             if (requestId) terminalFramesRef.current.set(requestId, frame);
-            if (
-              requestId &&
-              pendingRequestRef.current === requestId
-            ) {
+            if (requestId && pendingRequestRef.current === requestId) {
               pendingRequestRef.current = null;
             }
             setState((previous) => ({

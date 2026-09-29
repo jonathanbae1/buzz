@@ -41,9 +41,7 @@ type MessageComposerAutocompletesProps = {
     onDismiss: () => void;
     onRun: () => void;
     onSelect: (command: AgentSessionCommand) => void;
-    onSelectSubcommand: (
-      subcommand: AgentSessionCommandSubcommand,
-    ) => void;
+    onSelectSubcommand: (subcommand: AgentSessionCommandSubcommand) => void;
   };
   composerOwnsFocus: boolean;
   emojiAutocomplete: UseEmojiAutocompleteResult;
@@ -89,9 +87,7 @@ export function MessageComposerAutocompletes({
     <>
       <CommandAutocomplete
         activeCommand={commandPicker.activeCommand}
-        composerOwnsFocus={
-          composerOwnsFocus && commandPicker.isCommandOpen
-        }
+        composerOwnsFocus={composerOwnsFocus && commandPicker.isCommandOpen}
         isDispatching={commandPicker.isDispatching}
         onDismiss={commandPicker.onDismiss}
         onRun={commandPicker.onRun}
