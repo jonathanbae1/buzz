@@ -71,7 +71,10 @@ import { isWelcomeExperienceChannel as isWelcomeExperience } from "@/features/on
 import { useIsThreadPanelOverlay } from "@/shared/hooks/use-mobile";
 import { channelChrome } from "@/shared/layout/chromeLayout";
 import { cn } from "@/shared/lib/cn";
-import { threadCommandCandidates } from "@/features/messages/lib/threadCommandCandidates";
+import {
+  threadCommandCandidates,
+  threadScopeRefusal,
+} from "@/features/messages/lib/threadCommandCandidates";
 const HUDDLE_TRANSCRIPT_ROOT_STYLE = {
   "--buzz-channel-content-top-padding": "0rem",
   "--channel-top-chrome-height": "0.25rem",
@@ -293,12 +296,16 @@ export const ChannelPane = React.memo(function ChannelPane({
         : activityAgents
             .map((agent) => agent.pubkey)
             .filter((pubkey) => knownAgentPubkeys.has(pubkey.toLowerCase()));
-    return { candidateAgentPubkeys: [...new Set(candidates)] };
+    return {
+      candidateAgentPubkeys: [...new Set(candidates)],
+      ...threadScopeRefusal(activeChannel.channelType),
+    };
   }, [activeChannel, activityAgents, currentPubkey, knownAgentPubkeys]);
   const threadCommandTarget = React.useMemo(() => {
     if (!threadHeadMessage) return null;
     if (activeChannel?.channelType === "dm") return commandTarget;
     return {
+      ...threadScopeRefusal(activeChannel?.channelType ?? null),
       candidateAgentPubkeys: threadCommandCandidates(
         threadHeadMessage,
         threadMessages.map((entry) => entry.message),

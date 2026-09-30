@@ -1,3 +1,5 @@
+import { getOverrides } from "@/shared/features/store";
+
 type ThreadMessageLike = {
   pubkey?: string;
   tags?: string[][];
@@ -27,4 +29,23 @@ export function threadCommandCandidates(
   }
   for (const reply of replies) consider(reply.pubkey);
   return [...candidates];
+}
+
+/**
+ * With the experimental thread-scoped ACP sessions, each thread in a non-DM
+ * channel runs its own session, but observer events carry no thread root, so
+ * the desktop cannot tell which session is this thread's. Commands are refused
+ * there rather than sent to whichever session in the channel was latest. DMs
+ * are always one conversation session (buzz-acp `SessionScope::Conversation`).
+ */
+export function threadScopeRefusal(
+  channelType: string | null,
+  threadScopedSessions = getOverrides().threadScopedAcpSessions === true,
+): { sessionId?: null; unresolvedScopeReason?: string } {
+  if (!threadScopedSessions || channelType === "dm") return {};
+  return {
+    sessionId: null,
+    unresolvedScopeReason:
+      "Commands are unavailable here: thread-scoped agent sessions are on, and Buzz cannot yet tell which session belongs to this conversation.",
+  };
 }

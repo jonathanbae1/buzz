@@ -486,6 +486,7 @@ function MessageComposerImpl({
     channelId,
     profiles,
     sessionId: commandPicker.sessionId,
+    unresolvedScopeReason: commandTarget?.unresolvedScopeReason,
   });
   commandPickerOpenRef.current = commandPicker.isCommandOpen;
   const {
@@ -674,7 +675,6 @@ function MessageComposerImpl({
         }
       } else {
         if (
-          sessionModelPicker.isAvailable &&
           isBareModelCommand(
             trimmed,
             implicitAgentMentionProvenance.getPrefix(),
@@ -780,6 +780,9 @@ function MessageComposerImpl({
     mentions.revalidateMentionPubkeys,
     mentions.settlePendingMentionBindings,
     voiceNote.statusRef,
+    commandPicker.dismiss,
+    implicitAgentMentionProvenance.getPrefix,
+    sessionModelPicker.open,
   ]);
   submitMessageRef.current = submitMessage;
   // Draft auto-submit runs once after persisted editor state loads.

@@ -29,6 +29,11 @@ export type ComposerCommandTarget = {
   candidateAgentPubkeys?: readonly string[];
   /** Set this only when a parent already resolved the exact ACP session. */
   sessionId?: string | null;
+  /**
+   * Set when the conversation's ACP session cannot be identified, so commands
+   * are refused with this reason instead of reaching another session.
+   */
+  unresolvedScopeReason?: string | null;
 };
 
 type ParsedCommand = {
@@ -109,6 +114,7 @@ const INITIAL_STATE: CommandPickerState = {
 };
 
 function statusMessage({
+  unresolvedScopeReason,
   candidateCount,
   hasAgent,
   hasSession,
@@ -117,6 +123,7 @@ function statusMessage({
   query,
   suggestionCount,
 }: {
+  unresolvedScopeReason: string | null;
   candidateCount: number;
   hasAgent: boolean;
   hasSession: boolean;
@@ -125,6 +132,7 @@ function statusMessage({
   query: string;
   suggestionCount: number;
 }): string | null {
+  if (unresolvedScopeReason) return unresolvedScopeReason;
   if (candidateCount > 1) {
     return "More than one managed agent is in this conversation. Address one agent to use commands.";
   }
@@ -440,6 +448,14 @@ export function useComposerCommandPicker({
       if (!freshCommand && !knownCommand) {
         return { handled: false, succeeded: false };
       }
+      if (target?.unresolvedScopeReason) {
+        setState((previous) => ({
+          ...previous,
+          dispatchError: `${target.unresolvedScopeReason} The draft was kept.`,
+          dispatchNotice: null,
+        }));
+        return { handled: true, succeeded: false };
+      }
       if (isDispatchingRef.current) {
         return { handled: true, succeeded: false };
       }
@@ -511,6 +527,7 @@ export function useComposerCommandPicker({
       findCandidateCommand,
       implicitMentionPrefix,
       sessionId,
+      target?.unresolvedScopeReason,
     ],
   );
   const activeCommand =
@@ -529,6 +546,7 @@ export function useComposerCommandPicker({
       ? `agent ${agentPubkey.slice(0, 8)} · session ${sessionId.slice(0, 8)}`
       : null;
   const stateStatus = statusMessage({
+    unresolvedScopeReason: target?.unresolvedScopeReason ?? null,
     candidateCount: candidateAgentPubkeys.length,
     hasAgent,
     hasSession: Boolean(sessionId),

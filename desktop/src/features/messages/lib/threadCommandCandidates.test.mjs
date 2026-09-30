@@ -1,7 +1,10 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 
-import { threadCommandCandidates } from "./threadCommandCandidates.ts";
+import {
+  threadCommandCandidates,
+  threadScopeRefusal,
+} from "./threadCommandCandidates.ts";
 
 const HUMAN = "a".repeat(64);
 const SCOUT = "b".repeat(64);
@@ -36,4 +39,17 @@ test("two agents in one thread stay ambiguous", () => {
     threadCommandCandidates(head, replies, KNOWN).sort(),
     [SCOUT, CODER].sort(),
   );
+});
+
+test("thread-scoped sessions refuse commands in channel threads instead of guessing a session", () => {
+  // Two threads in one channel with the same agent run two sessions; observer
+  // events carry no thread root, so neither may be picked by channel alone.
+  const refusal = threadScopeRefusal("stream", true);
+  assert.equal(refusal.sessionId, null);
+  assert.match(refusal.unresolvedScopeReason, /thread-scoped/);
+});
+
+test("DMs and the default channel policy keep resolving by channel", () => {
+  assert.deepEqual(threadScopeRefusal("dm", true), {});
+  assert.deepEqual(threadScopeRefusal("stream", false), {});
 });

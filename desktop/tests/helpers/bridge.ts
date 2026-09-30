@@ -522,6 +522,8 @@ type MockBridgeOptions = {
     preferred_runtime?: string | null;
   };
   ownerOnlyAccessBuild?: boolean;
+  /** Fields merged over the default config surface, keyed by agent pubkey. */
+  agentConfigSurfaces?: Record<string, Record<string, unknown>>;
   /** File-layer config returned by runtime id. */
   runtimeFileConfigs?: Record<
     string,

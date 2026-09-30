@@ -46,6 +46,7 @@ import { getMarkdownParseCount } from "@/shared/ui/markdown/nodeCache";
 import { syncAgentTurnsFromEvents } from "@/features/agents/activeAgentTurnsStore";
 import { recordTimeoutFromRejection } from "@/features/moderation/lib/timeoutStore";
 import {
+  injectLiveObserverEventsForE2E,
   injectObserverEventsForE2E,
   syncAgentObserverEvents,
 } from "@/features/agents/observerRelayStore";
@@ -600,6 +601,8 @@ type E2eConfig = {
     };
     /** Explicit owner-only agent-access capability; independent of baked defaults. */
     ownerOnlyAccessBuild?: boolean;
+    /** Fields merged over the default config surface, keyed by agent pubkey. */
+    agentConfigSurfaces?: Record<string, Record<string, unknown>>;
     /** File-layer config returned by runtime id. */
     runtimeFileConfigs?: Record<string, RuntimeFileConfigSubset | null>;
     /** Baked build env returned by the display and key-name Tauri commands. */
@@ -1523,6 +1526,8 @@ declare global {
         payload: unknown;
       }>;
     }) => void;
+    /** Like the seed above, but through the decrypted-relay path. */
+    __BUZZ_E2E_SEED_LIVE_OBSERVER_EVENTS__?: Window["__BUZZ_E2E_SEED_OBSERVER_EVENTS__"];
     __BUZZ_E2E_EMIT_MOCK_READ_STATE__?: (input: {
       clientId: string;
       contexts: Record<string, number>;
@@ -12029,6 +12034,9 @@ export function maybeInstallE2eTauriMocks() {
   window.__BUZZ_E2E_SEED_OBSERVER_EVENTS__ = ({ agentPubkey, events }) => {
     injectObserverEventsForE2E(agentPubkey, events);
   };
+  window.__BUZZ_E2E_SEED_LIVE_OBSERVER_EVENTS__ = ({ agentPubkey, events }) => {
+    injectLiveObserverEventsForE2E(agentPubkey, events);
+  };
   const meshModelName = (modelId: string) => {
     const basename = modelId.split("/").at(-1) ?? modelId;
     return basename
@@ -14514,7 +14522,10 @@ export function maybeInstallE2eTauriMocks() {
       }
       case "get_agent_config_surface": {
         const configArgs = payload as { pubkey: string };
-        return buildMockConfigSurface(configArgs.pubkey);
+        return {
+          ...buildMockConfigSurface(configArgs.pubkey),
+          ...config.mock?.agentConfigSurfaces?.[configArgs.pubkey],
+        };
       }
       case "get_runtime_file_config": {
         const runtimeId = (payload as { runtimeId?: string } | null | undefined)

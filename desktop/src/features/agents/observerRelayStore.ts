@@ -990,6 +990,17 @@ export function injectObserverEventsForE2E(
 }
 
 /**
+ * E2E seam for frames that must take the decrypted-relay path, so they also
+ * drive latest-live session tracking, command catalogs and config capture.
+ */
+export function injectLiveObserverEventsForE2E(
+  agentPubkey: string,
+  events: ObserverEvent[],
+) {
+  processLiveObserverEvents(agentPubkey, events);
+}
+
+/**
  * Synchronize the observer store with a sorted buffer of events for one agent.
  * Used by test harnesses and replay bridges that already hold decoded frames.
  */
