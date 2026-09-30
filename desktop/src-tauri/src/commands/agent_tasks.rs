@@ -31,6 +31,8 @@ const M1_CONTRACT: &str = "agentmemory-m1.1";
 const PROJECT: &str = "oh-my-buzz";
 
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(15);
+/// Concurrent per-action projection reads when listing the board.
+const PROJECTION_WORKERS: usize = 8;
 
 /// How the client classified the outcome. The UI shows a different surface for each.
 #[derive(Debug, Clone, Serialize)]
@@ -192,9 +194,15 @@ fn read_env_file() -> Option<(Option<String>, Option<String>)> {
     Some((url, secret))
 }
 
-/// A blocking client with redirects disabled, so the bearer cannot be forwarded elsewhere.
-fn client() -> TaskResult<reqwest::blocking::Client> {
-    reqwest::blocking::Client::builder()
+/// One process-wide blocking client with redirects disabled, so the bearer cannot be
+/// forwarded elsewhere. Sharing it keeps the TLS connections to the store alive: a fresh
+/// client per request paid a new handshake (~0.25 s of a 0.36 s call) for every action.
+fn client() -> TaskResult<&'static reqwest::blocking::Client> {
+    static CLIENT: std::sync::OnceLock<reqwest::blocking::Client> = std::sync::OnceLock::new();
+    if let Some(client) = CLIENT.get() {
+        return Ok(client);
+    }
+    let built = reqwest::blocking::Client::builder()
         .timeout(REQUEST_TIMEOUT)
         // A redirect carrying the Authorization header is exactly the credential leak this
         // module exists to prevent; a redirect to a new host is therefore a hard failure.
@@ -207,7 +215,8 @@ fn client() -> TaskResult<reqwest::blocking::Client> {
                 None,
                 None,
             )
-        })
+        })?;
+    Ok(CLIENT.get_or_init(|| built))
 }
 
 fn classify(store: &Store, status: u16, body: Option<&Value>) -> Option<TaskError> {
@@ -598,17 +607,48 @@ pub fn agent_tasks_list_blocking() -> Result<TaskBoard, TaskError> {
         .cloned()
         .unwrap_or_default();
 
-    let mut tasks = Vec::with_capacity(actions.len());
-    for action in &actions {
-        let Some(id) = str_field(action, "id") else {
-            continue;
-        };
-        // The projection is what makes `ready` mean something: terminal, invalid target,
-        // unresolved dependencies and live conflicts all prevent Run.
-        let detail = send(&store, "GET", &format!("/actions/get?actionId={id}"), None)?;
-        let projection = detail.clone();
-        tasks.push(row_from(action, &projection));
-    }
+    // The projection is what makes `ready` mean something: terminal, invalid target,
+    // unresolved dependencies and live conflicts all prevent Run. The store has no batch
+    // read, so the per-action reads run on a few threads over the shared keep-alive
+    // client; one after another they took 15.6 s for 44 actions.
+    let actions: Vec<&Value> = actions
+        .iter()
+        .filter(|action| str_field(action, "id").is_some())
+        .collect();
+    let workers = PROJECTION_WORKERS.min(actions.len()).max(1);
+    let chunk = actions.len().div_ceil(workers).max(1);
+    let tasks = std::thread::scope(|scope| {
+        let handles: Vec<_> = actions
+            .chunks(chunk)
+            .map(|slice| {
+                let store = &store;
+                scope.spawn(move || {
+                    slice
+                        .iter()
+                        .map(|action| {
+                            let id = str_field(action, "id").unwrap_or_default();
+                            let projection =
+                                send(store, "GET", &format!("/actions/get?actionId={id}"), None)?;
+                            Ok(row_from(action, &projection))
+                        })
+                        .collect::<TaskResult<Vec<TaskRow>>>()
+                })
+            })
+            .collect();
+        let mut rows = Vec::with_capacity(actions.len());
+        for handle in handles {
+            let part = handle.join().map_err(|_| {
+                TaskError::new(
+                    TaskErrorKind::Protocol,
+                    "a projection reader panicked",
+                    Some(store.host.clone()),
+                    None,
+                )
+            })??;
+            rows.extend(part);
+        }
+        Ok::<_, TaskError>(rows)
+    })?;
 
     let managed_unavailable_reason = unavailability(contract.as_deref());
     Ok(TaskBoard {
