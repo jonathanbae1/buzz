@@ -54,6 +54,7 @@ export default defineConfig({
         "**/active-turn-resilience.spec.ts",
         "**/agent-control-regressions.spec.ts",
         "**/agent-tasks-run.spec.ts",
+        "**/composer-model-picker.spec.ts",
         "**/profile-active-turn.spec.ts",
         "**/config-bridge-screenshots.spec.ts",
         "**/observer-feed-screenshots.spec.ts",
@@ -213,7 +214,10 @@ export default defineConfig({
     },
   ],
   webServer: {
-    command: "python3 -m http.server 4173 -d dist",
+    // `python3 -m http.server` listens with a backlog of 5; on macOS the burst of module
+    // requests at boot overflows it and connections are reset, so a random spec boots blank.
+    command:
+      "python3 -c \"import functools, http.server as h; h.ThreadingHTTPServer.request_queue_size = 128; h.ThreadingHTTPServer(('127.0.0.1', 4173), functools.partial(h.SimpleHTTPRequestHandler, directory='dist')).serve_forever()\"",
     cwd: ".",
     reuseExistingServer: !process.env.CI,
     url: "http://127.0.0.1:4173",
