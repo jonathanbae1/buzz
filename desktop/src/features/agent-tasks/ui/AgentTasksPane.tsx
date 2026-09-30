@@ -163,6 +163,24 @@ export function AgentTasksPane() {
   const channelsQuery = useChannelsQuery();
   const sendMessage = useSendMessageMutation(null, identityQuery.data);
   const managedAgentsQuery = useManagedAgentsQuery();
+  // Assignment targets use the identity buzz-acp exports to a managed worker.
+  const assignableAgents = React.useMemo(
+    () =>
+      (managedAgentsQuery.data ?? [])
+        .map((agent) => ({
+          id: `buzz:${agent.pubkey.toLowerCase()}`,
+          name: agent.name,
+        }))
+        .sort((a, b) => a.name.localeCompare(b.name)),
+    [managedAgentsQuery.data],
+  );
+  const agentNameByTarget = React.useMemo<Record<string, string>>(
+    () =>
+      Object.fromEntries(
+        assignableAgents.map((agent) => [agent.id, agent.name]),
+      ),
+    [assignableAgents],
+  );
   const targetPubkey = selected?.assignmentTarget?.startsWith("buzz:")
     ? selected.assignmentTarget.slice("buzz:".length).toLowerCase()
     : null;
@@ -213,7 +231,7 @@ export function AgentTasksPane() {
         setNotice(
           targetAgentId === null
             ? `Cleared the assignment intent for ${row.title}.`
-            : `Assigned ${row.title} to ${targetAgentId}. This writes intent only; nothing was dispatched.`,
+            : `Assigned ${row.title} to ${agentNameByTarget[targetAgentId] ?? targetAgentId}. This writes intent only; nothing was dispatched.`,
         );
         await refresh();
       } catch (thrown) {
@@ -223,7 +241,7 @@ export function AgentTasksPane() {
         setBusy(false);
       }
     },
-    [refresh],
+    [agentNameByTarget, refresh],
   );
 
   const handleRun = React.useCallback(
@@ -437,8 +455,9 @@ export function AgentTasksPane() {
                     {READINESS_LABEL[row.readiness]}
                   </span>
                   {row.assignmentTarget ? (
-                    <span className="truncate font-mono">
-                      {row.assignmentTarget}
+                    <span className="truncate">
+                      {agentNameByTarget[row.assignmentTarget.toLowerCase()] ??
+                        row.assignmentTarget}
                     </span>
                   ) : (
                     <span>unassigned</span>
@@ -454,6 +473,9 @@ export function AgentTasksPane() {
             <ViewLoadingFallback kind="tasks" />
           ) : selected ? (
             <TaskDetail
+              key={selected.id}
+              agents={assignableAgents}
+              agentNameByTarget={agentNameByTarget}
               row={selected}
               busy={busy}
               onAssign={handleAssign}
@@ -486,16 +508,26 @@ function Field({
 }
 
 function TaskDetail({
+  agents,
+  agentNameByTarget,
   row,
   busy,
   onAssign,
   onRun,
 }: {
+  agents: readonly { id: string; name: string }[];
+  agentNameByTarget: Record<string, string>;
   row: TaskRow;
   busy: boolean;
   onAssign: (row: TaskRow, targetAgentId: string | null) => Promise<void>;
   onRun: (row: TaskRow) => Promise<void>;
 }) {
+  const currentTarget = row.assignmentTarget?.toLowerCase() ?? null;
+  const [choice, setChoice] = React.useState(
+    currentTarget && agentNameByTarget[currentTarget]
+      ? currentTarget
+      : (agents[0]?.id ?? ""),
+  );
   return (
     <div className="space-y-4">
       <div>
@@ -518,7 +550,11 @@ function TaskDetail({
         </Field>
         {row.assignmentTarget ? (
           <Field label="Assigned to">
-            <span className="font-mono">{row.assignmentTarget}</span>
+            <span>
+              {agentNameByTarget[row.assignmentTarget.toLowerCase()] ?? (
+                <span className="font-mono">{row.assignmentTarget}</span>
+              )}
+            </span>
             <span className="ml-2 text-xs text-muted-foreground">
               revision {row.assignmentRevision}
             </span>
@@ -589,15 +625,34 @@ function TaskDetail({
       </dl>
 
       <div className="flex flex-wrap gap-2">
+        <select
+          aria-label="Assignee"
+          className="rounded-md border border-border bg-background px-2 py-1.5 text-xs"
+          disabled={busy || row.readiness === "terminal" || agents.length === 0}
+          onChange={(event) => setChoice(event.currentTarget.value)}
+          value={choice}
+        >
+          {agents.length === 0 ? (
+            <option value="">No managed agents</option>
+          ) : null}
+          {agents.map((agent) => (
+            <option key={agent.id} value={agent.id}>
+              {agent.name}
+            </option>
+          ))}
+        </select>
         <button
           type="button"
-          disabled={busy || row.readiness === "terminal"}
-          onClick={() =>
-            void onAssign(row, row.assignmentTarget ?? "buzz:worker")
+          disabled={
+            busy ||
+            row.readiness === "terminal" ||
+            !choice ||
+            choice === currentTarget
           }
+          onClick={() => void onAssign(row, choice)}
           className="rounded-md border border-border px-3 py-1.5 text-xs hover:bg-accent disabled:opacity-50"
         >
-          Assign to worker
+          Assign
         </button>
         <button
           type="button"

@@ -220,4 +220,42 @@ test.describe("Tasks Run", () => {
     expect(payload.content).toMatch(new RegExp(`^M1W ${ACTION_ID} `));
     expect(payload.content).toContain("Run this task");
   });
+
+  test("assigns the chosen managed agent, not a placeholder worker", async ({
+    page,
+  }) => {
+    const scout = "e".repeat(64);
+    await installMockBridge(page, {
+      managedAgents: [
+        { pubkey: WORKER, name: "Coder", status: "running" },
+        { pubkey: scout, name: "Scout", status: "running" },
+      ],
+      agentTasks: {
+        contract: "agentmemory-m1.1",
+        managedAvailable: true,
+        tasks: [taskRow(`buzz:${WORKER}`)],
+      },
+    });
+    await openTasks(page);
+    const assignee = page.getByRole("combobox", { name: "Assignee" });
+    await expect(assignee).toHaveValue(`buzz:${WORKER}`);
+    const assign = page.getByRole("button", { name: "Assign", exact: true });
+    await expect(assign).toBeDisabled();
+
+    await assignee.selectOption({ label: "Scout" });
+    await assign.click();
+
+    const calls = await page.evaluate(() => {
+      const state = window as TestWindow;
+      return state.__BUZZ_E2E_COMMAND_LOG__ ?? [];
+    });
+    const assignCall = calls.find(
+      (call) => call.command === "agent_tasks_assign",
+    );
+    expect(assignCall?.payload).toMatchObject({
+      actionId: ACTION_ID,
+      targetAgentId: `buzz:${scout}`,
+      expectedRevision: 1,
+    });
+  });
 });
