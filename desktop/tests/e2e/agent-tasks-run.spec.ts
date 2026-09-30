@@ -15,6 +15,10 @@ type TestWindow = Window & {
     agentPubkey: string;
     events: Array<Record<string, unknown>>;
   }) => void;
+  __BUZZ_E2E_SEED_LIVE_OBSERVER_EVENTS__?: (input: {
+    agentPubkey: string;
+    events: Array<Record<string, unknown>>;
+  }) => void;
   __BUZZ_E2E_COMMANDS__?: string[];
   __BUZZ_E2E_COMMAND_LOG__?: Array<{ command: string; payload: unknown }>;
 };
@@ -64,9 +68,9 @@ async function observedCommands(page: Page) {
   });
 }
 
-async function seedDirectSession(page: Page) {
+async function seedDirectSession(page: Page, live = true) {
   return page.evaluate(
-    async ({ worker, session }) => {
+    async ({ worker, session, live }) => {
       const state = window as TestWindow;
       const invoke = state.__TAURI_INTERNALS__?.invoke;
       if (!invoke) throw new Error("Mock Tauri invoke bridge is unavailable.");
@@ -80,7 +84,10 @@ async function seedDirectSession(page: Page) {
         throw new Error("Mock direct-message creation returned no channel id.");
       }
       const channelId = rawChannel.id;
-      state.__BUZZ_E2E_SEED_OBSERVER_EVENTS__?.({
+      const seed = live
+        ? state.__BUZZ_E2E_SEED_LIVE_OBSERVER_EVENTS__
+        : state.__BUZZ_E2E_SEED_OBSERVER_EVENTS__;
+      seed?.({
         agentPubkey: worker,
         events: [
           {
@@ -100,7 +107,7 @@ async function seedDirectSession(page: Page) {
       });
       return channelId;
     },
-    { worker: WORKER, session: SESSION_ID },
+    { worker: WORKER, session: SESSION_ID, live },
   );
 }
 
@@ -219,6 +226,33 @@ test.describe("Tasks Run", () => {
     expect(payload.channelId).toBe(channelId);
     expect(payload.content).toMatch(new RegExp(`^M1W ${ACTION_ID} `));
     expect(payload.content).toContain("Run this task");
+  });
+
+  test("refuses a session known only from history, before registering", async ({
+    page,
+  }) => {
+    await installMockBridge(page, {
+      managedAgents: [{ pubkey: WORKER, name: "Coder", status: "running" }],
+      agentTasks: {
+        contract: "agentmemory-m1.1",
+        managedAvailable: true,
+        tasks: [taskRow(`buzz:${WORKER}`)],
+      },
+    });
+    await page.goto("/");
+    await expect(page.getByTestId("open-agent-tasks-view")).toBeVisible();
+    await seedDirectSession(page, false);
+    await openTasks(page);
+    await page.getByRole("button", { name: "Run", exact: true }).click();
+
+    await expect(
+      page.getByText(
+        /Run refused: the assigned agent has no live direct session/,
+      ),
+    ).toBeVisible();
+    expect(await observedCommands(page)).not.toContain(
+      "agent_tasks_register_dispatch",
+    );
   });
 
   test("assigns the chosen managed agent, not a placeholder worker", async ({

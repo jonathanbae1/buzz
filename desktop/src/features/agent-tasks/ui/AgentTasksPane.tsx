@@ -3,15 +3,10 @@ import * as React from "react";
 import { useActiveAgentTurns } from "@/features/agents/activeAgentTurnsStore";
 import { useManagedAgentsQuery } from "@/features/agents/hooks";
 import {
-  deriveLatestSessionId,
-  mergeObserverEventWindows,
-  scopeByChannel,
-} from "@/features/agents/ui/agentSessionPanelLayout";
-import {
-  useArchivedChannelEvents,
-  useLoadArchivedObserverEvents,
-  useObserverEvents,
-} from "@/features/agents/ui/useObserverEvents";
+  getLatestLiveSessionId,
+  subscribeAgentObserverStore,
+} from "@/features/agents/observerRelayStore";
+import { useObserverEvents } from "@/features/agents/ui/useObserverEvents";
 import { useChannelsQuery } from "@/features/channels/hooks";
 import { useSendMessageMutation } from "@/features/messages/hooks";
 import { useIdentityQuery } from "@/shared/api/hooks";
@@ -184,10 +179,9 @@ export function AgentTasksPane() {
   const targetPubkey = selected?.assignmentTarget?.startsWith("buzz:")
     ? selected.assignmentTarget.slice("buzz:".length).toLowerCase()
     : null;
-  const { events: liveEvents } = useObserverEvents(
-    Boolean(targetPubkey),
-    targetPubkey,
-  );
+  // Subscribing delivers the agent's live frames, which drive the latest-live
+  // session read below.
+  useObserverEvents(Boolean(targetPubkey), targetPubkey);
   const activeTurns = useActiveAgentTurns(targetPubkey);
   const ownPubkey = identityQuery.data?.pubkey?.toLowerCase() ?? null;
   const directChannel =
@@ -204,20 +198,22 @@ export function AgentTasksPane() {
           )),
     ) ?? null;
   const directChannelId = directChannel?.id ?? null;
-  useLoadArchivedObserverEvents(Boolean(directChannelId), directChannelId);
-  const archivedEvents = useArchivedChannelEvents(
-    targetPubkey,
-    directChannelId,
+  // Only a session seen live from the running agent process may be registered.
+  // Archived history outlives the process: after a restart it named yesterday's
+  // session, the prompt then opened a new one, and the dispatch could never be
+  // claimed under the store's session fence.
+  const getLatestSession = React.useCallback(
+    () =>
+      directChannelId
+        ? getLatestLiveSessionId(targetPubkey, directChannelId)
+        : null,
+    [directChannelId, targetPubkey],
   );
-  const sessionId = React.useMemo(() => {
-    if (!directChannelId) return null;
-    return deriveLatestSessionId(
-      mergeObserverEventWindows(
-        scopeByChannel(liveEvents, directChannelId),
-        archivedEvents,
-      ),
-    );
-  }, [archivedEvents, directChannelId, liveEvents]);
+  const sessionId = React.useSyncExternalStore(
+    subscribeAgentObserverStore,
+    getLatestSession,
+    getLatestSession,
+  );
   const handleAssign = React.useCallback(
     async (row: TaskRow, targetAgentId: string | null) => {
       setBusy(true);
@@ -289,7 +285,7 @@ export function AgentTasksPane() {
       }
       if (!identityQuery.data || !directChannel || !sessionId) {
         setNotice(
-          "Run refused: the assigned agent has no initialized direct conversation session.",
+          "Run refused: the assigned agent has no live direct session. Send it a message first, then Run.",
         );
         return;
       }
